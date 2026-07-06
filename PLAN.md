@@ -30,22 +30,24 @@
 ## Delegation ledger
 | Artifact / increment | Producer | Red-team / reviewer | Note |
 |---|---|---|---|
-| PRD.md (PR #3) | pm-prd sub-agent (sonnet) ≠ Lead | redteam-prd sub-agent (fable) ≠ producer | Round 1: FAIL (10 findings) → fixed. Round 2: PASS w/ 1 wording fix (provenance citation) → producer applying; Sentinel next |
+| PRD.md (PR #3) | pm-prd sub-agent (sonnet) ≠ Lead | redteam-prd sub-agent (fable) ≠ producer; Sentinel (fable) ≠ all | done — red-team round 2 PASS; Sentinel CONDITIONAL SNTL-20260706-bla-PR3-105a52d @ 105a52d; follow-ups #4 #5 filed; awaiting cofounder merge |
+| Engine-policy chore (PR #6) | Lead (ops chore, non-gate artifact) | Sentinel (fable) ≠ author | Sentinel round 1: REJECTED (1 🔴 containment) → fixed + follow-ups folded; re-invoke pending |
 
 ## Fleet registry
 | Agent | Channel | Task | State |
 |---|---|---|---|
 | probe-1 | built-in, background | capability probe | done (LEVEL1-OK, nested launch OK) |
-| pm-prd | built-in, background, sonnet | author PRD.md on branch docs/prd (PR #3) | fixing red-team findings |
+| pm-prd | built-in, background, sonnet | author PRD.md on branch docs/prd (PR #3) | done — final HEAD 105a52d |
 | redteam-prd | built-in, fable | red-team the PRD gate artifact | done — round 2 PASS at HEAD 105a52d |
-| sentinel-pr3 | built-in, fable | Sentinel review of PR #3 @ 105a52d | running |
+| sentinel-pr3 | built-in, fable | Sentinel review of PR #3 @ 105a52d | done — CONDITIONAL SNTL-20260706-bla-PR3-105a52d |
+| sentinel-pr6 | built-in, fable | Sentinel review of PR #6 | round 1 REJECTED @ 23f9e9d; delta re-review pending |
 
 ## Lead lease
 - Session: interactive CLI session e3f8b683 (scratchpad id), leased 2026-07-05. Refresh every tick; successor takes over only on a stale lease (>2 tick intervals).
 
 ## HANDOFF (for a cold successor: read docs/KICKOFF.md + MISSION.md + this block)
 - **Where we are:** Phase 1 PRD gate substantively passed: PR #3 red-teamed (round 2 PASS) + Sentinel CONDITIONAL (SNTL-20260706-bla-PR3-105a52d @ 105a52d), follow-ups filed (#4 🟡, #5 🟢), PR annotated. **Merge awaits cofounder authorization** (runtime permission classifier blocks fleet merges; cofounder offered one-off merge or a standing permission rule).
-- **Open gates:** (1) merge authorization for PR #3 (cofounder, live — permission classifier blocks fleet `gh pr merge`; cofounder to merge one-off or grant a rule); optional distinct agent identity for Tier-2 (future).
+- **Open gates:** (1) cofounder merge of PR #3 (PRD — fully gated, ready); (2) cofounder merge of PR #6 (harness-integrity engine policy — after Sentinel delta re-review passes); optional distinct agent identity for Tier-2 (future). **Copilot containment precondition** (MISSION §7): no Copilot implementer spawns until Sentinel-in-CI + harness-guard are required checks.
 - **Open increments:** none — no product code yet. No untriaged issues; security 0/0/0.
 - **Armed schedules:** Tier-1 watchdog via in-session cron (~20 min ticks, session-only; re-arm on new session per CONTINUOUS-OPERATION.md §Starting & restarting).
 - **Engine policy:** Copilot CLI (headless) for implementation + mechanical work; Claude fable for architecture/Sentinel/native-integration work (MISSION §7, cofounder-approved 2026-07-06).

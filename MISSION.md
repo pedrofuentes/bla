@@ -36,7 +36,7 @@
 - **Auth model:** none.
 - **Privacy/data constraints:** Audio, transcripts, and any derived text **never leave the device**. No telemetry, no analytics, no crash reporting to external services. History/dictionary live in local SQLite under the OS app-data dir.
 - **Network allowlist (runtime origins the *product* may contact):** `huggingface.co` + its CDN (one-time model downloads, user-initiated) and `localhost:11434` (Ollama). Nothing else — enforced by an automated test where feasible and Sentinel review of any new network call.
-- **Agent egress allowlist (origins the *build fleet* may reach):** github.com/api.github.com, crates.io/static.crates.io, registry.npmjs.org, plus docs: tauri.app, docs.rs, developer.apple.com, huggingface.co, ollama.com. Nothing else.
+- **Agent egress allowlist (origins the *build fleet* may reach):** github.com/api.github.com, crates.io/static.crates.io, registry.npmjs.org, the GitHub Copilot service backend used by the Copilot CLI (api.githubcopilot.com + its github.com auth endpoints — appended with the §7 engine policy through the same cofounder gate: PR #6), plus docs: tauri.app, docs.rs, developer.apple.com, huggingface.co, ollama.com. Nothing else.
 - **Known security risks to research up front:** macOS mic + Accessibility (synthetic keystroke) permissions UX; clipboard handling (transcripts transit the clipboard — restore semantics, never log clipboard contents); supply-chain surface of native crates (whisper-rs/cpal build scripts).
 - **Continuous scanning:** Dependabot, CodeQL, and secret scanning enabled and monitored; open high/critical alerts and any detected secret gate every release.
 
@@ -48,12 +48,14 @@
 - **Coverage threshold:** 70 (core Rust logic; UI components counted separately; native/OS-integration glue excluded via coverage config — Sentinel ratchets up, never down).
 - **Weak-test gate:** `coverage-diff`.
 - **Git author identity (commits):** Pedro Fuentes <git@pedrofuent.es>
-- **AI attribution (commit `Co-authored-by` trailer):** Claude Fable 5 <noreply@anthropic.com>
+- **AI attribution (commit `Co-authored-by` trailer):** Claude Fable 5 <noreply@anthropic.com> for Claude-authored commits; a commit authored by a Copilot CLI worker instead carries `Co-authored-by: GitHub Copilot <noreply@github.com>` — attribution must match the engine that actually authored the change.
 - **Sentinel method:** B (CI, enforced by branch protection) + A (sub-agent) in dev.
 - **Agent identity (for unattended runs):** none provisioned yet — see attended mode below; provisioning a distinct identity is queued as a `BLOCKED:` preflight item for the cofounder before any unattended Tier-2 operation.
 - **Attended single-operator mode:** `yes — I accept running under my own identity while present`. Tier-1 only; no unattended Tier-2 until a distinct agent identity exists.
 - **Enforced coding patterns:**
-  - Engine-per-task policy for the fleet (cofounder-approved 2026-07-06): Claude `fable` for architecture decisions, milestone planning, Sentinel review, and tricky native integrations (audio, STT bindings, synthetic input, permissions); **Copilot CLI (headless `copilot -p`)** for feature implementation and for mechanical work (triage, board/label updates, changelog/doc edits, watchdog ticks), with Claude `sonnet`/`haiku` as the respective fallbacks when a Copilot run fails or the task needs harness-native tooling. Copilot workers carry the full brief (TDD choreography, worktree isolation, stop-at-PR delegated-implementer contract), are registered in the PLAN.md fleet registry, and never invoke Sentinel or merge.
+  - Engine-per-task policy for the fleet (cofounder-approved 2026-07-06 — attested by the cofounder's merge of PR #6, the citable artifact for this approval): Claude `fable` for architecture decisions, milestone planning, Sentinel review, and tricky native integrations (audio, STT bindings, synthetic input, permissions); **Copilot CLI (headless `copilot -p`)** for feature implementation and for mechanical work (triage, board/label updates, changelog/doc edits, watchdog ticks), with Claude `sonnet`/`haiku` as the respective fallbacks when a Copilot run fails or the task needs harness-native tooling. Copilot workers carry the full brief (TDD choreography, worktree isolation, stop-at-PR delegated-implementer contract), are registered in the PLAN.md fleet registry, and never invoke Sentinel or merge.
+  - **Copilot containment (blocking precondition — SNTL-20260706-bla-PR6-23f9e9d 🔴):** Copilot CLI may run **read-only** work (watchdog ticks, triage reads, status checks) immediately, but may **not** be spawned as a delegated implementer (editing files, committing, pushing) until "never merge" is mechanically true: **Sentinel-in-CI + the harness-guard are required checks on `main`**, or the worker runs under a credential that structurally cannot push or merge to `main`. When the unlocking control lands, cite it here (workflow file + branch-protection contexts).
+  - Approval attestations in MISSION.md/PLAN.md must cite a verifiable artifact (an issue/PR comment URL, a merge by the cofounder, or a `decision:approved` label event); an uncited "(cofounder-approved)" string is an unsatisfied gate.
   - Cleanup layer stays behind the `Cleanup` trait; output targets stay behind the output-router abstraction; no direct OS calls outside the designated modules (`audio`, `output`, `hotkeys`, `context`).
   - LLM cleanup prompts must be rewrite-only (never answer, never add content) and live in versioned prompt files with fixture-based regression checks.
 - **Forbidden actions (NEVER):**
@@ -95,4 +97,4 @@
 - **Max auto-proceeded `time-boxed` gates per milestone:** 5
 - **Max consecutive auto-proceeded milestones with zero cofounder interaction:** 1 (every milestone ends in the AC-7 human gate anyway)
 - **Dead-man switch:** 7 days
-- **Per-milestone token/cost budget:** soft cap — honor the §7 model-per-task policy strictly; raise a `needs:decision` before any single milestone's spawn count exceeds the §10 caps.
+- **Per-milestone token/cost budget:** soft cap — honor the §7 engine-per-task policy strictly; raise a `needs:decision` before any single milestone's spawn count exceeds the §10 caps.
