@@ -3,42 +3,56 @@ name: harness-guard
 # Harness-integrity guard (MISSION.md §9, docs/CONTINUOUS-OPERATION.md Tier 2).
 #
 # Fails any PR that touches a protected path unless a `decision:approved` label
-# was applied by the cofounder (MISSION.md §1 handle). Protected paths:
+# was applied by the cofounder (MISSION.md §1 handle) AFTER the current head
+# SHA appeared. Protected paths:
 #   - docs/SENTINEL.md          (the Sentinel ruleset CI runs against every PR)
 #   - AGENTS.md                 (operating rules Sentinel/agents are held to)
+#   - MISSION.md                (the binding brief: §9 autonomy dial, §7 NEVER list)
 #   - .github/workflows/**      (this workflow and sentinel.yml themselves)
 #   - .github/dependabot.yml    (supply-chain scanning config)
 #
-# Trigger: `pull_request` — deliberately not `pull_request_target`. The guard
-# never checks out or executes anything from the PR (see below), so the only
-# reason to prefer `pull_request_target` would be to force this workflow
-# file's own definition to always come from `main` rather than the PR's copy.
-# We do not take that trade: `pull_request_target` hands a privileged
-# GITHUB_TOKEN (and any configured secrets) to a run whose *code* can still be
-# checked out from the PR in a later step by mistake or by a future edit —
-# that is the actual "PR-controlled code execution in a privileged context"
-# risk this project wants to avoid, and it is worse than the gap it would
-# close. `pull_request` keeps this job's token scoped the normal way, and for
-# a fork PR gives it no write access / no secrets at all by default.
+# Approval semantics (TOCTOU-hardened):
+#   - The decision is taken from the label EVENT history (Issues Events API),
+#     never from label text or PR body/title — both are PR-controlled data.
+#   - Approved = the LAST `decision:approved` labeled/unlabeled event is a
+#     `labeled` whose actor is the cofounder. A later `unlabeled` (by anyone)
+#     revokes; an author-applied label never counts (wrong actor); an author
+#     remove-and-re-add resets the last event to the wrong actor and fails.
+#   - The approval must be NEWER than the current head SHA: the label event's
+#     timestamp must postdate the moment this head SHA was first observed by
+#     Actions (the earliest workflow-run `created_at` for this SHA — a
+#     GitHub-recorded server-side time). Commit timestamps are NOT used
+#     anywhere: they are author-controlled and trivially backdatable. Effect:
+#     every push to an approved PR voids the approval, and the cofounder must
+#     re-apply the label (which triggers a fresh `labeled` run that passes for
+#     exactly that SHA).
 #
-# Known, accepted residual gap: because this runs on `pull_request`, a PR that
-# edits `.github/workflows/harness-guard.yml` itself executes ITS OWN edited
-# copy for this check (GitHub resolves the workflow file from the PR branch
-# for a plain `pull_request` trigger). Nothing in this job can close that gap
-# from inside the workflow. Mitigation lives one layer up, at repo config, not
-# in this file: (a) required-check + branch-protection settings the cofounder
-# adds after merge (see PR body), and (b) optionally a repository ruleset
-# restricting who can push to `.github/workflows/**` (suggested in
-# docs/CONTINUOUS-OPERATION.md Tier 2 — "Where the plan supports it,
-# additionally add a repository ruleset restricting changes to those paths"),
-# which this PR does not configure (out of scope — "Do NOT change branch
-# protection yourself").
+# Trigger: `pull_request` — deliberately not `pull_request_target`. The guard
+# never checks out or executes anything from the PR; the only reason to prefer
+# `pull_request_target` would be forcing this file's own definition to resolve
+# from `main`. We do not take that trade: `pull_request_target` hands a
+# privileged GITHUB_TOKEN to a run whose code a future edit could point at a
+# PR-controlled checkout — the exact "PR-controlled code execution in a
+# privileged context" this project rules out. `pull_request` keeps the token
+# scoped normally, and a fork PR gets no write token or secrets at all.
+#
+# Known, accepted residual gap: because this runs on `pull_request`, a
+# same-repo PR that edits this very file executes ITS OWN edited copy for this
+# check (GitHub resolves `pull_request` workflow files from the PR branch).
+# Nothing in this file can close that from inside the workflow, and NOTHING
+# here is tamper-resistant until BOTH repo-config controls exist: (a) this
+# check registered as a required status check on `main`, and (b) a repository
+# ruleset restricting pushes to `.github/workflows/**` (and ideally
+# docs/SENTINEL.md, AGENTS.md, MISSION.md) — docs/CONTINUOUS-OPERATION.md
+# Tier 2 recommends exactly that. This PR configures neither (out of scope —
+# cofounder action, see PR body). Until both are in place this guard is
+# advisory only; do not treat its green check as tamper-proof.
 #
 # What IS enforced here regardless of which copy of this file runs: the job
 # never checks out or executes PR code. It only calls the GitHub REST API
 # (via actions/github-script, using the default GITHUB_TOKEN) to read the PR's
-# changed-file list and its label-event history. All PR-supplied content
-# (label names, file paths) is treated as inert data, never as instructions.
+# changed-file list, its label-event history, and workflow-run timestamps.
+# All PR-supplied content (label names, file paths) is treated as inert data.
 
 on:
   pull_request:
@@ -48,6 +62,7 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
+  actions: read
 
 concurrency:
   group: harness-guard-${{ github.event.pull_request.number }}
@@ -71,6 +86,7 @@ jobs:
             const protectedPatterns = [
               /^docs\/SENTINEL\.md$/,
               /^AGENTS\.md$/,
+              /^MISSION\.md$/,
               /^\.github\/workflows\//,
               /^\.github\/dependabot\.yml$/,
             ];
@@ -99,6 +115,26 @@ jobs:
 
             core.warning(`Protected path(s) touched: ${touched.join(', ')}`);
 
+            // Bind the approval to the CURRENT head SHA: find when this SHA
+            // was first observed by Actions (earliest workflow-run created_at
+            // for this head SHA — a server-side, GitHub-recorded timestamp;
+            // the current run itself is in this list, so it is never empty).
+            // Commit timestamps are deliberately NOT used: they are
+            // author-controlled and can be backdated to predate any approval.
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head_sha: pr.head.sha,
+                per_page: 100,
+              }
+            );
+            const runTimes = runs.map((r) => new Date(r.created_at).getTime());
+            const headFirstSeen = runTimes.length
+              ? Math.min(...runTimes)
+              : Date.now();
+
             // Decide from the label-event history, never from label text or
             // PR body/title (both are PR-controlled data, not a trust signal).
             const events = await github.paginate(github.rest.issues.listEvents, {
@@ -108,28 +144,50 @@ jobs:
               per_page: 100,
             });
 
-            const approvedByCofounder = events.some(
+            // Chronological event list -> the LAST labeled/unlabeled event for
+            // the approval label decides. This makes `unlabeled` a revocation
+            // and makes any author re-add fail on the actor check.
+            const relevant = events.filter(
               (e) =>
-                e.event === 'labeled' &&
+                (e.event === 'labeled' || e.event === 'unlabeled') &&
                 e.label &&
-                e.label.name === APPROVAL_LABEL &&
-                e.actor &&
-                e.actor.login === COFOUNDER
+                e.label.name === APPROVAL_LABEL
             );
+            const last = relevant[relevant.length - 1];
 
-            if (!approvedByCofounder) {
+            const approved =
+              last &&
+              last.event === 'labeled' &&
+              last.actor &&
+              last.actor.login === COFOUNDER &&
+              new Date(last.created_at).getTime() > headFirstSeen;
+
+            if (!approved) {
+              let reason;
+              if (!last) {
+                reason = `no '${APPROVAL_LABEL}' label event exists`;
+              } else if (last.event === 'unlabeled') {
+                reason = `the label was removed (revoked) by '${last.actor?.login}' at ${last.created_at}`;
+              } else if (last.actor?.login !== COFOUNDER) {
+                reason = `the most recent '${APPROVAL_LABEL}' was applied by '${last.actor?.login}', not the cofounder`;
+              } else {
+                reason =
+                  `the cofounder's approval (${last.created_at}) predates the current head SHA ` +
+                  `${pr.head.sha} (first seen ${new Date(headFirstSeen).toISOString()}) — ` +
+                  `new commits void prior approval`;
+              }
               core.setFailed(
-                `harness-guard: this PR touches protected path(s) [${touched.join(
-                  ', '
-                )}] but no '${APPROVAL_LABEL}' label event with actor ` +
-                  `'${COFOUNDER}' was found. This is a HARNESS-INTEGRITY change ` +
-                  `(MISSION.md §9) — it requires the cofounder to apply the ` +
-                  `'${APPROVAL_LABEL}' label themselves before this check can pass.`
+                `harness-guard: this PR touches protected path(s) [${touched.join(', ')}] ` +
+                  `but is not approved: ${reason}. This is a HARNESS-INTEGRITY change ` +
+                  `(MISSION.md §9) — the cofounder ('${COFOUNDER}') must apply the ` +
+                  `'${APPROVAL_LABEL}' label themselves, AFTER the latest push (re-apply ` +
+                  `it if new commits landed since the last approval).`
               );
               return;
             }
 
             core.info(
-              `Protected path(s) touched, but '${APPROVAL_LABEL}' verified ` +
-                `(labeled-event actor: '${COFOUNDER}'). harness-guard passes.`
+              `Protected path(s) touched, but '${APPROVAL_LABEL}' verified: ` +
+                `labeled by '${COFOUNDER}' at ${last.created_at}, after head SHA ` +
+                `first seen at ${new Date(headFirstSeen).toISOString()}. harness-guard passes.`
             );
