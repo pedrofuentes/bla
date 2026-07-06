@@ -32,7 +32,7 @@
 
 ---
 
-## ADR-0002 — Scaffold tooling choices (Tailwind v4, ESLint flat config, cargo-llvm-cov exclusions)
+## ADR-0008 — Scaffold tooling choices (Tailwind v4, ESLint flat config, cargo-llvm-cov exclusions)
 
 - **Date:** 2026-07-06 · **Status:** accepted (scaffold PR, issue #14)
 - **Context:** `pnpm create tauri-app` (React-TS + Vite) needed Tailwind, lint/format tooling, and a coverage setup honoring MISSION.md §7's OS-glue exclusion, without introducing dependencies beyond MISSION §3 + create-tauri-app defaults + Tailwind.
