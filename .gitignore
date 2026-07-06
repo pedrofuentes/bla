@@ -1,0 +1,18 @@
+# Dependencies & build output
+node_modules/
+target/
+dist/
+
+# Local model files — never commit (large; user-downloaded at first run)
+*.gguf
+*.bin
+models/
+
+# Local user data — never commit
+*.sqlite
+*.sqlite3
+.DS_Store
+
+# Env / secrets
+.env
+.env.*
