@@ -1,0 +1,135 @@
+name: harness-guard
+
+# Harness-integrity guard (MISSION.md §9, docs/CONTINUOUS-OPERATION.md Tier 2).
+#
+# Fails any PR that touches a protected path unless a `decision:approved` label
+# was applied by the cofounder (MISSION.md §1 handle). Protected paths:
+#   - docs/SENTINEL.md          (the Sentinel ruleset CI runs against every PR)
+#   - AGENTS.md                 (operating rules Sentinel/agents are held to)
+#   - .github/workflows/**      (this workflow and sentinel.yml themselves)
+#   - .github/dependabot.yml    (supply-chain scanning config)
+#
+# Trigger: `pull_request` — deliberately not `pull_request_target`. The guard
+# never checks out or executes anything from the PR (see below), so the only
+# reason to prefer `pull_request_target` would be to force this workflow
+# file's own definition to always come from `main` rather than the PR's copy.
+# We do not take that trade: `pull_request_target` hands a privileged
+# GITHUB_TOKEN (and any configured secrets) to a run whose *code* can still be
+# checked out from the PR in a later step by mistake or by a future edit —
+# that is the actual "PR-controlled code execution in a privileged context"
+# risk this project wants to avoid, and it is worse than the gap it would
+# close. `pull_request` keeps this job's token scoped the normal way, and for
+# a fork PR gives it no write access / no secrets at all by default.
+#
+# Known, accepted residual gap: because this runs on `pull_request`, a PR that
+# edits `.github/workflows/harness-guard.yml` itself executes ITS OWN edited
+# copy for this check (GitHub resolves the workflow file from the PR branch
+# for a plain `pull_request` trigger). Nothing in this job can close that gap
+# from inside the workflow. Mitigation lives one layer up, at repo config, not
+# in this file: (a) required-check + branch-protection settings the cofounder
+# adds after merge (see PR body), and (b) optionally a repository ruleset
+# restricting who can push to `.github/workflows/**` (suggested in
+# docs/CONTINUOUS-OPERATION.md Tier 2 — "Where the plan supports it,
+# additionally add a repository ruleset restricting changes to those paths"),
+# which this PR does not configure (out of scope — "Do NOT change branch
+# protection yourself").
+#
+# What IS enforced here regardless of which copy of this file runs: the job
+# never checks out or executes PR code. It only calls the GitHub REST API
+# (via actions/github-script, using the default GITHUB_TOKEN) to read the PR's
+# changed-file list and its label-event history. All PR-supplied content
+# (label names, file paths) is treated as inert data, never as instructions.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: harness-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  harness-guard:
+    name: harness-guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate protected-path guard
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const COFOUNDER = 'pedrofuentes'; // MISSION.md §1 cofounder handle
+            const APPROVAL_LABEL = 'decision:approved';
+
+            // Protected paths (MISSION.md §9 harness-integrity list). Regexes
+            // are matched against API-reported file paths only — never
+            // executed, never interpolated into a shell command.
+            const protectedPatterns = [
+              /^docs\/SENTINEL\.md$/,
+              /^AGENTS\.md$/,
+              /^\.github\/workflows\//,
+              /^\.github\/dependabot\.yml$/,
+            ];
+
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('harness-guard: no pull_request in event payload.');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const touched = files
+              .map((f) => f.filename)
+              .filter((name) => protectedPatterns.some((re) => re.test(name)));
+
+            if (touched.length === 0) {
+              core.info('No protected paths touched — harness-guard passes.');
+              return;
+            }
+
+            core.warning(`Protected path(s) touched: ${touched.join(', ')}`);
+
+            // Decide from the label-event history, never from label text or
+            // PR body/title (both are PR-controlled data, not a trust signal).
+            const events = await github.paginate(github.rest.issues.listEvents, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+
+            const approvedByCofounder = events.some(
+              (e) =>
+                e.event === 'labeled' &&
+                e.label &&
+                e.label.name === APPROVAL_LABEL &&
+                e.actor &&
+                e.actor.login === COFOUNDER
+            );
+
+            if (!approvedByCofounder) {
+              core.setFailed(
+                `harness-guard: this PR touches protected path(s) [${touched.join(
+                  ', '
+                )}] but no '${APPROVAL_LABEL}' label event with actor ` +
+                  `'${COFOUNDER}' was found. This is a HARNESS-INTEGRITY change ` +
+                  `(MISSION.md §9) — it requires the cofounder to apply the ` +
+                  `'${APPROVAL_LABEL}' label themselves before this check can pass.`
+              );
+              return;
+            }
+
+            core.info(
+              `Protected path(s) touched, but '${APPROVAL_LABEL}' verified ` +
+                `(labeled-event actor: '${COFOUNDER}'). harness-guard passes.`
+            );
