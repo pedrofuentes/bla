@@ -106,7 +106,7 @@ Acceptance criteria **AC-1 through AC-7** are defined verbatim in `MISSION.md` �
 - **Latency budget:** transcribe + cleanup (regex path) for a 15-second, 16 kHz fixture completes in under 2 seconds on Apple Silicon (AC-2). This is the budget the daily-driver flow depends on; the LLM cleanup path is best-effort and not held to the same bound.
 - **Privacy invariants (MISSION §5):** the product may only ever reach `huggingface.co` + its CDN (one-time, user-initiated model downloads) and `localhost:11434` (Ollama). No telemetry, no analytics, no crash reporting, no other network origin — enforced by network-guard tests (AC-5, AC-12) and Sentinel review of any new network call. Raw clipboard contents are never logged or persisted (AC-9). All history/dictionary/snippet data lives in local SQLite under the OS app-data directory; no user data or model file is ever committed to the repo.
 - **Accessibility:** the settings UI (M2 onward) meets the Phase-2 design rubric's accessibility bar — visible focus, contrast, hit-target size — verified in the M2 design-review gate (AC-18; rubric defined in `docs/KICKOFF.md` Phase 2).
-- **Resource footprint:** Whisper model presets per MISSION §3: quantized `large-v3-turbo` as the default (≈ real-time on Apple Silicon) and `small` as the fast/low-RAM preset, selectable via the M2 settings model pick (AC-17).
+- **Resource footprint:** Whisper model presets per `docs/ARCHITECTURE.md` §Key Technical Decisions: quantized `large-v3-turbo` as the default (≈ real-time on Apple Silicon) and `small` as the fast/low-RAM preset, selectable via the M2 settings model pick (AC-17).
 
 ## 5. Success metrics
 
