@@ -46,10 +46,10 @@
 - Session: interactive CLI session e3f8b683 (scratchpad id), leased 2026-07-05. Refresh every tick; successor takes over only on a stale lease (>2 tick intervals).
 
 ## HANDOFF (for a cold successor: read docs/KICKOFF.md + MISSION.md + this block)
-- **Where we are:** Phase 1 PRD gate substantively passed: PR #3 red-teamed (round 2 PASS) + Sentinel CONDITIONAL (SNTL-20260706-bla-PR3-105a52d @ 105a52d), follow-ups filed (#4 🟡, #5 🟢), PR annotated. **Merge awaits cofounder authorization** (runtime permission classifier blocks fleet merges; cofounder offered one-off merge or a standing permission rule).
-- **Open gates:** (1) cofounder merge of PR #3 (PRD — fully gated, ready); (2) cofounder merge of PR #6 (harness-integrity engine policy — after Sentinel delta re-review passes); optional distinct agent identity for Tier-2 (future). **Copilot containment precondition** (MISSION §7): no Copilot implementer spawns until Sentinel-in-CI + harness-guard are required checks.
-- **Open increments:** none — no product code yet. No untriaged issues; security 0/0/0.
+- **Where we are:** Phase 1 complete — PRD merged (PR #3 → `c0c6fde`); engine-policy harness change merged (PR #6 → `f0da1f9`). M1 build started: milestone + issues #13–#27 seeded on board 8; three workers dispatched (#13 CI, #14 scaffold, #15 ADRs), each stopping at its PR for red-team/Sentinel.
+- **Open gates:** cofounder merges for the three M1 kickoff PRs when gated (#13 is harness-integrity); ANTHROPIC_API_KEY environment secret for Sentinel-in-CI (cofounder, when #13's PR lands); optional distinct agent identity for Tier-2 (future). **Copilot containment precondition** (MISSION §7): no Copilot implementer spawns until Sentinel-in-CI + harness-guard are required checks on `main`, or the worker credential structurally cannot push/merge.
+- **Open increments:** #13 (ci/sentinel-and-guard), #14 (chore/scaffold), #15 (docs/architecture-adrs) — in worktrees, claimed. Note: #15 branched pre-`f0da1f9`, will need a DECISIONS.md rebase. No untriaged issues; security 0/0/0.
 - **Armed schedules:** Tier-1 watchdog via in-session cron (~20 min ticks, session-only; re-arm on new session per CONTINUOUS-OPERATION.md §Starting & restarting).
-- **Engine policy:** Copilot CLI (headless) for implementation + mechanical work; Claude fable for architecture/Sentinel/native-integration work (MISSION §7, cofounder-approved 2026-07-06).
-- **Single next action:** on merge of PR #3 → seed the board with M1 issues from PRD ACs + all DoD cards, then start M1 Phase-3 (architecture ADRs) and the first build increments.
+- **Engine policy:** Copilot CLI (headless) for implementation + mechanical work; Claude fable for architecture/Sentinel/native-integration work (MISSION §7, attested at `f0da1f9`).
+- **Single next action:** as each worker reports: red-team #15's ADRs, Sentinel-review all three PRs, hand to cofounder for merge; then add `sentinel` + `harness-guard` to required checks and close #8.
 - **Lease refreshed:** 2026-07-06 board-setup turn (session e3f8b683).

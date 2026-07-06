@@ -26,6 +26,6 @@
 
 ## ADR-0001 — Engine-per-task fleet policy (Copilot CLI for non-fable work)
 
-- **Date:** 2026-07-06 · **Status:** accepted (cofounder-approved; attested by the cofounder's merge of PR #6)
+- **Date:** 2026-07-06 · **Status:** accepted — attested by the cofounder's merge of PR #6 (merge commit `f0da1f9`, https://github.com/pedrofuentes/bla/pull/6)
 - **Decision:** Fleet work is routed per MISSION.md §7: Claude `fable` for architecture, Sentinel review, and native-integration work; headless Copilot CLI for implementation and mechanical work, with Claude `sonnet`/`haiku` fallbacks.
-- **Containment:** per Sentinel SNTL-20260706-bla-PR6-23f9e9d, Copilot implementer spawns are blocked until Sentinel-in-CI + harness-guard are required checks on `main` (read-only Copilot work permitted immediately). Full policy text and precondition live in MISSION.md §7.
+- **Containment:** per Sentinel SNTL-20260706-bla-PR6-23f9e9d, Copilot implementer spawns are blocked until Sentinel-in-CI + harness-guard are required checks on `main`, **or the worker runs under a credential that structurally cannot push or merge to `main`** (read-only Copilot work permitted immediately). Canonical policy text and precondition live in MISSION.md §7.
