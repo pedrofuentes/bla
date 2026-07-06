@@ -2,6 +2,33 @@
 node_modules/
 target/
 dist/
+dist-ssr/
+*.local
+
+# Tauri-generated (capabilities schema autocompletion)
+src-tauri/gen/schemas/
+
+# Coverage reports (Vitest/v8, cargo-llvm-cov)
+coverage/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 
 # Local model files — never commit (large; user-downloaded at first run)
 *.gguf
@@ -11,7 +38,6 @@ models/
 # Local user data — never commit
 *.sqlite
 *.sqlite3
-.DS_Store
 
 # Env / secrets
 .env
