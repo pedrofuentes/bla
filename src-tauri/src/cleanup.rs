@@ -481,6 +481,20 @@ mod tests {
     }
 
     #[test]
+    fn regex_cleanup_keeps_genuine_list_connector_like_issue_52() {
+        // Sentinel issue #52: comma-flanked "like" isn't always discourse
+        // filler — "eggs, like, milk" uses "like" as a genuine list
+        // connector ("such as"), and stripping it produces a nonsensical
+        // "Eggs, milk." The word must survive when it isn't followed by a
+        // clause (contrast with the CASES table above, where "like," is
+        // followed by a clause starter like "this" and is correctly
+        // stripped as filler).
+        let cleanup = RegexCleanup;
+        let got = cleanup.clean("eggs, like, milk", Tone::Neutral).unwrap();
+        assert_eq!(got, "Eggs, like, milk.");
+    }
+
+    #[test]
     fn regex_cleanup_never_returns_unreachable() {
         // RegexCleanup is the always-available baseline (ADR-0005) — it must
         // never surface the Unreachable variant reserved for the future
