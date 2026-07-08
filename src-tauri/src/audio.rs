@@ -100,15 +100,43 @@ pub fn downmix_resample(input: &[f32], channels: u16, input_rate: u32) -> Vec<f3
     resample_linear(&mono, input_rate, TARGET_SAMPLE_RATE)
 }
 
+/// Same transform as [`downmix_resample`], but writes into caller-supplied
+/// scratch buffers instead of allocating fresh `Vec`s (issue #58): `mono_scratch`
+/// and `out` are cleared and refilled each call, so a caller that reuses the
+/// same two buffers across many calls (as the real-time audio callback does)
+/// only pays allocation cost the first few times each buffer grows to its
+/// steady-state capacity, never per-callback afterward.
+pub fn downmix_resample_into(
+    _input: &[f32],
+    _channels: u16,
+    _input_rate: u32,
+    mono_scratch: &mut Vec<f32>,
+    out: &mut Vec<f32>,
+) {
+    // TODO(#58): not yet implemented — placeholder so the RED test commit
+    // compiles.
+    mono_scratch.clear();
+    out.clear();
+}
+
 fn downmix_to_mono(input: &[f32], channels: u16) -> Vec<f32> {
+    let mut out = Vec::new();
+    downmix_to_mono_into(input, channels, &mut out);
+    out
+}
+
+fn downmix_to_mono_into(input: &[f32], channels: u16, out: &mut Vec<f32>) {
+    out.clear();
     let channels = channels.max(1) as usize;
     if channels == 1 {
-        return input.to_vec();
+        out.extend_from_slice(input);
+        return;
     }
-    input
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect()
+    out.extend(
+        input
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32),
+    );
 }
 
 /// Linear-interpolation resampler: maps each output sample index back to a
@@ -117,25 +145,31 @@ fn downmix_to_mono(input: &[f32], channels: u16) -> Vec<f32> {
 /// the cost of some high-frequency aliasing versus a windowed-sinc resampler
 /// — acceptable for speech destined for whisper (ADR-0002).
 fn resample_linear(mono: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
+    let mut out = Vec::new();
+    resample_linear_into(mono, input_rate, output_rate, &mut out);
+    out
+}
+
+fn resample_linear_into(mono: &[f32], input_rate: u32, output_rate: u32, out: &mut Vec<f32>) {
+    out.clear();
     if mono.is_empty() || input_rate == 0 {
-        return Vec::new();
+        return;
     }
     if input_rate == output_rate {
-        return mono.to_vec();
+        out.extend_from_slice(mono);
+        return;
     }
     let ratio = output_rate as f64 / input_rate as f64;
     let out_len = ((mono.len() as f64) * ratio).round() as usize;
     let last_idx = mono.len() - 1;
-    (0..out_len)
-        .map(|i| {
-            let src_pos = i as f64 / ratio;
-            let idx = (src_pos.floor() as usize).min(last_idx);
-            let frac = (src_pos - idx as f64) as f32;
-            let a = mono[idx];
-            let b = mono[(idx + 1).min(last_idx)];
-            a + (b - a) * frac
-        })
-        .collect()
+    out.extend((0..out_len).map(|i| {
+        let src_pos = i as f64 / ratio;
+        let idx = (src_pos.floor() as usize).min(last_idx);
+        let frac = (src_pos - idx as f64) as f32;
+        let a = mono[idx];
+        let b = mono[(idx + 1).min(last_idx)];
+        a + (b - a) * frac
+    }));
 }
 
 /// Root-mean-square level of a sample window — used to drive the pill's live
@@ -230,6 +264,91 @@ impl std::error::Error for CaptureError {}
 impl From<cpal::Error> for CaptureError {
     fn from(e: cpal::Error) -> Self {
         CaptureError::Cpal(e)
+    }
+}
+
+/// A structured problem observed on the real-time capture thread — the
+/// discriminated replacement for an invisible `eprintln!` (issues #44/#59):
+/// a poisoned ring-buffer lock, or a `cpal` stream error reported by its
+/// error callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureRuntimeError {
+    /// [`SharedRingBuffer`]'s mutex was poisoned (a prior panic while the
+    /// lock was held) — captured audio can no longer be trusted.
+    BufferLockPoisoned,
+    /// The underlying `cpal` stream reported an error via its error
+    /// callback (device disconnected, format renegotiation failure, ...).
+    Stream(String),
+}
+
+impl std::fmt::Display for CaptureRuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureRuntimeError::BufferLockPoisoned => {
+                write!(f, "audio ring buffer lock was poisoned")
+            }
+            CaptureRuntimeError::Stream(msg) => write!(f, "audio capture stream error: {msg}"),
+        }
+    }
+}
+
+/// Shared, thread-safe capture diagnostics the real-time callback (writer)
+/// reports into and the rest of the app (reader) observes (issues #44/#59,
+/// #58). Pure bookkeeping over an atomic counter and a small mutex-guarded
+/// slot — no OS calls, fully unit-testable without a real audio device.
+///
+/// [`Self::record_dropped_callback`] is called instead of blocking when the
+/// ring-buffer lock is contended (issue #58: the real-time thread must never
+/// block on a contended `std::sync::Mutex`, so a contended callback drops its
+/// samples and counts the drop rather than waiting); [`Self::record_error`]
+/// is called instead of `eprintln!` for a poisoned lock or a `cpal` stream
+/// error (issue #59), so the app can surface degraded-capture state (e.g. an
+/// error tray icon) instead of it vanishing into a packaged app's invisible
+/// stderr.
+#[derive(Debug, Default)]
+pub struct CaptureDiagnostics {
+    dropped_callbacks: std::sync::atomic::AtomicU64,
+    last_error: std::sync::Mutex<Option<CaptureRuntimeError>>,
+}
+
+impl CaptureDiagnostics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that one real-time callback dropped its samples because the
+    /// ring-buffer lock was contended (issue #58).
+    pub fn record_dropped_callback(&self) {
+        // TODO(#58): not yet implemented — placeholder so the RED test
+        // commit compiles.
+    }
+
+    /// Total callbacks that have dropped samples due to lock contention so
+    /// far.
+    pub fn dropped_callbacks(&self) -> u64 {
+        0
+    }
+
+    /// Record a structured capture error (issue #59), overwriting whatever
+    /// was previously recorded. Best-effort: if the diagnostics mutex itself
+    /// were ever poisoned, this silently no-ops rather than panicking the
+    /// real-time thread.
+    pub fn record_error(&self, _error: CaptureRuntimeError) {
+        // TODO(#59): not yet implemented — placeholder so the RED test
+        // commit compiles.
+    }
+
+    /// The most recently recorded capture error, if any.
+    pub fn last_error(&self) -> Option<CaptureRuntimeError> {
+        None
+    }
+
+    /// Clear the recorded error (e.g. once the app has surfaced/acknowledged
+    /// it).
+    pub fn clear_error(&self) {
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -388,6 +507,105 @@ mod tests {
         rb.extend(&[1.0, 2.0]);
         rb.extend(&[3.0]);
         assert_eq!(rb.window(), vec![2.0, 3.0]);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #58: scratch-buffer (allocation-free) downmix/resample variant
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn downmix_resample_into_matches_the_allocating_version() {
+        let stereo = [1.0, -1.0, 0.5, 0.3, 0.2, -0.2];
+        let expected = downmix_resample(&stereo, 2, TARGET_SAMPLE_RATE);
+
+        let mut mono_scratch = Vec::new();
+        let mut out = Vec::new();
+        downmix_resample_into(&stereo, 2, TARGET_SAMPLE_RATE, &mut mono_scratch, &mut out);
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn downmix_resample_into_reuses_buffers_without_leaking_prior_call_data() {
+        let mut mono_scratch = Vec::new();
+        let mut out = Vec::new();
+
+        // First call: a long buffer.
+        let first = sine_wave(440.0, TARGET_SAMPLE_RATE, 1_000, 1.0);
+        downmix_resample_into(&first, 1, TARGET_SAMPLE_RATE, &mut mono_scratch, &mut out);
+        assert_eq!(out.len(), 1_000);
+        let capacity_after_first = out.capacity();
+
+        // Second call: a much shorter buffer — `out` must reflect ONLY the
+        // second call's contents (proving `clear()` ran), while its
+        // capacity is retained from the first call rather than being
+        // reallocated from scratch (the entire point of the scratch-buffer
+        // seam: steady-state calls shouldn't (re)allocate).
+        let second = vec![0.25_f32; 10];
+        downmix_resample_into(&second, 1, TARGET_SAMPLE_RATE, &mut mono_scratch, &mut out);
+        assert_eq!(out.len(), 10);
+        assert_eq!(out, second, "stale samples from the first call must not linger");
+        assert!(
+            out.capacity() >= capacity_after_first,
+            "capacity should be retained/reused across calls, not shrunk"
+        );
+    }
+
+    #[test]
+    fn downmix_resample_into_handles_stereo_downmix_and_resample_together() {
+        let input = sine_wave(440.0, 8_000, 2_000, 1.0);
+        // Interleave into a fake stereo signal (duplicate channel).
+        let stereo: Vec<f32> = input.iter().flat_map(|&s| [s, s]).collect();
+
+        let mut mono_scratch = Vec::new();
+        let mut out = Vec::new();
+        downmix_resample_into(&stereo, 2, 8_000, &mut mono_scratch, &mut out);
+
+        let expected = downmix_resample(&stereo, 2, 8_000);
+        assert_eq!(out, expected);
+        assert_eq!(out.len(), 4_000); // 8kHz -> 16kHz doubles the sample count
+    }
+
+    // -----------------------------------------------------------------
+    // Issues #44/#59: structured capture diagnostics
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn capture_diagnostics_starts_with_no_drops_and_no_error() {
+        let diag = CaptureDiagnostics::new();
+        assert_eq!(diag.dropped_callbacks(), 0);
+        assert_eq!(diag.last_error(), None);
+    }
+
+    #[test]
+    fn capture_diagnostics_counts_dropped_callbacks() {
+        let diag = CaptureDiagnostics::new();
+        diag.record_dropped_callback();
+        diag.record_dropped_callback();
+        diag.record_dropped_callback();
+        assert_eq!(diag.dropped_callbacks(), 3);
+    }
+
+    #[test]
+    fn capture_diagnostics_records_and_overwrites_the_last_error() {
+        let diag = CaptureDiagnostics::new();
+        diag.record_error(CaptureRuntimeError::BufferLockPoisoned);
+        assert_eq!(diag.last_error(), Some(CaptureRuntimeError::BufferLockPoisoned));
+
+        diag.record_error(CaptureRuntimeError::Stream("device disconnected".to_string()));
+        assert_eq!(
+            diag.last_error(),
+            Some(CaptureRuntimeError::Stream("device disconnected".to_string())),
+            "a newer error must overwrite the older one, not accumulate"
+        );
+    }
+
+    #[test]
+    fn capture_diagnostics_clear_error_resets_to_none() {
+        let diag = CaptureDiagnostics::new();
+        diag.record_error(CaptureRuntimeError::BufferLockPoisoned);
+        diag.clear_error();
+        assert_eq!(diag.last_error(), None);
     }
 
     #[test]
