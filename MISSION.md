@@ -62,6 +62,7 @@
   - Naming, referencing, or linking any competing dictation product or company in any document, commit message, file, code identifier, issue, or PR. Describe functionality generically.
   - Any network call from the product outside the §5 allowlist; any telemetry/analytics; sending audio or text off-device.
   - Logging or persisting raw clipboard contents; committing model files or user data (history DB, settings) to the repo.
+  - Committing real user recordings as test fixtures — STT/cleanup fixtures must be synthetic (TTS) or already-public audio/text, since fleet engines transmit repo content (ADR-0007).
 - **Enable branch protection on `main`?** yes.
 
 ## 8. Definition of Done (project-specific acceptance)
