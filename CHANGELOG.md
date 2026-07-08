@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then appends an entry with an optional expanded timestamp prefix (AC-3,
   AC-11). Cursor-paste target and the router dispatching between the two
   remain out of scope (issue #21). Adds `tempfile` as a dev-dependency for
+- `Cleanup` trait, `Tone`, and `CleanupError` in `src-tauri/src/cleanup.rs`
+  (ADR-0005, PRD AC-4 basis), plus the always-available `RegexCleanup`
+  baseline: filler-word removal (unconditional `um`/`uh`/`er`; comma-flanked
+  `like`/`you know` only, to avoid stripping comparative/literal usage),
+  whitespace collapse, sentence-start capitalization, and sentence-final
+  punctuation. Fully unit-tested, pure logic, no self-correction resolution
 
 ### Changed
 
