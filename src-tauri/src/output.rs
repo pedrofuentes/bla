@@ -973,4 +973,69 @@ mod tests {
         let contents = fs::read_to_string(&written).unwrap();
         assert_eq!(contents, "[23:59]nested dirs entry\n");
     }
+
+    // -----------------------------------------------------------------
+    // Issue #98: a file-mode template with literal `/` separators (as a
+    // user would type into settings — this app's templating convention
+    // always uses `/`, never the host OS's separator) must still create the
+    // right nested directories and append correctly. Built by string
+    // concatenation with a hard-coded `/`, deliberately *not*
+    // `Path::join` (which would silently use the host separator and defeat
+    // the point), so this exercises the same literal-`/` string a Windows
+    // build would receive from settings.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn append_entry_creates_nested_dirs_from_a_literal_forward_slash_template_issue_98() {
+        let dir = tempdir().unwrap();
+        let template = format!(
+            "{}/sub/dir/{{{{date:YYYY-MM-DD}}}}.md",
+            dir.path().display()
+        );
+        let config = FileConfig {
+            path_template: template,
+            timestamp_prefix_template: None,
+        };
+
+        let written = append_entry(&config, "literal slash entry", clock(2026, 7, 7, 9, 5))
+            .expect("append_entry must succeed for a literal-'/' template");
+
+        let expected = dir.path().join("sub").join("dir").join("2026-07-07.md");
+        assert_eq!(written, expected);
+        assert!(
+            dir.path().join("sub").join("dir").is_dir(),
+            "intermediate directories from the literal-'/' template must be created"
+        );
+        assert_eq!(
+            fs::read_to_string(&expected).unwrap(),
+            "literal slash entry\n"
+        );
+    }
+
+    #[test]
+    fn append_entry_creates_nested_dirs_from_a_slash_date_token_plus_trailing_segment_issue_98() {
+        let dir = tempdir().unwrap();
+        // `{{date:YYYY/MM/DD}}` expands to a string containing its own `/`
+        // separators, followed by a literal `/note.md` segment — two
+        // sources of `/` compounding in one template.
+        let template = format!("{}/{{{{date:YYYY/MM/DD}}}}/note.md", dir.path().display());
+        let config = FileConfig {
+            path_template: template,
+            timestamp_prefix_template: Some("{{time:HH:mm}} ".to_string()),
+        };
+
+        let written = append_entry(&config, "compound slash entry", clock(2026, 12, 3, 23, 59))
+            .expect("append_entry must succeed for a slash-producing date token");
+
+        let expected = dir.path().join("2026").join("12").join("03").join("note.md");
+        assert_eq!(written, expected);
+        assert!(
+            dir.path().join("2026").join("12").join("03").is_dir(),
+            "every intermediate directory implied by the date token's '/'s must be created"
+        );
+        assert_eq!(
+            fs::read_to_string(&expected).unwrap(),
+            "23:59 compound slash entry\n"
+        );
+    }
 }
