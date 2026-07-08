@@ -126,6 +126,20 @@ impl ClipboardPayload {
     }
 }
 
+/// Given the transcript text we wrote to the clipboard (`set_to`) and what
+/// the clipboard actually holds after the synthetic paste + restore delay
+/// (`observed`), decide whether it's safe to restore the pre-dictation
+/// clipboard contents (ADR-0003, PRD AC-9).
+///
+/// Restoring is safe exactly when nothing else touched the clipboard while
+/// we owned it — i.e. `observed` still equals what we set. If some other
+/// actor wrote to the clipboard in the meantime, `observed` differs from
+/// `set_to`, and clobbering that newer value with the old, pre-dictation
+/// contents would lose the user's data — so the restore is skipped.
+pub fn should_restore_clipboard(set_to: &str, observed: &str) -> bool {
+    observed == set_to
+}
+
 /// Append `entry` to the file-mode target described by `config`, resolving
 /// the templated path against `clock`. Creates any missing intermediate
 /// directories and the file itself if absent (AC-3), and prepends the
