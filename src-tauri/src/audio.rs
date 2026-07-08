@@ -4,6 +4,399 @@
 //! expects, and buffers samples for the duration of a hold-to-record session.
 //!
 //! OS-integration module (AGENTS.md §OS-integration exemption): thin glue only —
-//! no cleanup/decision logic lives here.
-//!
-//! Stub — no logic yet; implemented in a later M1 increment.
+//! no cleanup/decision logic lives here. All decisions — buffering, overflow
+//! behavior, resampling, level metering, WAV export — live in pure functions
+//! below, fully unit-tested without needing a real audio device (ADR-0002,
+//! ADR-0007: fixtures are synthetic signals generated in-code, never real
+//! recordings).
+
+/// Sample rate the STT stage (`stt.rs`) expects all captured audio to be
+/// resampled to before transcription.
+pub const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+/// Fixed-capacity ring buffer of `f32` audio samples.
+///
+/// Pure logic (no OS calls) — TDD-mandatory. Once at capacity, pushing a new
+/// sample drops the oldest buffered sample first, so a hold-to-record session
+/// always keeps the most recent window of audio.
+#[derive(Debug)]
+pub struct RingBuffer {
+    capacity: usize,
+    buf: std::collections::VecDeque<f32>,
+}
+
+impl RingBuffer {
+    /// Create an empty ring buffer that holds at most `capacity` samples.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            buf: std::collections::VecDeque::with_capacity(capacity),
+        }
+    }
+
+    /// Maximum number of samples this buffer can hold.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Number of samples currently buffered.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// True if no samples are currently buffered.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Push one sample. If the buffer is at capacity, the oldest sample is
+    /// dropped first.
+    pub fn push(&mut self, sample: f32) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.buf.len() == self.capacity {
+            self.buf.pop_front();
+        }
+        self.buf.push_back(sample);
+    }
+
+    /// Push a slice of samples, applying the same overflow behavior as
+    /// [`RingBuffer::push`] to each one in order.
+    pub fn extend(&mut self, samples: &[f32]) {
+        for &sample in samples {
+            self.push(sample);
+        }
+    }
+
+    /// Copy out the currently buffered window, oldest sample first, without
+    /// clearing the buffer.
+    pub fn window(&self) -> Vec<f32> {
+        self.buf.iter().copied().collect()
+    }
+
+    /// Remove and return all buffered samples, oldest sample first, leaving
+    /// the buffer empty.
+    pub fn drain(&mut self) -> Vec<f32> {
+        self.buf.drain(..).collect()
+    }
+}
+
+/// A ring buffer shared between the capture callback (writer) and the rest
+/// of the app (reader) — the only piece of shared mutable state the OS-glue
+/// entry point below touches.
+pub type SharedRingBuffer = std::sync::Arc<std::sync::Mutex<RingBuffer>>;
+
+/// Downmix an interleaved multi-channel buffer to mono (by averaging the
+/// channels of each frame) and linearly resample it from `input_rate` to
+/// [`TARGET_SAMPLE_RATE`], the rate `stt` expects.
+///
+/// `input` is interleaved: `channels` samples per frame
+/// (`[ch0, ch1, ..., ch0, ch1, ...]`). The resampler is a simple linear
+/// interpolation — adequate for feeding speech into whisper, not a
+/// general-purpose DSP resampler.
+pub fn downmix_resample(input: &[f32], channels: u16, input_rate: u32) -> Vec<f32> {
+    let mono = downmix_to_mono(input, channels);
+    resample_linear(&mono, input_rate, TARGET_SAMPLE_RATE)
+}
+
+fn downmix_to_mono(input: &[f32], channels: u16) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    if channels == 1 {
+        return input.to_vec();
+    }
+    input
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .collect()
+}
+
+/// Linear-interpolation resampler: maps each output sample index back to a
+/// fractional position in the input and interpolates between its two
+/// neighboring samples. Documented tradeoff: simple and dependency-free, at
+/// the cost of some high-frequency aliasing versus a windowed-sinc resampler
+/// — acceptable for speech destined for whisper (ADR-0002).
+fn resample_linear(mono: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
+    if mono.is_empty() || input_rate == 0 {
+        return Vec::new();
+    }
+    if input_rate == output_rate {
+        return mono.to_vec();
+    }
+    let ratio = output_rate as f64 / input_rate as f64;
+    let out_len = ((mono.len() as f64) * ratio).round() as usize;
+    let last_idx = mono.len() - 1;
+    (0..out_len)
+        .map(|i| {
+            let src_pos = i as f64 / ratio;
+            let idx = (src_pos.floor() as usize).min(last_idx);
+            let frac = (src_pos - idx as f64) as f32;
+            let a = mono[idx];
+            let b = mono[(idx + 1).min(last_idx)];
+            a + (b - a) * frac
+        })
+        .collect()
+}
+
+/// Root-mean-square level of a sample window — used to drive the pill's live
+/// waveform meter. Returns `0.0` for an empty window.
+pub fn rms_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Peak (max absolute value) level of a sample window. Returns `0.0` for an
+/// empty window.
+pub fn peak_level(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()))
+}
+
+/// Write a captured window of 16 kHz mono `f32` samples out as a 16-bit PCM
+/// WAV file, so the pipeline and tests can round-trip a captured window
+/// (e.g. as an `stt` input fixture).
+pub fn write_wav_16k_mono(samples: &[f32], path: &std::path::Path) -> std::io::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: TARGET_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(hound_to_io_err)?;
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm = (clamped * i16::MAX as f32).round() as i16;
+        writer.write_sample(pcm).map_err(hound_to_io_err)?;
+    }
+    writer.finalize().map_err(hound_to_io_err)
+}
+
+fn hound_to_io_err(err: hound::Error) -> std::io::Error {
+    std::io::Error::other(err)
+}
+
+/// OS-integration glue (AGENTS.md §OS-integration exemption): opens the
+/// default input device and streams captured audio into `buffer`. Every
+/// decision — downmixing, resampling, overflow behavior — is delegated to
+/// the pure functions above; this function only wires cpal callbacks to
+/// them, so it stays thin and untested (no audio device in CI).
+pub fn start_capture(buffer: SharedRingBuffer) -> Result<cpal::Stream, CaptureError> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or(CaptureError::NoInputDevice)?;
+    let config = device.default_input_config()?;
+    let channels = config.channels();
+    let input_rate = config.sample_rate();
+
+    let stream = device.build_input_stream(
+        config.into(),
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            let mono_16k = downmix_resample(data, channels, input_rate);
+            if let Ok(mut buf) = buffer.lock() {
+                buf.extend(&mono_16k);
+            }
+        },
+        |err| eprintln!("audio capture stream error: {err}"),
+        None,
+    )?;
+    stream.play()?;
+    Ok(stream)
+}
+
+/// Errors from opening the input device or building/starting the capture
+/// stream — OS-glue error plumbing, not decision logic.
+#[derive(Debug)]
+pub enum CaptureError {
+    NoInputDevice,
+    Cpal(cpal::Error),
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::NoInputDevice => write!(f, "no default input audio device available"),
+            CaptureError::Cpal(e) => write!(f, "audio capture error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
+impl From<cpal::Error> for CaptureError {
+    fn from(e: cpal::Error) -> Self {
+        CaptureError::Cpal(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate a synthetic sine-wave signal in-code (ADR-0007: fixtures must
+    /// be synthetic or public-domain, never real recordings).
+    fn sine_wave(freq_hz: f32, sample_rate: u32, num_samples: usize, amplitude: f32) -> Vec<f32> {
+        (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                amplitude * (2.0 * std::f32::consts::PI * freq_hz * t).sin()
+            })
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn downmix_resample_averages_stereo_channels_at_matching_rate() {
+        // input_rate == TARGET_SAMPLE_RATE, so only the downmix applies.
+        let stereo = [1.0, -1.0, 0.5, 0.3];
+        let mono = downmix_resample(&stereo, 2, TARGET_SAMPLE_RATE);
+        assert_eq!(mono.len(), 2);
+        assert!((mono[0] - 0.0).abs() < 1e-6);
+        assert!((mono[1] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn downmix_resample_passes_mono_through_unchanged_at_matching_rate() {
+        let mono_in = vec![0.1, 0.2, -0.3];
+        let out = downmix_resample(&mono_in, 1, TARGET_SAMPLE_RATE);
+        assert_eq!(out, mono_in);
+    }
+
+    #[test]
+    fn downmix_resample_upsamples_8khz_to_16khz_expected_length() {
+        let input = sine_wave(440.0, 8_000, 4_000, 1.0);
+        let out = downmix_resample(&input, 1, 8_000);
+        assert_eq!(out.len(), 8_000);
+    }
+
+    #[test]
+    fn downmix_resample_downsamples_44100_to_16khz_expected_length() {
+        let input = sine_wave(440.0, 44_100, 44_100, 1.0);
+        let out = downmix_resample(&input, 1, 44_100);
+        assert_eq!(out.len(), 16_000);
+    }
+
+    #[test]
+    fn downmix_resample_preserves_sine_amplitude_within_tolerance() {
+        let input = sine_wave(440.0, 8_000, 4_000, 1.0);
+        let out = downmix_resample(&input, 1, 8_000);
+        let expected_rms = 1.0_f32 / std::f32::consts::SQRT_2;
+        assert!(
+            (rms(&out) - expected_rms).abs() < 0.05,
+            "resampled RMS {} too far from expected {}",
+            rms(&out),
+            expected_rms
+        );
+    }
+
+    #[test]
+    fn rms_level_of_full_scale_square_wave_is_one() {
+        let square = [1.0, -1.0, 1.0, -1.0];
+        assert!((rms_level(&square) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_level_of_empty_window_is_zero() {
+        assert_eq!(rms_level(&[]), 0.0);
+    }
+
+    #[test]
+    fn peak_level_returns_max_absolute_sample() {
+        let samples = [0.1, -0.9, 0.5, 0.2];
+        assert!((peak_level(&samples) - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn peak_level_of_empty_window_is_zero() {
+        assert_eq!(peak_level(&[]), 0.0);
+    }
+
+    #[test]
+    fn wav_export_round_trips_header_and_sample_count() {
+        let samples = sine_wave(440.0, TARGET_SAMPLE_RATE, 1_600, 0.8);
+        let path = std::env::temp_dir().join(format!(
+            "bla_audio_test_wav_round_trip_{}.wav",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        write_wav_16k_mono(&samples, &path).expect("write_wav_16k_mono should succeed");
+
+        let mut reader = hound::WavReader::open(&path).expect("WAV file should be readable");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, TARGET_SAMPLE_RATE);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        assert_eq!(reader.len() as usize, samples.len());
+
+        let read_back: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("sample should decode") as f32 / i16::MAX as f32)
+            .collect();
+        assert_eq!(read_back.len(), samples.len());
+        for (original, decoded) in samples.iter().zip(read_back.iter()) {
+            assert!(
+                (original - decoded).abs() < 0.001,
+                "round-tripped sample {} too far from original {}",
+                decoded,
+                original
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn new_buffer_is_empty() {
+        let rb = RingBuffer::new(4);
+        assert_eq!(rb.capacity(), 4);
+        assert_eq!(rb.len(), 0);
+        assert!(rb.is_empty());
+        assert!(rb.window().is_empty());
+    }
+
+    #[test]
+    fn push_below_capacity_keeps_all_samples_in_order() {
+        let mut rb = RingBuffer::new(4);
+        rb.push(1.0);
+        rb.push(2.0);
+        rb.push(3.0);
+        assert_eq!(rb.len(), 3);
+        assert_eq!(rb.window(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn push_past_capacity_drops_oldest_sample_first() {
+        let mut rb = RingBuffer::new(3);
+        rb.extend(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        // Capacity 3, pushed 5 samples: oldest (1.0, 2.0) dropped.
+        assert_eq!(rb.len(), 3);
+        assert_eq!(rb.window(), vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn extend_applies_overflow_per_sample() {
+        let mut rb = RingBuffer::new(2);
+        rb.extend(&[1.0, 2.0]);
+        rb.extend(&[3.0]);
+        assert_eq!(rb.window(), vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn drain_empties_buffer_and_returns_window_order() {
+        let mut rb = RingBuffer::new(4);
+        rb.extend(&[1.0, 2.0, 3.0]);
+        let drained = rb.drain();
+        assert_eq!(drained, vec![1.0, 2.0, 3.0]);
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+    }
+}
