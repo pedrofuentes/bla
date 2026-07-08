@@ -15,6 +15,12 @@ Phase 0/1 — harness bootstrapped; discovery (PRD) and board seeding for M1 in 
 - Minimal shell: tray icon with state + output-mode switch, first-run Whisper-model downloader, persisted hotkey/model/output settings
 - Acceptance: AC-1…AC-7 (MISSION.md §8)
 
+### Windows runtime support (cross-cutting)
+- Windows 10/11 as a supported dev/runtime target alongside macOS, delivered as a series of docs + CI + implementation increments rather than a single versioned milestone:
+  - Increment A (this milestone): Windows build-prerequisite docs (README/CONTRIBUTING/DEVELOPMENT-WORKFLOW), and a hardened Windows CI job that builds and runs the test suite (`cargo build --all-targets --all-features`, `cargo test --all-features`) with a deterministic LLVM/libclang install, instead of a compile-only check.
+  - Later increments: closing any remaining Windows-specific runtime gaps (hotkeys, paste, tray) as they're found.
+  - Windows packaging (`.exe`/`.msi` via GitHub Release) is tracked under M5, alongside the macOS `.dmg`.
+
 ### M2 — UI shell (v0.2)
 - Always-on-top recording pill: live waveform from streamed audio levels; recording/transcribing/done/error states
 - Full tabbed settings window (General: hotkeys, model pick, hold-vs-toggle, launch-at-login)
@@ -32,13 +38,14 @@ Phase 0/1 — harness bootstrapped; discovery (PRD) and board seeding for M1 in 
 ### M5 — Polish & packaging (v1.0)
 - First-run onboarding: mic + Accessibility permission walkthrough, model download with progress
 - Settings import/export; README with visuals; CONTRIBUTING
-- macOS .dmg via `tauri build` (GitHub Release — human-required gate); Windows build compile-verified
+- macOS .dmg and Windows .exe/.msi via `tauri build` (GitHub Release — human-required gate)
 
 ## Key Milestones
 
 | Milestone | Version | Status |
 |-----------|---------|--------|
 | M1 — MVP dictation pipeline | v0.1 | in-progress |
+| Windows runtime support | cross-cutting | in-progress (Increment A) |
 | M2 — UI shell | v0.2 | pending |
 | M3 — Context features | v0.3 | pending |
 | M4 — Command mode & snippets | v0.4 | pending |
