@@ -16,6 +16,12 @@ mod cleanup;
 mod commands;
 mod context;
 mod hotkeys;
+// `pub` (issue #24, ADR-0004): the first-run model downloader's registry,
+// AC-12 network guard, and download orchestration are real, tested,
+// standalone-usable API surface as of this increment (not yet wired into
+// commands.rs), so keeping the module private would make rustc flag them
+// as dead code — same rationale as `stt` below.
+pub mod models;
 mod output;
 mod store;
 // `pub` (rather than private like its stub siblings): stt's Stt trait,
