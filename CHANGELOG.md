@@ -43,18 +43,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the thin, non-decision-making `ureq`-backed glue), so request shaping,
   response parsing, and the unreachable-fallback decision are pure and
   unit-tested against a stub transport — no network call or running Ollama
-  needed in `cargo test`. Any transport failure maps to
-  `CleanupError::Unreachable` (AC-4) rather than propagating, so a future
-  pipeline dispatch can fall back to `RegexCleanup` with no error surfaced
-  to the paste path. The rewrite-only cleanup prompt lives in the versioned
+  needed in `cargo test`. Any transport failure — connection refused,
+  timeout, or unparsable response — maps to `CleanupError::Unreachable`
+  (AC-4) rather than propagating, so a future pipeline dispatch can fall
+  back to `RegexCleanup` with no error surfaced to the paste path. The
+  `UreqTransport` agent is built with connect/read timeouts (caller-
+  configurable, 2 s / 30 s defaults) so a hung-but-reachable endpoint can't
+  block the sync call forever, and with `redirects(0)` so a local responder
+  can't bounce the request off-origin (single-origin egress invariant,
+  MISSION §5). The rewrite-only cleanup prompt lives in the versioned
   `src-tauri/prompts/cleanup_v1.txt` (never answers, never adds content,
   removes fillers, resolves self-corrections, restores punctuation, renders
   spoken lists as bullets, honors the requested tone) and is embedded via
   `include_str!`; a fixture-regression test pins the prompt's constraints
-  and an AC-10 fixture (self-corrections + missing punctuation + a spoken
-  list) asserts the request carries the prompt and the raw input verbatim
-  and that a well-behaved stub response passes through faithfully. Adds
-  `ureq` as a new dependency.
+  and an AC-10 request-shape test deserializes the outgoing request and
+  asserts per field that the rewrite-only prompt and the raw input land in
+  the correct fields (so a field swap fails CI). Adds `ureq` (with
+  `default-features = false` — no TLS stack needed for localhost plain
+  HTTP) as a new dependency.
 
 ### Changed
 

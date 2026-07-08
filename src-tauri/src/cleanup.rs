@@ -29,6 +29,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Controls how aggressively a [`Cleanup`] implementation rewrites the raw
 /// transcript.
@@ -192,8 +193,14 @@ pub const CLEANUP_PROMPT_V1: &str = include_str!("../prompts/cleanup_v1.txt");
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     /// The endpoint could not be reached at all (connection refused, DNS
-    /// failure, timeout, ...).
+    /// failure, ...).
     ConnectionFailed,
+    /// The call was reachable but did not complete within the configured
+    /// connect/read timeout (a hung-but-reachable endpoint). Kept distinct
+    /// from [`Self::ConnectionFailed`] so a hung Ollama can't block the
+    /// sync call forever; still maps to [`CleanupError::Unreachable`] so the
+    /// AC-4 fallback fires.
+    Timeout,
     /// The endpoint responded, but the body wasn't a response this module
     /// can parse.
     InvalidResponse,
@@ -210,22 +217,84 @@ pub trait OllamaTransport {
     fn post(&self, url: &str, body: &str) -> Result<String, TransportError>;
 }
 
-/// The real transport: a synchronous `ureq` POST. Contains no logic beyond
-/// making the call and translating its outcome to [`TransportError`] — by
-/// design, this is the only code in the module that can open a socket, and
-/// it only ever talks to the URL it's given (which `OllamaCleanup` builds
-/// from its configured, localhost-by-default base URL — MISSION §5).
-pub struct UreqTransport;
+/// Default connect timeout for [`UreqTransport`] — how long to wait to
+/// establish the TCP connection to Ollama before giving up (and falling
+/// back to `RegexCleanup`).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default read timeout for [`UreqTransport`] — how long to wait for the
+/// model's response once connected. Generous because local generation can
+/// take a few seconds, but bounded so a hung endpoint can't block forever.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The real transport: a synchronous `ureq` POST over a preconfigured
+/// [`ureq::Agent`]. Contains no logic beyond making the call and translating
+/// its outcome to [`TransportError`] — by design, this is the only code in
+/// the module that can open a socket, and it only ever talks to the URL it's
+/// given (which `OllamaCleanup` builds from its configured,
+/// localhost-by-default base URL — MISSION §5).
+///
+/// The agent is built with **`redirects(0)`** so a squatting responder that
+/// answers with a 3xx can't bounce the request to another host — the
+/// single-origin (localhost-only) egress invariant holds even under a
+/// hostile local responder. Connect and read timeouts are set (caller-
+/// configurable via [`Self::new`]) so a hung-but-reachable endpoint fails
+/// with [`TransportError::Timeout`] instead of blocking the sync call
+/// forever.
+pub struct UreqTransport {
+    agent: ureq::Agent,
+}
+
+impl UreqTransport {
+    /// Builds a transport whose agent enforces `connect_timeout`,
+    /// `read_timeout`, and no redirects.
+    pub fn new(connect_timeout: Duration, read_timeout: Duration) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(connect_timeout)
+            .timeout_read(read_timeout)
+            .build();
+        Self { agent }
+    }
+}
+
+impl Default for UreqTransport {
+    /// A transport with [`DEFAULT_CONNECT_TIMEOUT`] / [`DEFAULT_READ_TIMEOUT`].
+    fn default() -> Self {
+        Self::new(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+    }
+}
 
 impl OllamaTransport for UreqTransport {
     fn post(&self, url: &str, body: &str) -> Result<String, TransportError> {
-        let response = ureq::post(url)
+        let response = self
+            .agent
+            .post(url)
             .set("Content-Type", "application/json")
             .send_string(body)
-            .map_err(|_| TransportError::ConnectionFailed)?;
+            .map_err(classify_ureq_error)?;
         response
             .into_string()
             .map_err(|_| TransportError::InvalidResponse)
+    }
+}
+
+/// Best-effort classification of a `ureq` error into a [`TransportError`].
+/// A non-2xx status or an unparsable/redirect response is treated as an
+/// invalid response; a timeout is surfaced distinctly; anything else is a
+/// connection failure. All three map to [`CleanupError::Unreachable`]
+/// upstream, so this only affects diagnostics, never the fallback decision.
+fn classify_ureq_error(err: ureq::Error) -> TransportError {
+    match err {
+        ureq::Error::Status(_, _) => TransportError::InvalidResponse,
+        ureq::Error::Transport(transport) => {
+            let msg = transport.to_string().to_lowercase();
+            if msg.contains("timed out") || msg.contains("timeout") {
+                TransportError::Timeout
+            } else {
+                TransportError::ConnectionFailed
+            }
+        }
     }
 }
 
@@ -269,6 +338,14 @@ pub struct OllamaCleanup<T: OllamaTransport> {
 impl<T: OllamaTransport> OllamaCleanup<T> {
     /// Builds an `OllamaCleanup` against `base_url` (no trailing slash
     /// required — it's trimmed) using `model` and the given transport.
+    ///
+    /// MISSION §5 invariant: `base_url` must resolve to the local machine
+    /// (`localhost`/`127.0.0.1`/`[::1]`) — Ollama is the only permitted
+    /// runtime origin besides model download, and it runs on-device. This
+    /// isn't enforced here yet: the pipeline wiring (issue #25) is where a
+    /// non-local base URL should be rejected at config time rather than
+    /// silently reached. `redirects(0)` on [`UreqTransport`] already prevents
+    /// a local responder from bouncing the request off-origin at runtime.
     pub fn new(base_url: impl Into<String>, model: impl Into<String>, transport: T) -> Self {
         Self {
             base_url: base_url.into(),
@@ -625,7 +702,10 @@ mod ollama_tests {
             parsed["prompt"], FIXTURE_RAW,
             "the `prompt` field must carry the raw transcript verbatim, not the prompt"
         );
-        assert_eq!(parsed["model"], "llama3", "the configured model must be sent");
+        assert_eq!(
+            parsed["model"], "llama3",
+            "the configured model must be sent"
+        );
         assert_eq!(
             parsed["stream"], false,
             "streaming must be disabled so the response is a single JSON object"
