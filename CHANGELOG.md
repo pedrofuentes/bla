@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (default 300 ms) that discards accidentally-short Hold presses without
   emitting a dictation. OS wiring (`tauri-plugin-global-shortcut`) remains a
   separate, thin, TDD-exempt stub.
+- `output.rs`: file-mode output target's path templating and file-append
+  logic — `{{date:YYYY-MM-DD}}` and `{{time:HH:mm}}` token expansion against
+  an injected `Clock` (deterministic, no OS-clock calls), and `append_entry`,
+  which creates missing intermediate directories and the file if absent,
+  then appends an entry with an optional expanded timestamp prefix (AC-3,
+  AC-11). Cursor-paste target and the router dispatching between the two
+  remain out of scope (issue #21). Adds `tempfile` as a dev-dependency for
 
 ### Changed
 
