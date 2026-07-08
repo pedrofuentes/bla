@@ -495,6 +495,109 @@ mod tests {
         assert_eq!(clipboard.get().unwrap(), "pre-dictation clipboard contents");
     }
 
+    /// A paste synthesizer that always fails — simulates `enigo` failing on
+    /// first-run macOS before Accessibility permission is granted (issue
+    /// #65).
+    struct FailingPaste;
+
+    impl PasteSynthesizer for FailingPaste {
+        fn synthesize_paste(&self) -> io::Result<()> {
+            Err(io::Error::other(
+                "synthetic paste synthesis failure (simulates enigo failing before Accessibility is granted)",
+            ))
+        }
+    }
+
+    #[test]
+    fn clipboard_is_restored_when_paste_synthesis_fails_issue_65() {
+        // Issue #65 (Sentinel 🔴-when-wired): a paste-synthesis failure must
+        // NOT leave the transcript permanently on the clipboard. Before the
+        // fix, the `?` on `paste.synthesize_paste()` returned early and
+        // skipped the restore entirely — this discriminating assertion
+        // checks the actual clipboard contents afterward, not merely that
+        // an Err was returned.
+        let clipboard = FakeClipboard::new("pre-dictation clipboard contents");
+        let paste = FailingPaste;
+        let payload = ClipboardPayload::new("the dictated transcript".to_string());
+
+        let err = paste_via_clipboard_swap(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            payload,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string().contains("synthetic paste synthesis"), true);
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "pre-dictation clipboard contents",
+            "the transcript must not be left on the clipboard when paste synthesis fails"
+        );
+    }
+
+    /// A fake clipboard whose `get()` fails on its *second* call onward —
+    /// exercises the restore-on-all-error-paths requirement (issue #65) for
+    /// the post-paste observation read, not just the paste-synthesis
+    /// failure above.
+    struct FlakyObserveClipboard {
+        contents: RefCell<String>,
+        calls: RefCell<u32>,
+    }
+
+    impl FlakyObserveClipboard {
+        fn new(initial: &str) -> Self {
+            Self {
+                contents: RefCell::new(initial.to_string()),
+                calls: RefCell::new(0),
+            }
+        }
+    }
+
+    impl Clipboard for FlakyObserveClipboard {
+        fn get(&self) -> io::Result<String> {
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls >= 2 {
+                return Err(io::Error::other("clipboard read failed"));
+            }
+            Ok(self.contents.borrow().clone())
+        }
+
+        fn set(&self, contents: &str) -> io::Result<()> {
+            *self.contents.borrow_mut() = contents.to_string();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_is_restored_when_the_post_paste_observation_read_fails_issue_65() {
+        // Issue #65: even when the *second* clipboard read (the one used to
+        // decide whether to restore) fails, the pre-dictation contents must
+        // still be restored best-effort, and the original error must still
+        // propagate to the caller.
+        let clipboard = FlakyObserveClipboard::new("pre-dictation clipboard contents");
+        let paste = FakePaste::new();
+        let payload = ClipboardPayload::new("the dictated transcript".to_string());
+
+        let err = paste_via_clipboard_swap(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            payload,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "clipboard read failed");
+        assert_eq!(
+            clipboard.contents.borrow().as_str(),
+            "pre-dictation clipboard contents",
+            "the transcript must not be left on the clipboard when the post-paste read fails"
+        );
+    }
+
     #[test]
     fn clipboard_swap_paste_skips_restore_if_clipboard_changed_during_delay() {
         let clipboard = FakeClipboard::new("pre-dictation clipboard contents");
