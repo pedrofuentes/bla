@@ -530,6 +530,17 @@ mod tests {
     }
 
     #[test]
+    fn regex_cleanup_does_not_capitalize_after_a_decimal_point_issue_54() {
+        // Sentinel issue #54: the sentence-start capitalization pass fires
+        // on ANY '.', including the decimal point in a number, so "3.14
+        // exactly" wrongly becomes "3.14 Exactly." — the word after a
+        // decimal point isn't a new sentence and must stay lowercase.
+        let cleanup = RegexCleanup;
+        let got = cleanup.clean("3.14 exactly", Tone::Neutral).unwrap();
+        assert_eq!(got, "3.14 exactly.");
+    }
+
+    #[test]
     fn regex_cleanup_no_orphan_comma_after_trailing_filler_issue_53() {
         // Sentinel issue #53: removing a trailing comma-preceded filler must
         // not leave a dangling comma that then collides with the
