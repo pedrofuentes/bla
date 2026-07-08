@@ -230,8 +230,104 @@ mod clipboard_payload_trait_assertions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Fake clipboard for tests: an in-memory cell, no real OS clipboard
+    /// access.
+    struct FakeClipboard {
+        contents: RefCell<String>,
+    }
+
+    impl FakeClipboard {
+        fn new(initial: &str) -> Self {
+            Self {
+                contents: RefCell::new(initial.to_string()),
+            }
+        }
+    }
+
+    impl Clipboard for FakeClipboard {
+        fn get(&self) -> io::Result<String> {
+            Ok(self.contents.borrow().clone())
+        }
+
+        fn set(&self, contents: &str) -> io::Result<()> {
+            *self.contents.borrow_mut() = contents.to_string();
+            Ok(())
+        }
+    }
+
+    /// Fake paste synthesizer: records that it was called but never touches
+    /// the clipboard itself (mirroring the real enigo glue, which only
+    /// synthesizes a keystroke — the focused app, not our code, reads the
+    /// clipboard in response).
+    struct FakePaste {
+        called: RefCell<bool>,
+    }
+
+    impl FakePaste {
+        fn new() -> Self {
+            Self {
+                called: RefCell::new(false),
+            }
+        }
+    }
+
+    impl PasteSynthesizer for FakePaste {
+        fn synthesize_paste(&self) -> io::Result<()> {
+            *self.called.borrow_mut() = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_swap_paste_restores_pre_dictation_contents_ac9() {
+        let clipboard = FakeClipboard::new("pre-dictation clipboard contents");
+        let paste = FakePaste::new();
+        let payload = ClipboardPayload::new("the dictated transcript".to_string());
+
+        paste_via_clipboard_swap(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            payload,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert!(*paste.called.borrow());
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "pre-dictation clipboard contents"
+        );
+    }
+
+    #[test]
+    fn clipboard_swap_paste_skips_restore_if_clipboard_changed_during_delay() {
+        let clipboard = FakeClipboard::new("pre-dictation clipboard contents");
+        let paste = FakePaste::new();
+        let payload = ClipboardPayload::new("the dictated transcript".to_string());
+
+        // Simulate another actor writing to the clipboard during the
+        // restore delay, from inside the injected sleep callback.
+        paste_via_clipboard_swap(
+            &clipboard,
+            &paste,
+            |_delay| {
+                clipboard.set("someone else's newer clipboard value").unwrap();
+            },
+            payload,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "someone else's newer clipboard value"
+        );
+    }
 
     #[test]
     fn confine_accepts_a_plain_relative_path() {
