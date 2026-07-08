@@ -85,7 +85,7 @@ jobs:
         run: echo "Docs-only tree — no Cargo.toml or package.json yet. Skipping build/test/lint."
 
   windows:
-    name: windows (compile-check)
+    name: windows (build / test)
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -98,9 +98,30 @@ jobs:
         shell: bash
         run: echo "present=$(test -f Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      - name: cargo check
+      # windows-latest ships CMake and the MSVC Build Tools, but not libclang.
+      # whisper-rs-sys uses bindgen to generate bindings at build time, and
+      # bindgen needs libclang — install it deterministically here rather than
+      # relying on the runner image happening to have it.
+      - name: Install LLVM (libclang for whisper-rs-sys/bindgen)
         if: steps.cargo.outputs.present == 'true'
-        run: cargo check --all-targets --all-features
+        run: choco install llvm -y
+
+      - name: Export LIBCLANG_PATH
+        if: steps.cargo.outputs.present == 'true'
+        shell: pwsh
+        run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Ensure CMake is available
+        if: steps.cargo.outputs.present == 'true'
+        run: cmake --version
+
+      - name: cargo build
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo build --all-targets --all-features
+
+      - name: cargo test
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo test --all-features
 
       - name: Check for package.json
         id: pnpm

@@ -16,7 +16,7 @@ History, personal dictionary, and settings are stored locally on your machine an
 
 ## Requirements
 
-- **macOS** (primary supported platform; Windows build is compile-verified but not yet a supported target)
+- **macOS** (primary supported platform) or **Windows 10/11** (supported dev/runtime target)
 - **Rust** (stable toolchain, via `rustup`)
 - **Node 20+** and **pnpm**
 - Xcode Command Line Tools (for native builds on macOS)
@@ -41,6 +41,44 @@ On first run, macOS will prompt you to grant:
 - **Accessibility** access — required so bla can paste cleaned text into the focused app via synthetic keystrokes.
 
 You'll also be prompted to download a Whisper model on first launch (one-time, from Hugging Face).
+
+### Building on Windows
+
+bla builds and runs on Windows 10/11. A few native prerequisites are needed before `cargo`/`pnpm` can build the Whisper integration — install these first on a fresh machine:
+
+1. **LLVM/libclang** (required by `whisper-rs-sys`, which generates bindings via `bindgen` at build time):
+   ```powershell
+   winget install LLVM.LLVM
+   ```
+   Then set `LIBCLANG_PATH` so `bindgen` can find `libclang.dll`, e.g.:
+   ```powershell
+   setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
+   ```
+   This is the #1 gotcha on a fresh Windows machine — without it, the build fails at the `whisper-rs-sys` build script.
+
+2. **CMake** and the **MSVC C++ build tools** (needed to compile `whisper.cpp`):
+   ```powershell
+   winget install Kitware.CMake
+   ```
+   Also install Visual Studio Build Tools with the **"Desktop development with C++"** workload.
+
+3. **WebView2** — present by default on Windows 10/11; no action needed.
+
+4. **Rust MSVC toolchain**:
+   ```powershell
+   rustup default stable-msvc
+   ```
+
+5. **Node 20+** and **pnpm**.
+
+Then build and run the same way as macOS:
+
+```powershell
+pnpm install
+pnpm tauri:dev
+```
+
+(`pnpm tauri:dev` builds with `--features whisper`, exercising the whisper-rs native build path.)
 
 ## Usage
 
