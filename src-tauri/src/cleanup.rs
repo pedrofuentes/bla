@@ -496,6 +496,17 @@ mod tests {
     }
 
     #[test]
+    fn regex_cleanup_no_orphan_comma_after_trailing_filler_issue_53() {
+        // Sentinel issue #53: removing a trailing comma-preceded filler must
+        // not leave a dangling comma that then collides with the
+        // sentence-final period RegexCleanup appends, e.g. "I think,." —
+        // the comma has to go, not just the filler word.
+        let cleanup = RegexCleanup;
+        let got = cleanup.clean("I think, um", Tone::Neutral).unwrap();
+        assert_eq!(got, "I think.");
+    }
+
+    #[test]
     fn regex_cleanup_is_idempotent_on_already_clean_input() {
         let cleanup = RegexCleanup;
         for (description, _, expected) in CASES {
