@@ -36,11 +36,19 @@ pub fn set_settings(
         current.hotkey != settings.hotkey
     };
 
-    save_settings_to_store(&app, &settings)?;
-
+    // Issue #91 (Sentinel 🔴): validate + register the new hotkey BEFORE
+    // persisting anything. A malformed/unregistrable hotkey is rejected at
+    // the IPC boundary (returns Err to the caller) and NEVER written to
+    // settings.json — a persisted bad hotkey would brick the next launch.
+    // `validate_hotkey` is the pure, unit-tested parse; `register_hotkey`
+    // uses the same parser, so a value that validates is the value that
+    // registers. Persisting happens only after both succeed.
     if hotkey_changed {
+        crate::hotkeys::validate_hotkey(&settings.hotkey)?;
         register_hotkey(&app, &settings.hotkey).map_err(|e| e.to_string())?;
     }
+
+    save_settings_to_store(&app, &settings)?;
 
     state
         .output_switch

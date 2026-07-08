@@ -281,9 +281,18 @@ pub struct CaptureSession {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Maximum time [`CaptureSession::start`] waits for the audio backend to
+/// acquire the device and confirm the stream is running before giving up
+/// (Sentinel 🟡 #4). Bounded so a hung backend (an exclusively-locked
+/// device, a Bluetooth-mic renegotiation that stalls) can't block the
+/// hotkey-callback thread indefinitely — generous enough not to trip on a
+/// merely-slow-but-live device.
+pub const CAPTURE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl CaptureSession {
     /// Starts capturing into `buffer` on a dedicated thread, blocking until
-    /// the stream is confirmed running (or has failed to start).
+    /// the stream is confirmed running (or has failed to start), but no
+    /// longer than [`CAPTURE_START_TIMEOUT`].
     pub fn start(
         buffer: SharedRingBuffer,
         diagnostics: std::sync::Arc<CaptureDiagnostics>,
@@ -305,7 +314,15 @@ impl CaptureSession {
             }
         });
 
-        match ready_rx.recv() {
+        // Sentinel 🟡 #4: bound the wait so a hung backend surfaces as
+        // CaptureError::Timeout (which the caller's existing Err handling
+        // turns into PipelineState::Error) instead of blocking the
+        // hotkey-callback thread forever. On timeout we deliberately do NOT
+        // join the spawned thread — it may still be stuck inside the
+        // backend's device setup — and instead detach it (dropping its
+        // JoinHandle); it will exit on its own once setup returns and it
+        // finds the ready channel closed.
+        match ready_rx.recv_timeout(CAPTURE_START_TIMEOUT) {
             Ok(Ok(())) => Ok(Self {
                 stop_tx: Some(stop_tx),
                 handle: Some(handle),
@@ -314,7 +331,8 @@ impl CaptureSession {
                 let _ = handle.join();
                 Err(err)
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CaptureError::Timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = handle.join();
                 Err(CaptureError::NoInputDevice)
             }
@@ -350,6 +368,10 @@ impl Drop for CaptureSession {
 pub enum CaptureError {
     NoInputDevice,
     Cpal(cpal::Error),
+    /// The audio backend did not confirm the stream was running within
+    /// [`CAPTURE_START_TIMEOUT`] (Sentinel 🟡 #4) — a hung device
+    /// acquisition, surfaced instead of blocking the caller forever.
+    Timeout,
 }
 
 impl std::fmt::Display for CaptureError {
@@ -357,6 +379,12 @@ impl std::fmt::Display for CaptureError {
         match self {
             CaptureError::NoInputDevice => write!(f, "no default input audio device available"),
             CaptureError::Cpal(e) => write!(f, "audio capture error: {e}"),
+            CaptureError::Timeout => {
+                write!(
+                    f,
+                    "timed out waiting for the audio device to start capturing"
+                )
+            }
         }
     }
 }

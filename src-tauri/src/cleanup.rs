@@ -19,9 +19,10 @@
 //!
 //! `pipeline` (issue #25) is the dispatch that catches
 //! `CleanupError::Unreachable` from `OllamaCleanup` and falls back to
-//! `RegexCleanup` (AC-4) — `commands.rs` doesn't call into either module yet;
-//! that wiring is a later step. `dead_code` stays silenced here for any item
-//! not yet reached from `pipeline` or this file's own unit tests.
+//! `RegexCleanup` (AC-4); the runtime wiring in `lib.rs` (issue #91) drives
+//! that pipeline on a completed dictation, so `OllamaCleanup`/
+//! `UreqTransport` are now live. `dead_code` stays silenced here for any
+//! item not yet reached from those call sites or this file's own unit tests.
 #![allow(dead_code)]
 
 use regex::Regex;

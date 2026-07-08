@@ -250,9 +250,12 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
     let state = app.state::<AppState>();
     match transition {
         Some(hotkeys::Transition::StartRecording) => {
-            // Drop any stale samples from a previous session before
-            // starting a fresh capture window.
+            // Drop any stale samples and any error recorded by a previous
+            // session before starting a fresh capture window, so the
+            // degraded-capture check on StopRecording reflects only THIS
+            // session (Sentinel 🟡 #3).
             state.buffer.lock().unwrap().drain();
+            state.diagnostics.clear_error();
             match audio::CaptureSession::start(state.buffer.clone(), state.diagnostics.clone()) {
                 Ok(session) => {
                     *state.capture.lock().unwrap() = Some(session);
@@ -268,18 +271,38 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             }
         }
         Some(hotkeys::Transition::StopRecording) => {
-            if let Some(session) = state.capture.lock().unwrap().take() {
+            // Sentinel 🟡 #2: take the session out from under the lock, THEN
+            // stop() it — so the `capture` mutex isn't held across stop()'s
+            // blocking join of the audio thread (which a concurrent
+            // focus-loss reset would otherwise block on).
+            let session = state.capture.lock().unwrap().take();
+            if let Some(session) = session {
                 session.stop();
             }
+
+            // Sentinel 🟡 #3: if a device/stream error was recorded mid-
+            // recording (#59's CaptureDiagnostics), do NOT transcribe
+            // garbage/partial audio as if healthy — surface Error and
+            // discard, clearing the flag for the next session.
+            if let Some(err) = state.diagnostics.last_error() {
+                eprintln!("bla: audio capture was degraded, discarding this dictation: {err}");
+                state.diagnostics.clear_error();
+                state.buffer.lock().unwrap().drain();
+                set_pipeline_state(app, tray::PipelineState::Error);
+                return;
+            }
+
             let samples = state.buffer.lock().unwrap().drain();
             set_pipeline_state(app, tray::PipelineState::Transcribing);
             run_pipeline_in_background(app.clone(), samples);
         }
         Some(hotkeys::Transition::Cancelled) => {
-            if let Some(session) = state.capture.lock().unwrap().take() {
+            let session = state.capture.lock().unwrap().take();
+            if let Some(session) = session {
                 session.stop();
             }
             state.buffer.lock().unwrap().drain();
+            state.diagnostics.clear_error();
             set_pipeline_state(app, tray::PipelineState::Idle);
         }
         None => {}
@@ -515,7 +538,25 @@ pub fn run() {
             };
             app.manage(state);
 
-            register_hotkey(&handle, &settings.hotkey)?;
+            // Issue #91 (Sentinel 🔴): a bad persisted hotkey must not brick
+            // launch. Resolve to the persisted binding only if it's valid,
+            // else the always-valid default; then register NON-FATALLY — a
+            // registration failure (e.g. an OS-level accelerator conflict)
+            // is logged and the app still launches, rather than propagating
+            // out of `.setup()` into `.run(...).expect(...)` → startup
+            // panic with no self-recovery. `set_settings` already prevents
+            // an invalid hotkey from being persisted in the first place;
+            // this is the defense-in-depth for a settings.json that was
+            // already corrupt (or written by an older build).
+            let default_hotkey = settings::Settings::default().hotkey;
+            let effective_hotkey =
+                hotkeys::resolve_effective_hotkey(&settings.hotkey, &default_hotkey).to_string();
+            if let Err(err) = register_hotkey(&handle, &effective_hotkey) {
+                eprintln!(
+                    "bla: failed to register global hotkey {effective_hotkey:?} at startup; \
+                     the app will launch without a bound dictation hotkey: {err}"
+                );
+            }
 
             // Issue #44: reconcile a possibly-dropped KeyUp on window
             // focus-loss so the machine can never wedge in Holding.

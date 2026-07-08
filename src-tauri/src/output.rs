@@ -29,9 +29,11 @@
 //! follow-ups, not addressed here.
 //!
 //! `route`'s first non-test consumer is `pipeline` (issue #25), which calls
-//! it from `Pipeline::run`; `commands.rs` doesn't call into either module
-//! yet — that wiring is a later step. `dead_code` stays allowed at module
-//! scope for any item not yet reached from there.
+//! it from `Pipeline::run`; the runtime wiring in `lib.rs` (issue #91) then
+//! drives `Pipeline::run` on a completed dictation, so `SystemClipboard`/
+//! `EnigoPaste` are now live. `dead_code` stays allowed at module scope for
+//! any item not yet reached from those call sites (e.g. surface kept for the
+//! M2 settings UI).
 #![allow(dead_code)]
 
 use std::fs;
