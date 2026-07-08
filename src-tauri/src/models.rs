@@ -16,17 +16,20 @@
 //! is a pure predicate enforcing MISSION §5's model-download allowlist
 //! (`huggingface.co` and its CDN — including the newer `hf.co`-hosted Xet
 //! storage backend HF's CDN redirects resolve to, e.g.
-//! `us.aws.cdn.hf.co`/`cas-bridge.xethub.hf.co`) with real host-matching
-//! (dot-boundary suffix checks, userinfo stripped, `https` required) rather
-//! than a naive substring check, so it isn't defeated by a lookalike host
-//! (`huggingface.co.evil.com`) or a userinfo trick
+//! `us.aws.cdn.hf.co`/`cas-bridge.xethub.hf.co`). Crucially it parses the URL
+//! with the **same `url` crate `ureq` resolves the connect target with**, so
+//! the host the guard checks can never diverge from the host actually dialed
+//! — closing the parser-differential bypass class (`https://evil.com?@huggingface.co`
+//! and friends, where a hand-rolled authority scan would read `huggingface.co`
+//! but the real host is `evil.com`), alongside lookalike hosts
+//! (`huggingface.co.evil.com`) and the userinfo trick
 //! (`https://huggingface.co@evil.com/`). A test asserts every
 //! [`model_registry`] URL passes this guard, and a battery of adversarial
-//! cases assert the guard rejects everything it should. [`UreqTransport`]
-//! (below) additionally re-checks every redirect hop against this same guard
-//! at the real network boundary — not just the request's initial origin —
-//! so the runtime egress invariant holds even if a redirect were to point
-//! somewhere unexpected.
+//! cases assert the guard rejects everything it should. [`follow_redirects`]
+//! (used by [`UreqTransport`]) re-checks every redirect hop against this same
+//! guard at the real network boundary — not just the request's initial
+//! origin — so the runtime egress invariant holds even if a redirect were to
+//! point somewhere unexpected.
 //!
 //! **Download orchestration is thin, TDD-exempt glue** (AGENTS.md
 //! OS-integration exemption): the actual HTTP GET, streaming-to-disk, and
@@ -63,8 +66,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The Hugging Face repo every supported preset is published from (ADR-0004:
 /// "a well-known HF GGUF source").
@@ -202,46 +206,33 @@ pub fn is_allowlisted_host(host: &str) -> bool {
             .any(|suffix| host.ends_with(suffix))
 }
 
-/// Extracts the host from an `https://` URL, stripping any userinfo
-/// (`user@`) and port, and rejecting every other scheme. Manual (not a full
-/// URI parser) because this module only ever needs to answer "is this host
-/// allowlisted" for URLs it either built itself or received as a redirect
-/// `Location` — but it still resists the classic userinfo phishing trick
-/// (`https://huggingface.co@evil.com/`) by taking the authority segment
-/// *after* the last unescaped `@`.
-fn extract_https_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let authority = match authority.rfind('@') {
-        Some(i) => &authority[i + 1..],
-        None => authority,
-    };
-    let host = match authority.rfind(':') {
-        Some(i)
-            if !authority[i + 1..].is_empty()
-                && authority[i + 1..].bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            &authority[..i]
-        }
-        _ => authority,
-    };
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
-}
-
 /// The AC-12 network guard: true only if `url` is an `https://` URL whose
 /// host is allowlisted per [`is_allowlisted_host`]. Every URL
 /// [`download_url`] can return must pass this (asserted in this module's
 /// tests); [`UreqTransport`] also re-applies it to every redirect hop it
 /// follows, so the invariant holds at the real network boundary too, not
 /// just at the registry.
+///
+/// **The URL is parsed with the `url` crate — the SAME parser `ureq`
+/// resolves its connect target with** — precisely so the host this guard
+/// checks can never diverge from the host that's actually dialed. A
+/// hand-rolled authority scan is not safe here: WHATWG URL parsing treats
+/// `?` and `#` as authority terminators, so e.g. `https://evil.com?@huggingface.co`
+/// has host `evil.com` (everything after `?` is the query), while a naive
+/// "take the segment after the last `@`" scan would wrongly read
+/// `huggingface.co` and wave a redirect to `evil.com` straight through.
+/// Delegating to `url::Url` closes that whole class of parser-differential
+/// bypass (`?@`, `#@`, backslash-authority, userinfo, ...).
 pub fn is_allowlisted_url(url: &str) -> bool {
-    match extract_https_host(url) {
-        Some(host) => is_allowlisted_host(&host),
-        None => false,
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            parsed.scheme() == "https"
+                && parsed
+                    .host_str()
+                    .map(|host| is_allowlisted_host(&host.to_ascii_lowercase()))
+                    .unwrap_or(false)
+        }
+        Err(_) => false,
     }
 }
 
@@ -361,6 +352,50 @@ pub fn compute_progress(bytes_downloaded: u64, total_bytes: u64) -> DownloadProg
     }
 }
 
+/// Throttles progress emission so a subscriber isn't flooded with one
+/// callback per 64 KB chunk (issue #24 Sentinel 🟡#4 — a multi-hundred-MB
+/// model is thousands of chunks). Emits at most once per whole-percent
+/// change of the total, and the caller always forces one final emit on
+/// completion. Pure and deterministic (no clock): the decision depends only
+/// on byte counts, so it's unit-testable.
+#[derive(Debug, Default)]
+pub struct ProgressThrottle {
+    last_emitted_bucket: Option<u64>,
+}
+
+impl ProgressThrottle {
+    /// Number of buckets progress is quantized into for throttling — 100 =
+    /// whole-percent granularity, so at most ~101 intermediate emits over a
+    /// whole download regardless of chunk count.
+    const BUCKETS: u64 = 100;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether progress at `bytes_downloaded`/`total_bytes` should be emitted
+    /// now. `is_final` forces an emit (the completed download always fires,
+    /// even if it lands in the same percent bucket as the previous emit).
+    /// Before the total is known (`total_bytes == 0`) nothing intermediate is
+    /// emitted.
+    pub fn should_emit(&mut self, bytes_downloaded: u64, total_bytes: u64, is_final: bool) -> bool {
+        if is_final {
+            self.last_emitted_bucket = Some(Self::BUCKETS);
+            return true;
+        }
+        if total_bytes == 0 {
+            return false;
+        }
+        let bucket = bytes_downloaded.saturating_mul(Self::BUCKETS) / total_bytes;
+        if self.last_emitted_bucket == Some(bucket) {
+            false
+        } else {
+            self.last_emitted_bucket = Some(bucket);
+            true
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Resume / restart planning
 // ---------------------------------------------------------------------
@@ -399,9 +434,77 @@ pub fn plan_resume(existing_partial_bytes: Option<u64>, expected_total_bytes: u6
     }
 }
 
+/// What the transport must do with the existing partial bytes once the
+/// server's response status to a (possibly ranged) request is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDisposition {
+    /// Keep the partial bytes and append the response body onto them.
+    Append,
+    /// Discard the partial bytes (truncate the sink) and write the response
+    /// body from offset 0.
+    Restart,
+}
+
+/// Pure decision (issue #24 Sentinel 🟡#3): given how many bytes we asked to
+/// resume from and the status the server actually answered with, decide
+/// whether the response body appends onto the partial or replaces it.
+///
+/// - A fresh download (`requested_resume_bytes == 0`) always [`Append`s](ResumeDisposition::Append)
+///   (there's nothing to reconcile — the sink was already truncated).
+/// - A resume request (`> 0`) [`Append`s](ResumeDisposition::Append) **only**
+///   on HTTP `206 Partial Content`, i.e. the server honored the `Range`.
+/// - Any other status to a resume request — most importantly `200 OK`, where
+///   the server ignored `Range` and is sending the **whole** file —
+///   [`Restart`s](ResumeDisposition::Restart). Appending a full 200 body onto
+///   an existing partial would corrupt the file and over-report the total.
+pub fn resume_disposition(requested_resume_bytes: u64, status: u16) -> ResumeDisposition {
+    if requested_resume_bytes == 0 || status == 206 {
+        ResumeDisposition::Append
+    } else {
+        ResumeDisposition::Restart
+    }
+}
+
 // ---------------------------------------------------------------------
 // Injected transport seam + real ureq-backed implementation
 // ---------------------------------------------------------------------
+
+/// The destination a [`ModelTransport`] streams a download into. Two ops
+/// only: [`append`](DownloadSink::append) bytes, or [`restart`](DownloadSink::restart)
+/// (discard everything written so far and rewind to byte 0). `restart` is
+/// what makes the 🟡#3 fix safe: when a resume request is answered with a
+/// full `200` body instead of `206`, the transport truncates the partial
+/// rather than appending full-onto-partial. The file-backed impl is thin OS
+/// glue ([`FileSink`]); tests use an in-memory `Vec` sink so the append /
+/// restart / partial-file behavior is exercised without touching disk.
+pub trait DownloadSink {
+    fn append(&mut self, buf: &[u8]) -> Result<(), ModelError>;
+    /// Discard everything written so far and rewind to byte 0.
+    fn restart(&mut self) -> Result<(), ModelError>;
+}
+
+/// File-backed [`DownloadSink`] — thin OS glue over a `.partial` file handle.
+pub struct FileSink {
+    file: File,
+}
+
+impl FileSink {
+    pub fn new(file: File) -> Self {
+        Self { file }
+    }
+}
+
+impl DownloadSink for FileSink {
+    fn append(&mut self, buf: &[u8]) -> Result<(), ModelError> {
+        self.file.write_all(buf).map_err(io_err)
+    }
+
+    fn restart(&mut self) -> Result<(), ModelError> {
+        self.file.set_len(0).map_err(io_err)?;
+        self.file.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        Ok(())
+    }
+}
 
 /// Injected HTTP transport seam (mirrors `cleanup.rs`'s `OllamaTransport`).
 /// All of [`download_model_with_spec`]'s decision-making — URL/allowlist
@@ -411,36 +514,112 @@ pub fn plan_resume(existing_partial_bytes: Option<u64>, expected_total_bytes: u6
 pub trait ModelTransport {
     /// Fetches `url`, optionally resuming from `resume_from_bytes` (`0` =
     /// from scratch), streaming the response body into `sink` and invoking
-    /// `on_chunk(total_bytes_written_including_resume_offset, server_reported_total)`
-    /// after every chunk written. `server_reported_total` is `None` until
-    /// the server's response is available, then the full file size (a
-    /// resumed request's total, not just the remaining-bytes count).
+    /// `on_chunk(total_bytes_on_disk, server_reported_total)` after every
+    /// chunk written. If a resume request is not honored (see
+    /// [`resume_disposition`]) the transport must [`restart`](DownloadSink::restart)
+    /// the sink and write the full body from 0. Returns the final byte count
+    /// on disk. `server_reported_total` is `None` until the response is
+    /// available, then the full file size (a resumed request's total, not
+    /// just the remaining-bytes count).
     fn fetch(
         &self,
         url: &str,
         resume_from_bytes: u64,
-        sink: &mut dyn Write,
+        sink: &mut dyn DownloadSink,
         on_chunk: &mut dyn FnMut(u64, Option<u64>),
-    ) -> Result<(), ModelError>;
+    ) -> Result<u64, ModelError>;
 }
 
-/// Maximum redirect hops [`UreqTransport`] will follow before giving up.
+/// Maximum redirect hops the redirect loop ([`follow_redirects`]) will follow
+/// before giving up.
 pub const MAX_REDIRECTS: u8 = 5;
 
+/// One HTTP request's outcome as the redirect loop's per-hop responder
+/// reports it (issue #24 Sentinel 🟡#6). Generic over the terminal-body type
+/// `B` so [`follow_redirects`] stays pure and testable: the real transport
+/// uses `B = ureq::Response`, tests use a canned fake so the per-hop
+/// allowlist re-check, redirect cap, and missing-`Location` handling are
+/// covered with no socket.
+pub enum Hop<B> {
+    /// A 3xx redirect carrying its raw `Location` header (`None` if the
+    /// server omitted it).
+    Redirect(Option<String>),
+    /// A terminal (non-3xx) response ready for the caller to stream.
+    Terminal(B),
+}
+
+/// Pure redirect-following loop with the AC-12 allowlist re-checked on
+/// **every** hop (issue #24 Sentinel 🟡#6 + the 🔴 blocker's runtime half):
+/// the start URL and every `Location` a redirect points at must pass
+/// [`is_allowlisted_url`] before it's dialed, so a redirect can never bounce
+/// the download off the MISSION §5 allowlist. Enforces [`MAX_REDIRECTS`] and
+/// rejects a redirect with no `Location`. `request` performs one hop (a real
+/// socket call in [`UreqTransport`]; a canned outcome in tests).
+pub fn follow_redirects<B, F>(start_url: &str, mut request: F) -> Result<B, ModelError>
+where
+    F: FnMut(&str) -> Result<Hop<B>, ModelError>,
+{
+    if !is_allowlisted_url(start_url) {
+        return Err(ModelError::DisallowedOrigin(start_url.to_string()));
+    }
+    let mut current = start_url.to_string();
+    let mut redirects: u8 = 0;
+    loop {
+        match request(&current)? {
+            Hop::Terminal(body) => return Ok(body),
+            Hop::Redirect(location) => {
+                let location = location.ok_or_else(|| {
+                    ModelError::Transport("redirect response missing Location header".into())
+                })?;
+                if !is_allowlisted_url(&location) {
+                    return Err(ModelError::DisallowedOrigin(location));
+                }
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(ModelError::Transport("too many redirects".to_string()));
+                }
+                current = location;
+            }
+        }
+    }
+}
+
+/// Default connect timeout for [`UreqTransport`] (issue #24 Sentinel 🟡#2):
+/// how long to wait to establish the TCP/TLS connection before giving up, so
+/// a black-hole host can't hang the first-run download indefinitely.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default per-read timeout for [`UreqTransport`] (issue #24 Sentinel 🟡#2):
+/// how long to wait for the next chunk of body once connected. Bounded so a
+/// connection that stalls mid-stream fails instead of hanging forever;
+/// generous enough not to trip on a slow-but-live CDN.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The real transport: a synchronous `ureq` GET, built with `redirects(0)`
-/// and a manual redirect loop so every hop — not just the initial request —
-/// is re-checked against [`is_allowlisted_url`] before being followed. This
-/// is the only code in the module that opens a real socket, and it refuses
-/// to send a single byte anywhere off the MISSION §5 allowlist, including a
-/// redirect target.
+/// so redirects are driven through [`follow_redirects`] — every hop, not
+/// just the first request, is re-checked against [`is_allowlisted_url`]. It
+/// sets explicit connect/read timeouts so a black-hole or stalled host
+/// fails instead of hanging (🟡#2), and honors [`resume_disposition`] so a
+/// `200` answer to a `Range` request restarts the sink instead of appending
+/// a full body onto the partial (🟡#3). This is the only code in the module
+/// that opens a real socket, and it refuses to send a single byte anywhere
+/// off the MISSION §5 allowlist, including a redirect target.
 pub struct UreqTransport {
     agent: ureq::Agent,
 }
 
 impl UreqTransport {
     pub fn new() -> Self {
+        Self::with_timeouts(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+    }
+
+    pub fn with_timeouts(connect_timeout: Duration, read_timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new().redirects(0).build(),
+            agent: ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout_connect(connect_timeout)
+                .timeout_read(read_timeout)
+                .build(),
         }
     }
 }
@@ -456,62 +635,52 @@ impl ModelTransport for UreqTransport {
         &self,
         url: &str,
         resume_from_bytes: u64,
-        sink: &mut dyn Write,
+        sink: &mut dyn DownloadSink,
         on_chunk: &mut dyn FnMut(u64, Option<u64>),
-    ) -> Result<(), ModelError> {
-        if !is_allowlisted_url(url) {
-            return Err(ModelError::DisallowedOrigin(url.to_string()));
-        }
-
-        let mut current_url = url.to_string();
-        let mut hops = 0u8;
-        let response = loop {
-            let mut req = self.agent.get(&current_url);
+    ) -> Result<u64, ModelError> {
+        let response = follow_redirects(url, |current| {
+            let mut req = self.agent.get(current);
             if resume_from_bytes > 0 {
                 req = req.set("Range", &format!("bytes={resume_from_bytes}-"));
             }
             let resp = req
                 .call()
                 .map_err(|e| ModelError::Transport(e.to_string()))?;
-
             if (300..400).contains(&resp.status()) {
-                hops += 1;
-                if hops > MAX_REDIRECTS {
-                    return Err(ModelError::Transport("too many redirects".to_string()));
-                }
-                let location = resp
-                    .header("Location")
-                    .ok_or_else(|| {
-                        ModelError::Transport("redirect response missing Location header".into())
-                    })?
-                    .to_string();
-                if !is_allowlisted_url(&location) {
-                    return Err(ModelError::DisallowedOrigin(location));
-                }
-                current_url = location;
-                continue;
+                Ok(Hop::Redirect(resp.header("Location").map(str::to_string)))
+            } else {
+                Ok(Hop::Terminal(resp))
             }
-            break resp;
+        })?;
+
+        // 🟡#3: only append onto the partial when the server honored the
+        // Range (206). A 200 (Range ignored — full body) restarts the sink.
+        let base = match resume_disposition(resume_from_bytes, response.status()) {
+            ResumeDisposition::Append => resume_from_bytes,
+            ResumeDisposition::Restart => {
+                sink.restart()?;
+                0
+            }
         };
 
         let total_bytes = response
             .header("Content-Length")
             .and_then(|s| s.parse::<u64>().ok())
-            .map(|remaining| remaining + resume_from_bytes);
+            .map(|body_len| body_len + base);
 
         let mut reader = response.into_reader();
         let mut buf = [0u8; 64 * 1024];
-        let mut written = resume_from_bytes;
+        let mut written = base;
         loop {
             let n = reader.read(&mut buf).map_err(io_err)?;
             if n == 0 {
                 break;
             }
-            sink.write_all(&buf[..n]).map_err(io_err)?;
+            sink.append(&buf[..n])?;
             written += n as u64;
             on_chunk(written, total_bytes);
         }
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -559,28 +728,44 @@ pub fn download_model_with_spec<T: ModelTransport>(
     let plan = plan_resume(existing_bytes, spec.size_bytes);
 
     match plan {
-        ResumePlan::StartFresh => {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&partial)
-                .map_err(io_err)?;
-            transport.fetch(spec.url, 0, &mut file, &mut |done, total| {
-                on_progress(compute_progress(done, total.unwrap_or(spec.size_bytes)));
-            })?;
-        }
-        ResumePlan::Resume(from_byte) => {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&partial)
-                .map_err(io_err)?;
-            transport.fetch(spec.url, from_byte, &mut file, &mut |done, total| {
-                on_progress(compute_progress(done, total.unwrap_or(spec.size_bytes)));
-            })?;
-        }
         ResumePlan::AlreadyComplete => {
             on_progress(compute_progress(spec.size_bytes, spec.size_bytes));
+        }
+        ResumePlan::StartFresh | ResumePlan::Resume(_) => {
+            let from_byte = if let ResumePlan::Resume(n) = plan {
+                n
+            } else {
+                0
+            };
+            let file = if from_byte > 0 {
+                // Resume: keep existing bytes, append after them. The
+                // transport may still `restart` this handle (truncate) if the
+                // server ignores the Range and sends a full 200 body (🟡#3).
+                OpenOptions::new().append(true).open(&partial)
+            } else {
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&partial)
+            }
+            .map_err(io_err)?;
+            let mut sink = FileSink::new(file);
+
+            // 🟡#4: throttle intermediate progress so the subscriber isn't
+            // flooded with a callback per 64 KB chunk.
+            let written = {
+                let mut throttle = ProgressThrottle::new();
+                let mut emit = |done: u64, total: Option<u64>| {
+                    let total = total.unwrap_or(spec.size_bytes);
+                    if throttle.should_emit(done, total, false) {
+                        on_progress(compute_progress(done, total));
+                    }
+                };
+                transport.fetch(spec.url, from_byte, &mut sink, &mut emit)?
+            };
+            // Always fire one final progress on completion (🟡#4).
+            on_progress(compute_progress(written, spec.size_bytes));
         }
     }
 
@@ -730,6 +915,44 @@ mod tests {
         assert!(!is_allowlisted_url("not a url at all"));
     }
 
+    #[test]
+    fn allowlist_rejects_parser_differential_authority_bypasses() {
+        // 🔴 REGRESSION (Sentinel PR #78): these have NO `/` before the `?`
+        // or `#`, so a hand-rolled "host = segment after the last `@`" scan
+        // read `huggingface.co` and waved them through — while the `url`
+        // crate `ureq` actually connects with resolves the host to
+        // `evil.com`. That divergence is the whole allowlist bypass. Because
+        // the guard now uses the SAME parser, host == evil.com == rejected.
+        for url in [
+            "https://evil.com?@huggingface.co",
+            "https://evil.com#@huggingface.co",
+            "https://evil.com?x=@huggingface.co/ggml-small.bin",
+            "https://evil.com#@huggingface.co/ggml-small.bin",
+            // Backslash-authority variant: WHATWG treats `\` like `/`, so the
+            // authority ends at the backslash and the host is `evil.com`.
+            "https://evil.com\\@huggingface.co",
+            "https://evil.com\\.huggingface.co/foo",
+        ] {
+            assert!(
+                !is_allowlisted_url(url),
+                "parser-differential bypass must be rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_still_accepts_legitimate_query_and_fragment_on_allowlisted_hosts() {
+        // Guard the flip side of the bypass fix: a real allowlisted host with
+        // a query or fragment (HF CDN URLs carry signed query strings) must
+        // still pass.
+        assert!(is_allowlisted_url(
+            "https://us.aws.cdn.hf.co/xet-bridge-us/abc?X-Amz-Signature=deadbeef&Expires=123"
+        ));
+        assert!(is_allowlisted_url(
+            "https://huggingface.co/a/b?ref=main#frag"
+        ));
+    }
+
     // -------------------------------------------------------------
     // Checksum
     // -------------------------------------------------------------
@@ -874,18 +1097,57 @@ mod tests {
     // Orchestration, against a fake in-memory transport
     // -------------------------------------------------------------
 
+    /// An in-memory [`DownloadSink`] for transport-level tests — records the
+    /// full byte stream and honors `restart` (truncate) exactly like the
+    /// real file-backed sink.
+    #[derive(Default)]
+    struct VecSink {
+        bytes: Vec<u8>,
+    }
+
+    impl DownloadSink for VecSink {
+        fn append(&mut self, buf: &[u8]) -> Result<(), ModelError> {
+            self.bytes.extend_from_slice(buf);
+            Ok(())
+        }
+        fn restart(&mut self) -> Result<(), ModelError> {
+            self.bytes.clear();
+            Ok(())
+        }
+    }
+
     /// A fake [`ModelTransport`] that serves fixed bytes from memory and
-    /// records whether/how it was called — no real socket, ever.
+    /// records how it was called — no real socket, ever. `honor_range`
+    /// models whether the simulated server honors a `Range` request: when
+    /// `true` it appends only the bytes past `resume_from_bytes` (a `206`);
+    /// when `false` it `restart`s the sink and serves the full body from 0
+    /// (a `200` that ignored the range — the 🟡#3 case). `last_resume_from`
+    /// records the offset it was actually asked to resume from (🟡#5), so a
+    /// test can prove the resume offset propagated rather than silently
+    /// defaulting to 0.
     struct FakeTransport {
         body: Vec<u8>,
+        honor_range: bool,
         called: std::cell::Cell<bool>,
+        last_resume_from: std::cell::Cell<Option<u64>>,
     }
 
     impl FakeTransport {
         fn new(body: impl Into<Vec<u8>>) -> Self {
             Self {
                 body: body.into(),
+                honor_range: true,
                 called: std::cell::Cell::new(false),
+                last_resume_from: std::cell::Cell::new(None),
+            }
+        }
+
+        /// A fake whose simulated server ignores `Range` and always sends the
+        /// full body with a `200` (exercises the 🟡#3 restart path).
+        fn ignoring_range(body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                honor_range: false,
+                ..Self::new(body)
             }
         }
     }
@@ -895,16 +1157,28 @@ mod tests {
             &self,
             _url: &str,
             resume_from_bytes: u64,
-            sink: &mut dyn Write,
+            sink: &mut dyn DownloadSink,
             on_chunk: &mut dyn FnMut(u64, Option<u64>),
-        ) -> Result<(), ModelError> {
+        ) -> Result<u64, ModelError> {
             self.called.set(true);
+            self.last_resume_from.set(Some(resume_from_bytes));
             let total = self.body.len() as u64;
-            let remaining = &self.body[(resume_from_bytes as usize).min(self.body.len())..];
-            sink.write_all(remaining)
-                .map_err(|e| ModelError::Io(e.to_string()))?;
-            on_chunk(total, Some(total));
-            Ok(())
+            let base = if resume_from_bytes > 0 && self.honor_range {
+                resume_from_bytes
+            } else {
+                // Fresh, or a server that ignored the Range (200): the sink
+                // starts (or is truncated back to) empty and gets the whole
+                // body.
+                if resume_from_bytes > 0 {
+                    sink.restart()?;
+                }
+                0
+            };
+            let slice = &self.body[(base as usize).min(self.body.len())..];
+            sink.append(slice)?;
+            let written = base + slice.len() as u64;
+            on_chunk(written, Some(total));
+            Ok(written)
         }
     }
 
@@ -988,13 +1262,50 @@ mod tests {
         fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
         fs::write(&partial_path, &full_body[..10]).unwrap();
 
-        // The fake transport only ever serves the FULL body sliced from the
-        // requested offset onward, mirroring a real ranged response.
+        // The fake transport serves a 206-style ranged response: only the
+        // bytes past the requested offset.
         let transport = FakeTransport::new(full_body.clone());
         let target = download_model_with_spec(&transport, &spec, dir.path(), |_| {})
             .expect("resumed download should succeed");
 
         assert_eq!(fs::read(&target).unwrap(), full_body);
+        // 🟡#5: the transport must actually have been asked to resume from
+        // the partial's length — not silently restart from 0. This assertion
+        // goes RED if the orchestration passes the wrong offset (e.g. if
+        // ResumePlan::Resume were mishandled as StartFresh).
+        assert_eq!(
+            transport.last_resume_from.get(),
+            Some(10),
+            "transport must be asked to resume from the existing partial's byte length"
+        );
+    }
+
+    #[test]
+    fn download_model_with_spec_restarts_when_server_ignores_the_range_and_sends_full_body() {
+        // 🟡#3: a resume request answered with a full 200 body (Range
+        // ignored) must truncate the partial and rewrite from scratch —
+        // never append full-onto-partial (which would corrupt the file and
+        // fail the checksum).
+        let dir = tempfile::tempdir().unwrap();
+        let full_body = b"0123456789ABCDEFGHIJ".to_vec();
+        let spec = spec_for(&full_body, "fixture-d2.bin");
+
+        // Pre-seed a partial with a DIFFERENT first 10 bytes than the real
+        // file, so appending-onto-partial would demonstrably corrupt it.
+        let partial_path = partial_download_path(dir.path(), &spec);
+        fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
+        fs::write(&partial_path, b"XXXXXXXXXX").unwrap();
+
+        let transport = FakeTransport::ignoring_range(full_body.clone());
+        let target = download_model_with_spec(&transport, &spec, dir.path(), |_| {})
+            .expect("restart-on-200 download should succeed");
+
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            full_body,
+            "the corrupt partial must have been discarded, not appended onto"
+        );
+        assert_eq!(transport.last_resume_from.get(), Some(10));
     }
 
     #[test]
@@ -1034,5 +1345,173 @@ mod tests {
         // was checked against, and that the URL used matched the registry.
         assert!(matches!(err, ModelError::ChecksumMismatch { .. }));
         assert_eq!(real_spec.url, download_url(ModelPreset::Small));
+    }
+
+    // -------------------------------------------------------------
+    // 🟡#3: resume disposition (206 appends, anything else restarts)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn resume_disposition_appends_on_206_and_restarts_otherwise() {
+        // Fresh download: always append (nothing to reconcile), whatever the
+        // status.
+        assert_eq!(resume_disposition(0, 200), ResumeDisposition::Append);
+        assert_eq!(resume_disposition(0, 206), ResumeDisposition::Append);
+        // Resume request honored → append.
+        assert_eq!(resume_disposition(100, 206), ResumeDisposition::Append);
+        // Resume request answered with a full 200 (Range ignored) → restart.
+        assert_eq!(resume_disposition(100, 200), ResumeDisposition::Restart);
+        // Any other status to a resume request also restarts (defensive).
+        assert_eq!(resume_disposition(100, 416), ResumeDisposition::Restart);
+    }
+
+    // -------------------------------------------------------------
+    // 🟡#4: progress throttling
+    // -------------------------------------------------------------
+
+    #[test]
+    fn progress_throttle_emits_at_most_once_per_percent_plus_the_final() {
+        // Simulate a large download delivered in many small (64 KB) chunks:
+        // without throttling this would be ~15k callbacks; throttled it must
+        // be at most ~101 intermediate + 1 final.
+        let total: u64 = 1_000_000_000;
+        let chunk: u64 = 64 * 1024;
+        let mut throttle = ProgressThrottle::new();
+        let mut emitted = 0usize;
+        let mut done = 0u64;
+        while done < total {
+            done = (done + chunk).min(total);
+            if throttle.should_emit(done, total, false) {
+                emitted += 1;
+            }
+        }
+        // Final emit is always forced.
+        assert!(throttle.should_emit(total, total, true));
+        assert!(
+            emitted <= 101,
+            "throttled intermediate emits should be ≤101, got {emitted}"
+        );
+        assert!(
+            emitted >= 90,
+            "should still emit steady progress, got {emitted}"
+        );
+    }
+
+    #[test]
+    fn progress_throttle_is_quiet_before_the_total_is_known() {
+        let mut throttle = ProgressThrottle::new();
+        assert!(!throttle.should_emit(123, 0, false));
+        // But a final emit still fires even with an unknown total.
+        assert!(throttle.should_emit(123, 0, true));
+    }
+
+    // -------------------------------------------------------------
+    // 🟡#6: the redirect / per-hop allowlist re-check loop
+    // -------------------------------------------------------------
+
+    #[test]
+    fn follow_redirects_returns_the_terminal_body_on_a_direct_hit() {
+        let result: Result<&str, _> =
+            follow_redirects("https://huggingface.co/ggml-small.bin", |_url| {
+                Ok(Hop::Terminal("body"))
+            });
+        assert_eq!(result.unwrap(), "body");
+    }
+
+    #[test]
+    fn follow_redirects_follows_allowlisted_hops_to_the_terminal_body() {
+        let hops = std::cell::Cell::new(0u8);
+        let result: Result<&str, _> =
+            follow_redirects("https://huggingface.co/ggml-small.bin", |_url| {
+                let n = hops.get();
+                hops.set(n + 1);
+                match n {
+                    0 => Ok(Hop::Redirect(Some(
+                        "https://cdn-lfs.huggingface.co/a".to_string(),
+                    ))),
+                    1 => Ok(Hop::Redirect(Some(
+                        "https://us.aws.cdn.hf.co/b".to_string(),
+                    ))),
+                    _ => Ok(Hop::Terminal("cdn-body")),
+                }
+            });
+        assert_eq!(result.unwrap(), "cdn-body");
+    }
+
+    #[test]
+    fn follow_redirects_rejects_a_redirect_to_a_disallowed_host() {
+        // Deleting the per-hop guard in follow_redirects makes this test go
+        // RED — the whole point of 🟡#6's coverage.
+        let result: Result<&str, _> =
+            follow_redirects("https://huggingface.co/ggml-small.bin", |_url| {
+                Ok(Hop::Redirect(Some("https://evil.com/steal".to_string())))
+            });
+        assert!(
+            matches!(result, Err(ModelError::DisallowedOrigin(u)) if u == "https://evil.com/steal")
+        );
+    }
+
+    #[test]
+    fn follow_redirects_rejects_the_parser_differential_bypass_at_the_redirect_layer() {
+        // The 🔴 bypass, but arriving as a redirect Location rather than the
+        // initial URL: it must be rejected here too.
+        let result: Result<&str, _> =
+            follow_redirects("https://huggingface.co/ggml-small.bin", |_url| {
+                Ok(Hop::Redirect(Some(
+                    "https://evil.com?@huggingface.co".to_string(),
+                )))
+            });
+        assert!(matches!(result, Err(ModelError::DisallowedOrigin(_))));
+    }
+
+    #[test]
+    fn follow_redirects_rejects_a_redirect_without_a_location_header() {
+        let result: Result<&str, _> =
+            follow_redirects("https://huggingface.co/ggml-small.bin", |_url| {
+                Ok(Hop::Redirect(None))
+            });
+        assert!(matches!(result, Err(ModelError::Transport(_))));
+    }
+
+    #[test]
+    fn follow_redirects_gives_up_after_too_many_redirects() {
+        // A responder that never terminates — always redirects to an
+        // allowlisted host — must be stopped by the MAX_REDIRECTS cap rather
+        // than looping forever.
+        let result: Result<&str, _> = follow_redirects("https://huggingface.co/start", |_url| {
+            Ok(Hop::Redirect(Some(
+                "https://huggingface.co/again".to_string(),
+            )))
+        });
+        assert!(
+            matches!(result, Err(ModelError::Transport(m)) if m.contains("too many redirects"))
+        );
+    }
+
+    #[test]
+    fn follow_redirects_rejects_a_disallowed_start_url_without_calling_the_responder() {
+        let called = std::cell::Cell::new(false);
+        let result: Result<&str, _> = follow_redirects("https://evil.com/start", |_url| {
+            called.set(true);
+            Ok(Hop::Terminal("nope"))
+        });
+        assert!(matches!(result, Err(ModelError::DisallowedOrigin(_))));
+        assert!(
+            !called.get(),
+            "responder must not run for a disallowed start URL"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // DownloadSink (the restart seam behind the 🟡#3 fix)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn vec_sink_append_then_restart_discards_prior_bytes() {
+        let mut sink = VecSink::default();
+        sink.append(b"partial-garbage").unwrap();
+        sink.restart().unwrap();
+        sink.append(b"clean").unwrap();
+        assert_eq!(sink.bytes, b"clean");
     }
 }

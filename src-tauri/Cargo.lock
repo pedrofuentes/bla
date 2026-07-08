@@ -335,6 +335,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "ureq",
+ "url",
  "whisper-rs",
 ]
 
