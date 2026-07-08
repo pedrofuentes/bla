@@ -202,11 +202,9 @@ impl SettingsStore for InMemorySettingsStore {
 pub fn persist_validated<S: SettingsStore>(
     store: &mut S,
     new: &Settings,
-    _validate: impl Fn(&str) -> Result<(), String>,
+    validate: impl Fn(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    // TODO(#91 🔴): not yet validating before persist — placeholder so the
-    // RED test commit compiles while matching the pre-fix
-    // persist-before-validate behavior being fixed.
+    validate(&new.hotkey)?;
     store.save(new)
 }
 

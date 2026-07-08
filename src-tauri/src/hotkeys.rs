@@ -38,10 +38,11 @@ use std::time::Duration;
 /// boundary and never written), and `run()`'s startup uses
 /// [`resolve_effective_hotkey`] (built on this) so a bad persisted hotkey
 /// falls back to the default instead of bricking launch.
-pub fn validate_hotkey(_hotkey: &str) -> Result<(), String> {
-    // TODO(#91 🔴): not yet implemented — placeholder so the RED test
-    // commit compiles.
-    Ok(())
+pub fn validate_hotkey(hotkey: &str) -> Result<(), String> {
+    use std::str::FromStr;
+    tauri_plugin_global_shortcut::Shortcut::from_str(hotkey)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Startup fallback (issue #91 Sentinel 🔴): returns `persisted` if it is a
@@ -51,10 +52,12 @@ pub fn validate_hotkey(_hotkey: &str) -> Result<(), String> {
 /// corrupt/unregistrable persisted hotkey degrades to the default binding
 /// rather than propagating a registration failure into a fatal startup
 /// panic.
-pub fn resolve_effective_hotkey<'a>(persisted: &'a str, _default: &'a str) -> &'a str {
-    // TODO(#91 🔴): not yet implemented — placeholder so the RED test
-    // commit compiles.
-    persisted
+pub fn resolve_effective_hotkey<'a>(persisted: &'a str, default: &'a str) -> &'a str {
+    if validate_hotkey(persisted).is_ok() {
+        persisted
+    } else {
+        default
+    }
 }
 
 /// Injected timestamp abstraction — an opaque duration since some
