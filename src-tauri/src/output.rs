@@ -174,6 +174,26 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn restores_when_clipboard_still_holds_what_we_set_ac9() {
+        // Nobody else touched the clipboard during the restore delay: safe
+        // to restore the pre-dictation contents.
+        assert!(should_restore_clipboard(
+            "transcript we set",
+            "transcript we set"
+        ));
+    }
+
+    #[test]
+    fn skips_restore_when_another_actor_changed_the_clipboard_meanwhile() {
+        // Some other app wrote to the clipboard after our paste — restoring
+        // now would clobber that newer value (ADR-0003 skip-on-change rule).
+        assert!(!should_restore_clipboard(
+            "transcript we set",
+            "someone else's newer clipboard value"
+        ));
+    }
+
+    #[test]
     fn clipboard_payload_round_trips_its_text_via_the_single_consumption_path() {
         let payload = ClipboardPayload::new("hello from the transcript".to_string());
         assert_eq!(payload.into_inner(), "hello from the transcript");
