@@ -294,9 +294,28 @@ impl Clipboard for SystemClipboard {
     }
 }
 
-/// Real synthetic Cmd+V (macOS) / Ctrl+V (elsewhere) via `enigo`. Thin OS
-/// glue (AGENTS.md OS-integration exemption) — synthesizes exactly one
-/// keystroke combo and delegates every decision to the pure logic above.
+/// The modifier key synthesized alongside `V` for a platform's native paste
+/// shortcut: `Cmd+V` on macOS, `Ctrl+V` everywhere else (Windows, Linux).
+/// Pure, `cfg`-selected lookup — no `enigo` call, no OS handle — so the
+/// per-platform choice is unit-tested directly (issue #98) rather than only
+/// implied by an inline `#[cfg]` inside [`EnigoPaste::synthesize_paste`].
+/// Exactly one of the two `cfg`-gated definitions below is compiled for any
+/// given target.
+#[cfg(target_os = "macos")]
+pub const fn paste_modifier() -> enigo::Key {
+    enigo::Key::Meta
+}
+
+/// Windows/Linux variant of [`paste_modifier`] — see its doc comment above.
+#[cfg(not(target_os = "macos"))]
+pub const fn paste_modifier() -> enigo::Key {
+    enigo::Key::Control
+}
+
+/// Real synthetic Cmd+V (macOS) / Ctrl+V (Windows, Linux) via `enigo`. Thin
+/// OS glue (AGENTS.md OS-integration exemption) — synthesizes exactly one
+/// keystroke combo, using [`paste_modifier`] (pure, unit-tested) to pick the
+/// modifier; no decision logic lives in this impl.
 pub struct EnigoPaste;
 
 impl PasteSynthesizer for EnigoPaste {
@@ -306,10 +325,7 @@ impl PasteSynthesizer for EnigoPaste {
         let mut enigo =
             Enigo::new(&Settings::default()).map_err(|e| io::Error::other(e.to_string()))?;
 
-        #[cfg(target_os = "macos")]
-        let modifier = Key::Meta;
-        #[cfg(not(target_os = "macos"))]
-        let modifier = Key::Control;
+        let modifier = paste_modifier();
 
         enigo
             .key(modifier, Direction::Press)
