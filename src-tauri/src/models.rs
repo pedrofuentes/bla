@@ -1076,6 +1076,29 @@ mod tests {
     }
 
     #[test]
+    fn model_target_path_resolves_correctly_under_a_windows_style_app_data_base_issue_98() {
+        // `r"C:\Users\x\AppData\Roaming\bla"` is just a Rust string literal —
+        // it compiles and asserts identically on every host this repo
+        // builds on (including this macOS dev machine, which never sees a
+        // real `C:\` path from its own OS). `model_target_path` only ever
+        // appends (`Path::join`), never parses or splits `base`, so a
+        // Windows-shaped base round-trips through it intact regardless of
+        // which platform is running the test — that's the seam this test
+        // locks in.
+        let windows_base = PathBuf::from(r"C:\Users\x\AppData\Roaming\bla");
+        let spec = registry(ModelPreset::Small);
+
+        let target = model_target_path(&windows_base, &spec);
+
+        assert!(
+            target.starts_with(&windows_base),
+            "target must live under the supplied app-data base, got {target:?}"
+        );
+        assert_eq!(target.file_name().unwrap(), "ggml-small.bin");
+        assert_eq!(target, windows_base.join("models").join("ggml-small.bin"));
+    }
+
+    #[test]
     fn partial_download_path_differs_from_the_final_target_and_is_stable() {
         let base = Path::new("/app-data");
         for preset in ModelPreset::ALL {
