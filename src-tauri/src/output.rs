@@ -241,13 +241,34 @@ pub fn paste_via_clipboard_swap(
     let saved = clipboard.get()?;
     let transcript = payload.into_inner();
     clipboard.set(&transcript)?;
-    paste.synthesize_paste()?;
-    sleep(restore_delay);
-    let observed = clipboard.get()?;
-    if should_restore_clipboard(&transcript, &observed) {
-        clipboard.set(&saved)?;
+
+    // Issue #65 (Sentinel 🔴-when-wired): from this point on, the clipboard
+    // holds the transcript, not the user's pre-dictation contents. Every
+    // exit path below — the paste synthesizer failing (e.g. enigo failing
+    // on first-run macOS before Accessibility is granted) or the final
+    // observation read failing — must restore `saved` before returning,
+    // rather than propagating the error via `?` and leaving the transcript
+    // permanently on the clipboard. The restore itself is best-effort: its
+    // own failure must never mask the original error being propagated.
+    if let Err(paste_err) = paste.synthesize_paste() {
+        let _ = clipboard.set(&saved);
+        return Err(paste_err);
     }
-    Ok(())
+
+    sleep(restore_delay);
+
+    match clipboard.get() {
+        Ok(observed) => {
+            if should_restore_clipboard(&transcript, &observed) {
+                clipboard.set(&saved)?;
+            }
+            Ok(())
+        }
+        Err(observe_err) => {
+            let _ = clipboard.set(&saved);
+            Err(observe_err)
+        }
+    }
 }
 
 /// Real system clipboard via `arboard`. Thin OS glue (AGENTS.md
