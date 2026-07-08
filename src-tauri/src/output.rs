@@ -380,6 +380,125 @@ mod tests {
     }
 
     #[test]
+    fn route_dispatches_cursor_paste_and_restores_clipboard_ac9() {
+        let clipboard = FakeClipboard::new("pre-dictation clipboard contents");
+        let paste = FakePaste::new();
+
+        let outcome = route(
+            &OutputMode::CursorPaste,
+            "the dictated transcript".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &clipboard,
+            &paste,
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, OutputOutcome::Pasted);
+        assert!(*paste.called.borrow());
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "pre-dictation clipboard contents"
+        );
+    }
+
+    #[test]
+    fn route_dispatches_file_mode_and_confines_the_path() {
+        let dir = tempdir().unwrap();
+        let clipboard = FakeClipboard::new("untouched");
+        let paste = FakePaste::new();
+        let mode = OutputMode::File {
+            base_dir: dir.path().to_path_buf(),
+            config: FileConfig {
+                path_template: "daily/{{date:YYYY-MM-DD}}.md".to_string(),
+                timestamp_prefix_template: Some("{{time:HH:mm}} ".to_string()),
+            },
+        };
+
+        let outcome = route(
+            &mode,
+            "routed entry".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &clipboard,
+            &paste,
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        let expected_path = dir.path().join("daily/2026-07-07.md");
+        assert_eq!(outcome, OutputOutcome::AppendedTo(expected_path.clone()));
+        assert_eq!(
+            fs::read_to_string(&expected_path).unwrap(),
+            "09:05 routed entry\n"
+        );
+        // File mode must never touch the clipboard.
+        assert_eq!(clipboard.get().unwrap(), "untouched");
+        assert!(!*paste.called.borrow());
+    }
+
+    #[test]
+    fn route_rejects_a_file_template_that_resolves_absolute() {
+        let dir = tempdir().unwrap();
+        let clipboard = FakeClipboard::new("untouched");
+        let paste = FakePaste::new();
+        let mode = OutputMode::File {
+            base_dir: dir.path().to_path_buf(),
+            config: FileConfig {
+                path_template: "/etc/passwd".to_string(),
+                timestamp_prefix_template: None,
+            },
+        };
+
+        let err = route(
+            &mode,
+            "entry".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &clipboard,
+            &paste,
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RouteError::PathConfinement(PathConfinementError::AbsolutePath)
+        );
+    }
+
+    #[test]
+    fn route_rejects_a_file_template_that_escapes_the_base_dir() {
+        let dir = tempdir().unwrap();
+        let clipboard = FakeClipboard::new("untouched");
+        let paste = FakePaste::new();
+        let mode = OutputMode::File {
+            base_dir: dir.path().to_path_buf(),
+            config: FileConfig {
+                path_template: "../../etc/{{date:YYYY-MM-DD}}.md".to_string(),
+                timestamp_prefix_template: None,
+            },
+        };
+
+        let err = route(
+            &mode,
+            "entry".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &clipboard,
+            &paste,
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RouteError::PathConfinement(PathConfinementError::EscapesBaseDir)
+        );
+    }
+
+    #[test]
     fn confine_accepts_a_plain_relative_path() {
         let base = PathBuf::from("/vault");
         let out = confine_relative_path(&base, "2026-07-07.md").unwrap();
