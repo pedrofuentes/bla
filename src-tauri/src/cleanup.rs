@@ -848,6 +848,72 @@ mod ollama_tests {
     }
 
     #[test]
+    fn ollama_write_timeout_prevents_hanging_on_a_peer_that_stops_draining_issue_73() {
+        // Issue #73 (Sentinel 🟡, becomes 🔴 once the paste path is wired):
+        // UreqTransport previously set only connect/read timeouts, so a
+        // peer that accepts the TCP connection but never reads from it
+        // could block `send_string` forever once a large-enough request
+        // body overflows the OS socket send buffer — defeating the AC-4
+        // fallback (the pipeline would hang instead of falling back to
+        // RegexCleanup). This test exercises the real UreqTransport against
+        // a real (localhost-only) socket that accepts the connection and
+        // then never reads from OR closes it — the only way the client's
+        // write can return is via its own configured timeout. The test
+        // bounds its OWN wait via `recv_timeout` so a still-broken write
+        // timeout fails this test with a clear panic rather than hanging
+        // the suite forever.
+        use std::sync::mpsc;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local test listener");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Keep the connection open indefinitely without reading —
+                // the process exiting at the end of the test run is what
+                // eventually tears this down, not an explicit close.
+                // `_stream` stays bound (and thus the socket stays open)
+                // for the lifetime of this loop.
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+        });
+
+        let base_url = format!("http://{addr}");
+        // read_timeout doubles as the write timeout after the #73 fix (see
+        // UreqTransport::new's doc comment) — short so the test is fast.
+        let transport = UreqTransport::new(Duration::from_millis(300), Duration::from_millis(500));
+        let cleanup = OllamaCleanup::new(base_url, "llama3", transport);
+
+        // Large enough to overflow the OS socket send buffer against a
+        // peer that never reads, so the write genuinely blocks rather than
+        // completing instantly into the kernel buffer (confirmed against a
+        // raw std::net::TcpStream in the same sandbox: a 20 MB write to a
+        // non-draining peer blocks for as long as the peer holds the
+        // connection).
+        let raw = "x".repeat(20 * 1024 * 1024);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = cleanup.clean(&raw, Tone::Neutral);
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "OllamaCleanup::clean must return within a bounded time on a non-draining peer, \
+             not hang forever (issue #73) — the write timeout is not firing",
+        );
+
+        assert_eq!(
+            result,
+            Err(CleanupError::Unreachable),
+            "a write timeout must map to CleanupError::Unreachable so the AC-4 fallback fires"
+        );
+    }
+
+    #[test]
     fn ac10_prompt_file_contains_the_rewrite_only_constraints() {
         // Regression guard: if a future prompt edit drops one of these
         // constraints, this test fails CI (MISSION §7).
