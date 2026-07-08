@@ -60,7 +60,7 @@ bla supports Windows 10/11 as a dev/runtime target alongside macOS. Before build
 
 - **LLVM/libclang** — `winget install LLVM.LLVM`, then set `LIBCLANG_PATH` (e.g. `C:\Program Files\LLVM\bin`). Required because `whisper-rs-sys` generates bindings via `bindgen`, which needs `libclang`. This is the most common first-build failure on a fresh machine.
 - **CMake** — `winget install Kitware.CMake` — plus the Visual Studio Build Tools "Desktop development with C++" workload, both needed to compile `whisper.cpp`.
-- **WebView2** (present by default on Win10/11), the **Rust MSVC toolchain** (`rustup default stable-msvc`), and **Node 20+**/**pnpm**.
+- **WebView2** (present by default on Windows 11 and most updated Windows 10 installs; if missing, install the Evergreen WebView2 Runtime), the **Rust MSVC toolchain** (`rustup default stable-msvc`), and **Node 20+**/**pnpm**.
 
 Then `pnpm install` and `pnpm tauri:dev` (builds `--features whisper`), same as macOS. See the [README](./README.md#building-on-windows) for the full command list.
 

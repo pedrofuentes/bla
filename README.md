@@ -28,11 +28,11 @@ History, personal dictionary, and settings are stored locally on your machine an
 # Install dependencies
 pnpm install
 
-# Run in development mode
-pnpm tauri dev
+# Run in development mode (--features whisper, for on-device STT)
+pnpm tauri:dev
 
-# Build a packaged app
-pnpm tauri build
+# Build a packaged app (--features whisper)
+pnpm tauri:build
 ```
 
 On first run, macOS will prompt you to grant:
@@ -62,7 +62,7 @@ bla builds and runs on Windows 10/11. A few native prerequisites are needed befo
    ```
    Also install Visual Studio Build Tools with the **"Desktop development with C++"** workload.
 
-3. **WebView2** — present by default on Windows 10/11; no action needed.
+3. **WebView2** — present by default on Windows 11 and most updated Windows 10 installs; if missing, install the [Evergreen WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/).
 
 4. **Rust MSVC toolchain**:
    ```powershell

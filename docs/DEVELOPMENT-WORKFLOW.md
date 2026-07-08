@@ -109,7 +109,7 @@ Windows 10/11 is a supported dev/runtime target. On a fresh machine, install the
 
 - **LLVM/libclang**: `winget install LLVM.LLVM`, then set `LIBCLANG_PATH` (e.g. `C:\Program Files\LLVM\bin`). `whisper-rs-sys` uses `bindgen` to generate bindings at build time, and `bindgen` needs `libclang` — this is the most common fresh-machine build failure if skipped.
 - **CMake**: `winget install Kitware.CMake`, plus the Visual Studio Build Tools "Desktop development with C++" workload — both required to compile `whisper.cpp`.
-- **WebView2** — present by default on Win10/11.
+- **WebView2** — present by default on Windows 11 and most updated Windows 10 installs; if missing, install the Evergreen WebView2 Runtime.
 - **Rust MSVC toolchain**: `rustup default stable-msvc`.
 - **Node 20+** and **pnpm**.
 
