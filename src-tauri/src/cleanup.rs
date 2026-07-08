@@ -17,12 +17,11 @@
 //! instance; only `UreqTransport::post` touches a real socket, and only
 //! ever the configured `localhost:11434`-by-default origin (MISSION §5).
 //!
-//! `mod cleanup` isn't `pub` and `commands.rs` doesn't call into it yet — that
-//! wiring lands with the pipeline-integration work (issue #25 and friends),
-//! including the dispatch that catches `CleanupError::Unreachable` from
-//! `OllamaCleanup` and falls back to `RegexCleanup` (AC-4).
-//! Until then this file's items are only reachable from its own unit tests,
-//! so `dead_code` is silenced here rather than crate-wide.
+//! `pipeline` (issue #25) is the dispatch that catches
+//! `CleanupError::Unreachable` from `OllamaCleanup` and falls back to
+//! `RegexCleanup` (AC-4) — `commands.rs` doesn't call into either module yet;
+//! that wiring is a later step. `dead_code` stays silenced here for any item
+//! not yet reached from `pipeline` or this file's own unit tests.
 #![allow(dead_code)]
 
 use regex::Regex;
