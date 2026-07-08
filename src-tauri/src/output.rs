@@ -97,6 +97,35 @@ fn render_time_format(fmt: &str, clock: Clock) -> String {
         .replace("mm", &format!("{:02}", clock.minute))
 }
 
+/// Transcript text in transit through the clipboard-swap paste path
+/// (ADR-0003, PRD AC-9).
+///
+/// Deliberately implements **neither** [`std::fmt::Debug`],
+/// [`std::fmt::Display`], nor `serde::Serialize`: that makes it impossible
+/// for clipboard/transcript contents to flow into a log macro, string
+/// formatting, or a serializer by construction, rather than relying on
+/// reviewer vigilance. `clipboard_payload_trait_assertions` below locks this
+/// in at compile time — adding any of those trait impls back fails
+/// `cargo test`.
+///
+/// The only way to get the text back out is [`ClipboardPayload::into_inner`],
+/// which the paste/restore glue below consumes exactly once.
+pub struct ClipboardPayload(String);
+
+impl ClipboardPayload {
+    /// Wrap transcript (or saved-clipboard) text for transit through the
+    /// paste path.
+    pub fn new(text: String) -> Self {
+        Self(text)
+    }
+
+    /// Consume the payload, releasing the wrapped text. Used only by the
+    /// clipboard-swap paste glue — never pass the result to a logger.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
 /// Append `entry` to the file-mode target described by `config`, resolving
 /// the templated path against `clock`. Creates any missing intermediate
 /// directories and the file itself if absent (AC-3), and prepends the
