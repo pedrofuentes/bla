@@ -95,9 +95,17 @@ pub trait Cleanup {
 ///    content.
 /// 3. Collapses runs of whitespace (including any left behind by 1–2) to a
 ///    single space and trims the ends.
-/// 4. Capitalizes the first letter of the string and of every sentence that
-///    follows a `.`, `!`, or `?`.
-/// 5. Ensures the result ends with sentence-final punctuation (`.` added if
+/// 4. Strips any comma left dangling directly before another comma, a
+///    sentence terminator, or the end of the string (issue #53) — the
+///    orphaned punctuation a trailing filler removal can otherwise leave
+///    behind (e.g. "I think, um" would otherwise clean to "I think," and
+///    then collide with step 6's appended period into "I think,.").
+/// 5. Capitalizes the first letter of the string and of every sentence that
+///    follows a **real** sentence-terminating `.`, `!`, or `?` — a `.`
+///    between two digits (a decimal point, issue #54) or with no following
+///    letter never counts, so e.g. "3.14 exactly" doesn't capitalize
+///    "exactly".
+/// 6. Ensures the result ends with sentence-final punctuation (`.` added if
 ///    none of `.`/`!`/`?` is already present).
 ///
 /// `RegexCleanup` does **not** resolve self-corrections (false starts,
@@ -128,6 +136,15 @@ struct FillerPatterns {
     comma_flanked_you_know: Regex,
     /// Any run of whitespace, collapsed to a single space.
     whitespace: Regex,
+    /// A comma left dangling directly before another comma or a sentence
+    /// terminator — orphaned punctuation a filler removal can leave behind
+    /// mid-string (issue #53). `regex` has no look-around, so the following
+    /// punctuation is captured and put back rather than merely peeked at.
+    dangling_comma_before_punct: Regex,
+    /// A comma left dangling at the very end of the string — the other half
+    /// of issue #53 (e.g. "I think, um" -> "I think," once "um" is gone,
+    /// with nothing at all following the comma).
+    trailing_dangling_comma: Regex,
 }
 
 fn patterns() -> &'static FillerPatterns {
@@ -137,7 +154,23 @@ fn patterns() -> &'static FillerPatterns {
         comma_flanked_like: Regex::new(r"(?i),\s*like\s*,\s*(\w+)").expect("valid regex"),
         comma_flanked_you_know: Regex::new(r"(?i),\s*you know\s*,").expect("valid regex"),
         whitespace: Regex::new(r"\s+").expect("valid regex"),
+        dangling_comma_before_punct: Regex::new(r",\s*([,.!?])").expect("valid regex"),
+        trailing_dangling_comma: Regex::new(r",\s*$").expect("valid regex"),
     })
+}
+
+/// Strips a comma left dangling before another comma/terminator or at the
+/// end of the string (issue #53) — see [`FillerPatterns::dangling_comma_before_punct`]
+/// / [`FillerPatterns::trailing_dangling_comma`].
+fn strip_dangling_commas(input: &str) -> String {
+    let patterns = patterns();
+    let before_punct = patterns
+        .dangling_comma_before_punct
+        .replace_all(input, "$1");
+    patterns
+        .trailing_dangling_comma
+        .replace_all(&before_punct, "")
+        .into_owned()
 }
 
 /// Words that, immediately after a comma-flanked "like", mark it as a
@@ -186,7 +219,8 @@ fn clean_text(raw: &str) -> String {
         return String::new();
     }
 
-    let capitalized = capitalize_sentence_starts(trimmed);
+    let without_dangling_commas = strip_dangling_commas(trimmed);
+    let capitalized = capitalize_sentence_starts(&without_dangling_commas);
 
     let ends_with_terminal = matches!(capitalized.chars().last(), Some('.' | '!' | '?'));
     if ends_with_terminal {
