@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `models` module (issue #24, ADR-0004, MISSION §5, PRD AC-12): the first-run
+  Whisper model downloader. A registry of the two supported presets
+  (quantized `large-v3-turbo` q5_0, the default, and `small`), each pinned
+  to its `ggerganov/whisper.cpp` Hugging Face file name, download URL, exact
+  size, and SHA-256 (from that repo's Git-LFS metadata). `download_url` and
+  `is_allowlisted_url` are the AC-12 network guard's tested seam: every
+  registry URL is asserted to resolve only to `huggingface.co`/`hf.co` and
+  their subdomains (including the newer Xet-storage CDN hosts, e.g.
+  `us.aws.cdn.hf.co`). The guard parses the URL with the **same `url` crate
+  `ureq` itself resolves the connect target with**, so the host it checks
+  cannot diverge from the host that's actually dialed — a battery of
+  adversarial tests confirms it rejects lookalike hosts
+  (`huggingface.co.evil.com`), the userinfo phishing trick
+  (`https://huggingface.co@evil.com/`), authority-ambiguity bypasses
+  (`https://evil.com?@huggingface.co`, `#@`, backslash variants), and
+  non-`https` schemes. Checksum verification
+  (`sha256_hex`/`sha256_hex_reader`/`verify_checksum`), progress-percent math
+  (`compute_progress`, throttled to ~10 Hz so the callback doesn't fire per
+  64 KB chunk), and resume-vs-restart planning (`plan_resume`) are pure and
+  unit-tested; the actual HTTP GET, streaming-to-disk, and progress reporting
+  live behind an injected `ModelTransport` trait, so
+  `download_model_with_spec`'s orchestration (URL/allowlist selection, resume
+  planning, checksum verification, target-path promotion) is exercised in
+  tests against a fake in-memory transport — no real network call or
+  downloaded model file needed. A resume only proceeds on an HTTP `206`
+  response (a `200` full-body reply to a `Range` request restarts from
+  scratch rather than appending full-onto-partial). A checksum mismatch
+  always errors and removes the corrupt partial file rather than promoting
+  it; the target path is only ever created after a verified checksum.
+  `UreqTransport`, the real transport, sets explicit connect/read timeouts
+  (so a black-hole host can't hang the first run) and re-checks every
+  redirect hop against the same network guard via an injected per-hop
+  responder seam (covered by tests: disallowed-host redirect, too-many-
+  redirects, missing `Location`, and the `?@` bypass at the redirect layer),
+  so the CDN-only egress invariant holds at the real network boundary too.
+  Adds `sha2` (checksum hashing) and `url` (shared-parser guard) as
+  dependencies and enables `ureq`'s `tls` (rustls-backed) feature, needed for
+  the HTTPS download (the existing `OllamaCleanup` transport stays on plain
+  HTTP to localhost). Not yet wired into `commands.rs`/the UI — that lands
+  with the first-run downloader UI integration.
 - `tray` module (issue #23, AC-14): a total, deterministic
   `tray_icon_state(&PipelineState) -> TrayIconState` mapping every pipeline
   state (`Idle`/`Recording`/`Transcribing`/`Error`) to its tray icon

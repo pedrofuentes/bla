@@ -25,11 +25,24 @@ serde_json = "1"
 hound = "3.5.1"
 cpal = "0.18.1"
 regex = "1"
-# No default features: the endpoint is plain HTTP on localhost (MISSION §5),
-# so the default rustls/ring TLS stack and gzip are unnecessary weight.
-ureq = { version = "2", default-features = false }
+# `cleanup.rs`'s Ollama transport talks plain HTTP to localhost (MISSION §5),
+# so it never needed TLS on its own — but `models.rs`'s downloader (AC-12)
+# talks HTTPS to huggingface.co, so this single crate-wide dependency now
+# enables the `tls` feature (rustls-backed — NOT native-tls, keeping the
+# minimal-native-surface posture) on top of the otherwise still-disabled
+# defaults (gzip stays off; neither caller needs it).
+ureq = { version = "2", default-features = false, features = ["tls"] }
 enigo = "0.6.1"
 arboard = "3.6.1"
+# SHA-256 for model-checksum verification (models.rs, ADR-0004/AC-12) — a
+# small, pure-Rust hashing crate with no TLS/native-build surface of its own.
+sha2 = "0.10"
+# URL parsing for the AC-12 network guard (models.rs). Deliberately the SAME
+# crate `ureq` resolves its connect target with (already in the tree via
+# ureq — same version), so the host the guard checks can never diverge from
+# the host actually dialed (a hand-rolled authority parser could, e.g. on
+# `https://evil.com?@huggingface.co`).
+url = "2.5"
 
 [dev-dependencies]
 static_assertions = "1.1.0"
