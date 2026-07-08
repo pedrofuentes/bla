@@ -29,9 +29,11 @@
 //! follow-ups, not addressed here.
 //!
 //! `route`'s first non-test consumer is `pipeline` (issue #25), which calls
-//! it from `Pipeline::run`; `commands.rs` doesn't call into either module
-//! yet — that wiring is a later step. `dead_code` stays allowed at module
-//! scope for any item not yet reached from there.
+//! it from `Pipeline::run`; the runtime wiring in `lib.rs` (issue #91) then
+//! drives `Pipeline::run` on a completed dictation, so `SystemClipboard`/
+//! `EnigoPaste` are now live. `dead_code` stays allowed at module scope for
+//! any item not yet reached from those call sites (e.g. surface kept for the
+//! M2 settings UI).
 #![allow(dead_code)]
 
 use std::fs;
@@ -241,13 +243,34 @@ pub fn paste_via_clipboard_swap(
     let saved = clipboard.get()?;
     let transcript = payload.into_inner();
     clipboard.set(&transcript)?;
-    paste.synthesize_paste()?;
-    sleep(restore_delay);
-    let observed = clipboard.get()?;
-    if should_restore_clipboard(&transcript, &observed) {
-        clipboard.set(&saved)?;
+
+    // Issue #65 (Sentinel 🔴-when-wired): from this point on, the clipboard
+    // holds the transcript, not the user's pre-dictation contents. Every
+    // exit path below — the paste synthesizer failing (e.g. enigo failing
+    // on first-run macOS before Accessibility is granted) or the final
+    // observation read failing — must restore `saved` before returning,
+    // rather than propagating the error via `?` and leaving the transcript
+    // permanently on the clipboard. The restore itself is best-effort: its
+    // own failure must never mask the original error being propagated.
+    if let Err(paste_err) = paste.synthesize_paste() {
+        let _ = clipboard.set(&saved);
+        return Err(paste_err);
     }
-    Ok(())
+
+    sleep(restore_delay);
+
+    match clipboard.get() {
+        Ok(observed) => {
+            if should_restore_clipboard(&transcript, &observed) {
+                clipboard.set(&saved)?;
+            }
+            Ok(())
+        }
+        Err(observe_err) => {
+            let _ = clipboard.set(&saved);
+            Err(observe_err)
+        }
+    }
 }
 
 /// Real system clipboard via `arboard`. Thin OS glue (AGENTS.md
@@ -493,6 +516,109 @@ mod tests {
 
         assert!(*paste.called.borrow());
         assert_eq!(clipboard.get().unwrap(), "pre-dictation clipboard contents");
+    }
+
+    /// A paste synthesizer that always fails — simulates `enigo` failing on
+    /// first-run macOS before Accessibility permission is granted (issue
+    /// #65).
+    struct FailingPaste;
+
+    impl PasteSynthesizer for FailingPaste {
+        fn synthesize_paste(&self) -> io::Result<()> {
+            Err(io::Error::other(
+                "synthetic paste synthesis failure (simulates enigo failing before Accessibility is granted)",
+            ))
+        }
+    }
+
+    #[test]
+    fn clipboard_is_restored_when_paste_synthesis_fails_issue_65() {
+        // Issue #65 (Sentinel 🔴-when-wired): a paste-synthesis failure must
+        // NOT leave the transcript permanently on the clipboard. Before the
+        // fix, the `?` on `paste.synthesize_paste()` returned early and
+        // skipped the restore entirely — this discriminating assertion
+        // checks the actual clipboard contents afterward, not merely that
+        // an Err was returned.
+        let clipboard = FakeClipboard::new("pre-dictation clipboard contents");
+        let paste = FailingPaste;
+        let payload = ClipboardPayload::new("the dictated transcript".to_string());
+
+        let err = paste_via_clipboard_swap(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            payload,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("synthetic paste synthesis"));
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "pre-dictation clipboard contents",
+            "the transcript must not be left on the clipboard when paste synthesis fails"
+        );
+    }
+
+    /// A fake clipboard whose `get()` fails on its *second* call onward —
+    /// exercises the restore-on-all-error-paths requirement (issue #65) for
+    /// the post-paste observation read, not just the paste-synthesis
+    /// failure above.
+    struct FlakyObserveClipboard {
+        contents: RefCell<String>,
+        calls: RefCell<u32>,
+    }
+
+    impl FlakyObserveClipboard {
+        fn new(initial: &str) -> Self {
+            Self {
+                contents: RefCell::new(initial.to_string()),
+                calls: RefCell::new(0),
+            }
+        }
+    }
+
+    impl Clipboard for FlakyObserveClipboard {
+        fn get(&self) -> io::Result<String> {
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls >= 2 {
+                return Err(io::Error::other("clipboard read failed"));
+            }
+            Ok(self.contents.borrow().clone())
+        }
+
+        fn set(&self, contents: &str) -> io::Result<()> {
+            *self.contents.borrow_mut() = contents.to_string();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_is_restored_when_the_post_paste_observation_read_fails_issue_65() {
+        // Issue #65: even when the *second* clipboard read (the one used to
+        // decide whether to restore) fails, the pre-dictation contents must
+        // still be restored best-effort, and the original error must still
+        // propagate to the caller.
+        let clipboard = FlakyObserveClipboard::new("pre-dictation clipboard contents");
+        let paste = FakePaste::new();
+        let payload = ClipboardPayload::new("the dictated transcript".to_string());
+
+        let err = paste_via_clipboard_swap(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            payload,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "clipboard read failed");
+        assert_eq!(
+            clipboard.contents.borrow().as_str(),
+            "pre-dictation clipboard contents",
+            "the transcript must not be left on the clipboard when the post-paste read fails"
+        );
     }
 
     #[test]

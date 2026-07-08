@@ -19,9 +19,10 @@
 //!
 //! `pipeline` (issue #25) is the dispatch that catches
 //! `CleanupError::Unreachable` from `OllamaCleanup` and falls back to
-//! `RegexCleanup` (AC-4) — `commands.rs` doesn't call into either module yet;
-//! that wiring is a later step. `dead_code` stays silenced here for any item
-//! not yet reached from `pipeline` or this file's own unit tests.
+//! `RegexCleanup` (AC-4); the runtime wiring in `lib.rs` (issue #91) drives
+//! that pipeline on a completed dictation, so `OllamaCleanup`/
+//! `UreqTransport` are now live. `dead_code` stays silenced here for any
+//! item not yet reached from those call sites or this file's own unit tests.
 #![allow(dead_code)]
 
 use regex::Regex;
@@ -347,11 +348,26 @@ pub struct UreqTransport {
 impl UreqTransport {
     /// Builds a transport whose agent enforces `connect_timeout`,
     /// `read_timeout`, and no redirects.
+    ///
+    /// Issue #73: a connect/read timeout alone doesn't bound the *write*
+    /// phase — a peer that accepts the connection but stops draining can
+    /// block `send_string` forever once a large-enough request body
+    /// overflows the OS socket send buffer, defeating the AC-4 fallback
+    /// (the pipeline would hang instead of falling back to `RegexCleanup`).
+    /// This now also sets a write timeout (mirroring `read_timeout`, since
+    /// both bound "how long may a single I/O phase of this request take")
+    /// and an overall request timeout (the sum of all three phases) as a
+    /// second, independent bound in case any single phase's timeout somehow
+    /// doesn't fire.
     pub fn new(connect_timeout: Duration, read_timeout: Duration) -> Self {
+        let write_timeout = read_timeout;
+        let overall_timeout = connect_timeout + read_timeout + write_timeout;
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
             .timeout_connect(connect_timeout)
             .timeout_read(read_timeout)
+            .timeout_write(write_timeout)
+            .timeout(overall_timeout)
             .build();
         Self { agent }
     }
@@ -396,6 +412,64 @@ fn classify_ureq_error(err: ureq::Error) -> TransportError {
         }
     }
 }
+
+mod sealed {
+    /// Private supertrait (issue #86): only types defined *within this
+    /// crate* can implement it, since external code has no path to name
+    /// `crate::cleanup::sealed::Sealed`. This is what makes
+    /// [`super::NoRealNetworkTransport`] a genuine sealed marker rather than
+    /// something any caller could self-declare conformance with.
+    pub trait Sealed {}
+}
+
+/// Sealed marker (issue #86, AC-5): implemented only by [`OllamaTransport`]s
+/// that provably never open a real network socket — i.e. test stubs like
+/// [`StubTransport`]. [`UreqTransport`] (the real, network-touching
+/// transport) deliberately does **not** implement this.
+///
+/// This replaces a previous AC-5 guard
+/// (`static_assertions::assert_type_ne_all!(StubTransport, UreqTransport)`)
+/// that was a tautology: any two distinct *named* types are always "not
+/// equal" to that macro, so it could never actually catch a real transport
+/// being substituted in for the stub — it just restated that the two type
+/// names differ. A test that requires `T: NoRealNetworkTransport` instead
+/// fails to **compile** if `UreqTransport` (or any other real transport)
+/// were ever swapped in, because sealing means only this module can grant
+/// the marker, and it deliberately never grants it to `UreqTransport`. See
+/// the `compile_fail` doctest below for the negative-space proof.
+///
+/// ```compile_fail
+/// fn assert_no_real_network_transport<T: bla_lib::cleanup::NoRealNetworkTransport>() {}
+/// // Must NOT compile: UreqTransport is the real, network-touching
+/// // transport and deliberately does not implement the sealed marker.
+/// assert_no_real_network_transport::<bla_lib::cleanup::UreqTransport>();
+/// ```
+pub trait NoRealNetworkTransport: OllamaTransport + sealed::Sealed {}
+
+/// A minimal, reusable [`OllamaTransport`] test double that returns a
+/// preprogrammed outcome and never touches a real socket. `pub` (rather than
+/// confined to `#[cfg(test)]`) so external integration tests —
+/// `tests/acceptance.rs`'s AC-5 case in particular — can drive
+/// `OllamaCleanup` and assert, via [`NoRealNetworkTransport`], that they are
+/// provably not using the real transport (issue #86).
+pub struct StubTransport {
+    pub response: Result<String, TransportError>,
+}
+
+impl StubTransport {
+    pub fn new(response: Result<String, TransportError>) -> Self {
+        Self { response }
+    }
+}
+
+impl OllamaTransport for StubTransport {
+    fn post(&self, _url: &str, _body: &str) -> Result<String, TransportError> {
+        self.response.clone()
+    }
+}
+
+impl sealed::Sealed for StubTransport {}
+impl NoRealNetworkTransport for StubTransport {}
 
 /// Request body shape for Ollama's `/api/generate` endpoint. `system`
 /// carries the rewrite-only prompt ([`CLEANUP_PROMPT_V1`]); `prompt` carries
@@ -613,6 +687,17 @@ mod tests {
         let cleanup = RegexCleanup;
         let got = cleanup.clean("eggs, like, milk", Tone::Neutral).unwrap();
         assert_eq!(got, "Eggs, like, milk.");
+    }
+
+    #[test]
+    fn stub_transport_satisfies_the_sealed_no_real_network_transport_marker_issue_86() {
+        // Issue #86: this is the positive-space half of the AC-5 guard — it
+        // fails to compile if `StubTransport`'s sealed-marker impl were ever
+        // removed. The negative-space half (UreqTransport must NOT satisfy
+        // the bound) is the `compile_fail` doctest on
+        // `NoRealNetworkTransport`.
+        fn assert_no_real_network_transport<T: NoRealNetworkTransport>() {}
+        assert_no_real_network_transport::<StubTransport>();
     }
 
     #[test]
@@ -844,6 +929,72 @@ mod ollama_tests {
         assert_eq!(
             parsed["stream"], false,
             "streaming must be disabled so the response is a single JSON object"
+        );
+    }
+
+    #[test]
+    fn ollama_write_timeout_prevents_hanging_on_a_peer_that_stops_draining_issue_73() {
+        // Issue #73 (Sentinel 🟡, becomes 🔴 once the paste path is wired):
+        // UreqTransport previously set only connect/read timeouts, so a
+        // peer that accepts the TCP connection but never reads from it
+        // could block `send_string` forever once a large-enough request
+        // body overflows the OS socket send buffer — defeating the AC-4
+        // fallback (the pipeline would hang instead of falling back to
+        // RegexCleanup). This test exercises the real UreqTransport against
+        // a real (localhost-only) socket that accepts the connection and
+        // then never reads from OR closes it — the only way the client's
+        // write can return is via its own configured timeout. The test
+        // bounds its OWN wait via `recv_timeout` so a still-broken write
+        // timeout fails this test with a clear panic rather than hanging
+        // the suite forever.
+        use std::sync::mpsc;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local test listener");
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // Keep the connection open indefinitely without reading —
+                // the process exiting at the end of the test run is what
+                // eventually tears this down, not an explicit close.
+                // `_stream` stays bound (and thus the socket stays open)
+                // for the lifetime of this loop.
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+        });
+
+        let base_url = format!("http://{addr}");
+        // read_timeout doubles as the write timeout after the #73 fix (see
+        // UreqTransport::new's doc comment) — short so the test is fast.
+        let transport = UreqTransport::new(Duration::from_millis(300), Duration::from_millis(500));
+        let cleanup = OllamaCleanup::new(base_url, "llama3", transport);
+
+        // Large enough to overflow the OS socket send buffer against a
+        // peer that never reads, so the write genuinely blocks rather than
+        // completing instantly into the kernel buffer (confirmed against a
+        // raw std::net::TcpStream in the same sandbox: a 20 MB write to a
+        // non-draining peer blocks for as long as the peer holds the
+        // connection).
+        let raw = "x".repeat(20 * 1024 * 1024);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = cleanup.clean(&raw, Tone::Neutral);
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "OllamaCleanup::clean must return within a bounded time on a non-draining peer, \
+             not hang forever (issue #73) — the write timeout is not firing",
+        );
+
+        assert_eq!(
+            result,
+            Err(CleanupError::Unreachable),
+            "a write timeout must map to CleanupError::Unreachable so the AC-4 fallback fires"
         );
     }
 

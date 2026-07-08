@@ -24,6 +24,42 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+/// Validate that `hotkey` parses as a registrable global-shortcut
+/// accelerator (e.g. `"Control+Option+Space"`). Pure string parsing via the
+/// **same** parser the OS-glue registration path uses
+/// (`tauri-plugin-global-shortcut`'s `Shortcut::from_str`), so a value that
+/// passes here is exactly the value that will register — there is no parser
+/// divergence between "validated" and "registered". No OS handles are
+/// touched, so this is fully unit-testable.
+///
+/// This is the pure logic behind two OS-glue call sites (issue #91 Sentinel
+/// 🔴): `commands::set_settings` validates a user-typed hotkey with this
+/// *before* persisting it (so a malformed one is rejected at the IPC
+/// boundary and never written), and `run()`'s startup uses
+/// [`resolve_effective_hotkey`] (built on this) so a bad persisted hotkey
+/// falls back to the default instead of bricking launch.
+pub fn validate_hotkey(hotkey: &str) -> Result<(), String> {
+    use std::str::FromStr;
+    tauri_plugin_global_shortcut::Shortcut::from_str(hotkey)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Startup fallback (issue #91 Sentinel 🔴): returns `persisted` if it is a
+/// valid hotkey per [`validate_hotkey`], otherwise `default`. Callers pass
+/// `settings::Settings::default().hotkey` (always a valid accelerator) as
+/// `default`, so the resolved value is guaranteed registrable — a
+/// corrupt/unregistrable persisted hotkey degrades to the default binding
+/// rather than propagating a registration failure into a fatal startup
+/// panic.
+pub fn resolve_effective_hotkey<'a>(persisted: &'a str, default: &'a str) -> &'a str {
+    if validate_hotkey(persisted).is_ok() {
+        persisted
+    } else {
+        default
+    }
+}
+
 /// Injected timestamp abstraction — an opaque duration since some
 /// caller-chosen origin (e.g. `Instant::now().duration_since(origin)` in the
 /// real glue). Tests construct these directly with `Duration::from_millis`,
@@ -161,6 +197,35 @@ impl StateMachine {
         }
     }
 
+    /// Reconciliation entry the OS glue calls when a `KeyUp` might have been
+    /// dropped — e.g. on window focus-loss, screen lock, or system
+    /// sleep/resume (issue #44). Before this, the only way out of
+    /// `Phase::Holding` was a matching `KeyUp`; a dropped one left the
+    /// machine permanently wedged in `Holding` with a stale held-set, and
+    /// every subsequent hotkey press would silently do nothing (the chord
+    /// already reads as "complete" from the stale `held` state, so a fresh
+    /// press can never re-trigger the not-complete -> complete edge
+    /// `on_chord_pressed` requires).
+    ///
+    /// Unconditionally clears the held-key set and returns to `Phase::Idle`,
+    /// treating any in-progress session as abnormally interrupted rather
+    /// than a genuine dictation:
+    /// - From `Phase::Holding` or `Phase::ToggledOn`: emits
+    ///   [`Transition::Cancelled`] (mirroring the debounce path — a
+    ///   reconciliation is not a real dictation completing) so the caller
+    ///   discards whatever audio was captured and stops capture.
+    /// - From `Phase::Idle`: a no-op, returns `None`.
+    pub fn reset(&mut self) -> Option<Transition> {
+        self.held.clear();
+        let was_active = !matches!(self.phase, Phase::Idle);
+        self.phase = Phase::Idle;
+        if was_active {
+            Some(Transition::Cancelled)
+        } else {
+            None
+        }
+    }
+
     /// The chord transitioned from fully-held to not-fully-held (any one
     /// chord key released).
     fn on_chord_released(&mut self, at: Timestamp) -> Option<Transition> {
@@ -295,6 +360,130 @@ mod tests {
 
         assert_eq!(start, Some(Transition::StartRecording));
         assert_eq!(repeat, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #44: reset()/reconcile — a dropped KeyUp must not wedge Holding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reset_from_idle_is_a_noop() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+        assert_eq!(sm.reset(), None);
+        // Still fully functional afterward.
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+    }
+
+    #[test]
+    fn reset_from_holding_cancels_and_unwedges_the_machine_issue_44() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+
+        // Chord pressed, now Holding — then its KeyUp is dropped (focus
+        // loss, lock, suspend) rather than ever arriving.
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+
+        // OS glue calls reset() instead (e.g. on window focus-loss).
+        let reconciled = sm.reset();
+        assert_eq!(
+            reconciled,
+            Some(Transition::Cancelled),
+            "a dropped-KeyUp reconciliation must cancel the stuck session"
+        );
+
+        // The machine must NOT be wedged: a fresh chord press re-triggers
+        // normally. Before the fix, the stale `held` set from before would
+        // have made chord_complete() already true, so this fresh KeyDown
+        // could never re-fire the not-complete -> complete edge.
+        let start_again = sm.handle(KeyEvent::KeyDown(1, ms(1_000)));
+        assert_eq!(
+            start_again,
+            Some(Transition::StartRecording),
+            "after reset(), the machine must accept a brand-new chord press"
+        );
+    }
+
+    #[test]
+    fn reset_from_holding_clears_a_stale_multi_key_held_set_issue_44() {
+        let mut sm = StateMachine::new(Mode::Hold, [1, 2], Duration::from_millis(300));
+
+        // Two-key chord fully pressed (Holding); its KeyUps are dropped.
+        sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        let start = sm.handle(KeyEvent::KeyDown(2, ms(10)));
+        assert_eq!(start, Some(Transition::StartRecording));
+
+        assert_eq!(sm.reset(), Some(Transition::Cancelled));
+
+        // Re-pressing only ONE of the two keys must NOT re-trigger — proves
+        // the stale held-set (both keys 1 and 2) was actually cleared,
+        // rather than only the phase being reset while `held` lingered.
+        let partial = sm.handle(KeyEvent::KeyDown(1, ms(2_000)));
+        assert_eq!(partial, None, "chord isn't complete with only one key down");
+
+        let start_again = sm.handle(KeyEvent::KeyDown(2, ms(2_010)));
+        assert_eq!(start_again, Some(Transition::StartRecording));
+    }
+
+    #[test]
+    fn reset_from_toggled_on_cancels_and_unwedges_the_machine_issue_44() {
+        let mut sm = StateMachine::new(Mode::Toggle, [1], Duration::from_millis(300));
+
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+        sm.handle(KeyEvent::KeyUp(1, ms(10))); // toggle mode ignores release
+
+        let reconciled = sm.reset();
+        assert_eq!(reconciled, Some(Transition::Cancelled));
+
+        // A fresh press starts a brand-new toggle session (not a "stop" of
+        // a phantom already-on session).
+        let start_again = sm.handle(KeyEvent::KeyDown(1, ms(1_000)));
+        assert_eq!(start_again, Some(Transition::StartRecording));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #91 Sentinel 🔴: pure hotkey validation + startup fallback so a
+    // malformed hotkey can't be persisted (and can't brick launch).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_hotkey_accepts_well_formed_accelerators() {
+        // The persisted default plus a representative user-chosen binding.
+        for good in ["Control+Option+Space", "Cmd+Shift+D", "Alt+F4", "Super+K"] {
+            assert!(
+                validate_hotkey(good).is_ok(),
+                "expected {good:?} to be a valid hotkey"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_hotkey_rejects_malformed_accelerators_issue_91() {
+        // Empty, an unknown key, a dangling '+' (empty token), and a
+        // modifiers-only chord with no main key must all be rejected — so
+        // set_settings never persists one of these.
+        for bad in ["", "NotARealKey", "Ctrl+", "Control+Shift"] {
+            assert!(
+                validate_hotkey(bad).is_err(),
+                "expected {bad:?} to be rejected as an invalid hotkey"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_effective_hotkey_keeps_a_valid_persisted_binding() {
+        let effective = resolve_effective_hotkey("Cmd+Shift+D", "Control+Option+Space");
+        assert_eq!(effective, "Cmd+Shift+D");
+    }
+
+    #[test]
+    fn resolve_effective_hotkey_falls_back_to_default_on_a_bad_persisted_binding_issue_91() {
+        // A corrupt/unregistrable persisted hotkey must resolve to the
+        // (always-valid) default rather than being handed to registration —
+        // this is what keeps a bad settings.json from bricking startup.
+        let effective = resolve_effective_hotkey("NotARealKey", "Control+Option+Space");
+        assert_eq!(effective, "Control+Option+Space");
     }
 
     // Keys outside the configured chord must be inert.
