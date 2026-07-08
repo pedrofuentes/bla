@@ -126,11 +126,29 @@ pub fn append_entry(config: &FileConfig, entry: &str, clock: Clock) -> io::Resul
     Ok(path)
 }
 
+/// Compile-time proof that [`ClipboardPayload`] can never flow into a log
+/// macro, string formatting, or a serializer (ADR-0003, PRD AC-9): if
+/// `Debug`, `Display`, or `serde::Serialize` were ever added back to it,
+/// this assertion fails to compile and `cargo test` fails with it.
+#[cfg(test)]
+mod clipboard_payload_trait_assertions {
+    use super::ClipboardPayload;
+    use static_assertions::assert_not_impl_any;
+
+    assert_not_impl_any!(ClipboardPayload: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn clipboard_payload_round_trips_its_text_via_the_single_consumption_path() {
+        let payload = ClipboardPayload::new("hello from the transcript".to_string());
+        assert_eq!(payload.into_inner(), "hello from the transcript");
+    }
 
     fn clock(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Clock {
         Clock {
