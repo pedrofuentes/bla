@@ -20,10 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `model-download-error` events (minimal — full onboarding UX is M5). New
   `commands.rs` handlers (`get_settings`, `set_settings`,
   `set_output_mode`, `download_selected_model`) expose this to a future
-  settings UI. `WhisperStt` is selected under `--features whisper`
-  (`pnpm tauri:dev` / `pnpm tauri:build`); the default build (`cargo
-  build`/`cargo test`, used by CI) compiles and runs with a clear
-  "model engine unavailable" error path instead.
+  settings UI. `set_settings` validates a new hotkey (pure
+  `hotkeys::validate_hotkey`, the same parser registration uses) and
+  registers it **before** persisting, so a malformed hotkey is rejected
+  at the IPC boundary and never written; startup resolves the effective
+  hotkey (`hotkeys::resolve_effective_hotkey` — persisted-if-valid, else
+  the always-valid default) and registers it non-fatally, so a corrupt
+  `settings.json` can't brick launch. `WhisperStt` is selected under
+  `--features whisper` (`pnpm tauri:dev` / `pnpm tauri:build`); the
+  default build (`cargo build`/`cargo test`, used by CI) compiles and
+  runs with a clear "model engine unavailable" error path instead.
 - `models` module (issue #24, ADR-0004, MISSION §5, PRD AC-12): the first-run
   Whisper model downloader. A registry of the two supported presets
   (quantized `large-v3-turbo` q5_0, the default, and `small`), each pinned
