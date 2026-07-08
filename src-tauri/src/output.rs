@@ -236,6 +236,82 @@ pub fn paste_via_clipboard_swap(
     Ok(())
 }
 
+/// Selects which output target a finished dictation is routed to (AC-14
+/// switches this per-dictation from settings-derived state).
+pub enum OutputMode {
+    /// Clipboard-swap + synthesized paste into the focused app (AC-9).
+    CursorPaste,
+    /// Templated append to a file, confined to `base_dir` (AC-3/AC-11, plus
+    /// the path-confinement security AC carried from PR #41's Sentinel
+    /// review into issue #21).
+    File { base_dir: PathBuf, config: FileConfig },
+}
+
+/// What happened after [`route`] dispatched a finished dictation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputOutcome {
+    Pasted,
+    AppendedTo(PathBuf),
+}
+
+/// Errors [`route`] can return, spanning both output targets.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RouteError {
+    Io(String),
+    PathConfinement(PathConfinementError),
+}
+
+impl From<io::Error> for RouteError {
+    fn from(err: io::Error) -> Self {
+        RouteError::Io(err.to_string())
+    }
+}
+
+impl From<PathConfinementError> for RouteError {
+    fn from(err: PathConfinementError) -> Self {
+        RouteError::PathConfinement(err)
+    }
+}
+
+/// Dispatch a finished dictation's transcript to whichever target `mode`
+/// selects (ADR-0002: the output router's job). Pure dispatch logic: OS
+/// calls only ever happen inside the injected `clipboard`/`paste`/`sleep`
+/// seams (cursor-paste branch) or inside `append_entry`'s `std::fs` calls
+/// (file branch) — both fakeable in tests, as the tests above do.
+#[allow(clippy::too_many_arguments)]
+pub fn route(
+    mode: &OutputMode,
+    transcript: String,
+    clock: Clock,
+    clipboard: &impl Clipboard,
+    paste: &impl PasteSynthesizer,
+    sleep: impl FnOnce(Duration),
+    restore_delay: Duration,
+) -> Result<OutputOutcome, RouteError> {
+    match mode {
+        OutputMode::CursorPaste => {
+            paste_via_clipboard_swap(
+                clipboard,
+                paste,
+                sleep,
+                ClipboardPayload::new(transcript),
+                restore_delay,
+            )?;
+            Ok(OutputOutcome::Pasted)
+        }
+        OutputMode::File { base_dir, config } => {
+            let expanded = expand_template(&config.path_template, clock);
+            let confined = confine_relative_path(base_dir, &expanded)?;
+            let resolved_config = FileConfig {
+                path_template: confined.to_string_lossy().into_owned(),
+                timestamp_prefix_template: config.timestamp_prefix_template.clone(),
+            };
+            let path = append_entry(&resolved_config, &transcript, clock)?;
+            Ok(OutputOutcome::AppendedTo(path))
+        }
+    }
+}
+
 /// Append `entry` to the file-mode target described by `config`, resolving
 /// the templated path against `clock`. Creates any missing intermediate
 /// directories and the file itself if absent (AC-3), and prepends the
