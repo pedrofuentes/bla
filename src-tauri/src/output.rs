@@ -835,6 +835,29 @@ mod tests {
         assert_eq!(payload.into_inner(), "hello from the transcript");
     }
 
+    // -----------------------------------------------------------------
+    // Issue #98: paste modifier is a pure, cfg-selected lookup — Cmd on
+    // macOS, Ctrl everywhere else (Windows, Linux) — so it's asserted here
+    // rather than only inline inside `EnigoPaste::synthesize_paste`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn paste_modifier_matches_this_platforms_native_shortcut() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            paste_modifier(),
+            enigo::Key::Meta,
+            "macOS pastes with Cmd+V, not Ctrl+V"
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            paste_modifier(),
+            enigo::Key::Control,
+            "Windows/Linux paste with Ctrl+V, not Cmd+V"
+        );
+    }
+
     fn clock(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Clock {
         Clock {
             year,
