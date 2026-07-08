@@ -104,7 +104,13 @@ fn ac1_headless_pipeline_removes_fillers_and_applies_self_correction() {
     let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", transport);
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let pipeline = Pipeline::new(stt, cleanup, NoopClipboard, NoopPaste, |_delay: Duration| {});
+    let pipeline = Pipeline::new(
+        stt,
+        cleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
 
     let opts = PipelineOpts {
         transcribe: TranscribeOpts::default(),
@@ -126,7 +132,10 @@ fn ac1_headless_pipeline_removes_fillers_and_applies_self_correction() {
         outcome.cleaned_transcript
     );
     assert!(
-        !outcome.cleaned_transcript.to_lowercase().contains("you know"),
+        !outcome
+            .cleaned_transcript
+            .to_lowercase()
+            .contains("you know"),
         "AC-1: cleaned output must have no filler words, got {:?}",
         outcome.cleaned_transcript
     );
@@ -138,7 +147,10 @@ fn ac1_headless_pipeline_removes_fillers_and_applies_self_correction() {
         !outcome.cleaned_transcript.contains("Tuesday"),
         "AC-1: cleaned output must not contain the superseded phrase"
     );
-    assert!(!outcome.cleanup_fell_back, "AC-1: the LLM path must be used, not the fallback");
+    assert!(
+        !outcome.cleanup_fell_back,
+        "AC-1: the LLM path must be used, not the fallback"
+    );
 }
 
 #[test]
@@ -157,7 +169,13 @@ fn ac2_latency_budget_regex_path_under_2s_for_15s_fixture() {
     let cleanup = RegexCleanup;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let pipeline = Pipeline::new(stt, cleanup, NoopClipboard, NoopPaste, |_delay: Duration| {});
+    let pipeline = Pipeline::new(
+        stt,
+        cleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
 
     // 15-second-equivalent fixture at the 16 kHz mono format `audio`
     // produces (`audio::TARGET_SAMPLE_RATE`) — synthetic silence; FakeStt
@@ -206,7 +224,13 @@ fn ac4_ollama_unreachable_falls_back_to_regex_cleanup_with_no_error() {
     let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", transport);
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let pipeline = Pipeline::new(stt, cleanup, NoopClipboard, NoopPaste, |_delay: Duration| {});
+    let pipeline = Pipeline::new(
+        stt,
+        cleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
 
     let opts = PipelineOpts {
         transcribe: TranscribeOpts::default(),
@@ -256,7 +280,13 @@ fn ac5_full_pipeline_run_makes_no_network_io_outside_allowlist() {
     let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", transport);
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let pipeline = Pipeline::new(stt, cleanup, NoopClipboard, NoopPaste, |_delay: Duration| {});
+    let pipeline = Pipeline::new(
+        stt,
+        cleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
 
     let opts = PipelineOpts {
         transcribe: TranscribeOpts::default(),
