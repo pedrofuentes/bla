@@ -161,6 +161,30 @@ impl StateMachine {
         }
     }
 
+    /// Reconciliation entry the OS glue calls when a `KeyUp` might have been
+    /// dropped — e.g. on window focus-loss, screen lock, or system
+    /// sleep/resume (issue #44). Before this, the only way out of
+    /// `Phase::Holding` was a matching `KeyUp`; a dropped one left the
+    /// machine permanently wedged in `Holding` with a stale held-set, and
+    /// every subsequent hotkey press would silently do nothing (the chord
+    /// already reads as "complete" from the stale `held` state, so a fresh
+    /// press can never re-trigger the not-complete -> complete edge
+    /// `on_chord_pressed` requires).
+    ///
+    /// Unconditionally clears the held-key set and returns to `Phase::Idle`,
+    /// treating any in-progress session as abnormally interrupted rather
+    /// than a genuine dictation:
+    /// - From `Phase::Holding` or `Phase::ToggledOn`: emits
+    ///   [`Transition::Cancelled`] (mirroring the debounce path — a
+    ///   reconciliation is not a real dictation completing) so the caller
+    ///   discards whatever audio was captured and stops capture.
+    /// - From `Phase::Idle`: a no-op, returns `None`.
+    pub fn reset(&mut self) -> Option<Transition> {
+        // TODO(#44): not yet implemented — placeholder so the RED test
+        // commit compiles.
+        None
+    }
+
     /// The chord transitioned from fully-held to not-fully-held (any one
     /// chord key released).
     fn on_chord_released(&mut self, at: Timestamp) -> Option<Transition> {
@@ -295,6 +319,86 @@ mod tests {
 
         assert_eq!(start, Some(Transition::StartRecording));
         assert_eq!(repeat, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #44: reset()/reconcile — a dropped KeyUp must not wedge Holding
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reset_from_idle_is_a_noop() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+        assert_eq!(sm.reset(), None);
+        // Still fully functional afterward.
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+    }
+
+    #[test]
+    fn reset_from_holding_cancels_and_unwedges_the_machine_issue_44() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+
+        // Chord pressed, now Holding — then its KeyUp is dropped (focus
+        // loss, lock, suspend) rather than ever arriving.
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+
+        // OS glue calls reset() instead (e.g. on window focus-loss).
+        let reconciled = sm.reset();
+        assert_eq!(
+            reconciled,
+            Some(Transition::Cancelled),
+            "a dropped-KeyUp reconciliation must cancel the stuck session"
+        );
+
+        // The machine must NOT be wedged: a fresh chord press re-triggers
+        // normally. Before the fix, the stale `held` set from before would
+        // have made chord_complete() already true, so this fresh KeyDown
+        // could never re-fire the not-complete -> complete edge.
+        let start_again = sm.handle(KeyEvent::KeyDown(1, ms(1_000)));
+        assert_eq!(
+            start_again,
+            Some(Transition::StartRecording),
+            "after reset(), the machine must accept a brand-new chord press"
+        );
+    }
+
+    #[test]
+    fn reset_from_holding_clears_a_stale_multi_key_held_set_issue_44() {
+        let mut sm = StateMachine::new(Mode::Hold, [1, 2], Duration::from_millis(300));
+
+        // Two-key chord fully pressed (Holding); its KeyUps are dropped.
+        sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        let start = sm.handle(KeyEvent::KeyDown(2, ms(10)));
+        assert_eq!(start, Some(Transition::StartRecording));
+
+        assert_eq!(sm.reset(), Some(Transition::Cancelled));
+
+        // Re-pressing only ONE of the two keys must NOT re-trigger — proves
+        // the stale held-set (both keys 1 and 2) was actually cleared,
+        // rather than only the phase being reset while `held` lingered.
+        let partial = sm.handle(KeyEvent::KeyDown(1, ms(2_000)));
+        assert_eq!(partial, None, "chord isn't complete with only one key down");
+
+        let start_again = sm.handle(KeyEvent::KeyDown(2, ms(2_010)));
+        assert_eq!(start_again, Some(Transition::StartRecording));
+    }
+
+    #[test]
+    fn reset_from_toggled_on_cancels_and_unwedges_the_machine_issue_44() {
+        let mut sm = StateMachine::new(Mode::Toggle, [1], Duration::from_millis(300));
+
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+        sm.handle(KeyEvent::KeyUp(1, ms(10))); // toggle mode ignores release
+
+        let reconciled = sm.reset();
+        assert_eq!(reconciled, Some(Transition::Cancelled));
+
+        // A fresh press starts a brand-new toggle session (not a "stop" of
+        // a phantom already-on session).
+        let start_again = sm.handle(KeyEvent::KeyDown(1, ms(1_000)));
+        assert_eq!(start_again, Some(Transition::StartRecording));
     }
 
     // Keys outside the configured chord must be inert.
