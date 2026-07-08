@@ -180,9 +180,14 @@ impl StateMachine {
     ///   discards whatever audio was captured and stops capture.
     /// - From `Phase::Idle`: a no-op, returns `None`.
     pub fn reset(&mut self) -> Option<Transition> {
-        // TODO(#44): not yet implemented — placeholder so the RED test
-        // commit compiles.
-        None
+        self.held.clear();
+        let was_active = !matches!(self.phase, Phase::Idle);
+        self.phase = Phase::Idle;
+        if was_active {
+            Some(Transition::Cancelled)
+        } else {
+            None
+        }
     }
 
     /// The chord transitioned from fully-held to not-fully-held (any one
