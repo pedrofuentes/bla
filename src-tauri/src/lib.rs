@@ -11,7 +11,7 @@
 //! - The UI reaches the core only through `commands` (IPC), mirrored on the
 //!   frontend by `src/lib/ipc.ts`.
 
-mod audio;
+pub mod audio;
 mod cleanup;
 mod commands;
 mod context;
