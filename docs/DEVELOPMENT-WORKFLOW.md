@@ -102,3 +102,15 @@ git pull origin main
 ## Environment Setup
 
 Prerequisites: Rust stable (`rustup`), Node 20+ with `pnpm`, Xcode Command Line Tools (macOS). Optional: [Ollama](https://ollama.com) running on `localhost:11434` for the LLM cleanup path (the app falls back to rule-based cleanup without it). First run downloads a Whisper GGUF model to the app-data dir — never commit model files. macOS dev builds need Microphone + Accessibility permission re-granted after each rebuild (System Settings → Privacy & Security).
+
+### Windows prerequisites
+
+Windows 10/11 is a supported dev/runtime target. On a fresh machine, install these before the first build:
+
+- **LLVM/libclang**: `winget install LLVM.LLVM`, then set `LIBCLANG_PATH` (e.g. `C:\Program Files\LLVM\bin`). `whisper-rs-sys` uses `bindgen` to generate bindings at build time, and `bindgen` needs `libclang` — this is the most common fresh-machine build failure if skipped.
+- **CMake**: `winget install Kitware.CMake`, plus the Visual Studio Build Tools "Desktop development with C++" workload — both required to compile `whisper.cpp`.
+- **WebView2** — present by default on Win10/11.
+- **Rust MSVC toolchain**: `rustup default stable-msvc`.
+- **Node 20+** and **pnpm**.
+
+Then `pnpm install` followed by `pnpm tauri:dev` (builds `--features whisper`), same as macOS.

@@ -54,6 +54,16 @@ bla has a hard on-device privacy guarantee (see [MISSION.md](./MISSION.md) for t
 
 If your change needs a new network destination or a new heavy native dependency, flag it explicitly in your PR description — these require maintainer sign-off.
 
+## Building on Windows
+
+bla supports Windows 10/11 as a dev/runtime target alongside macOS. Before building, install:
+
+- **LLVM/libclang** — `winget install LLVM.LLVM`, then set `LIBCLANG_PATH` (e.g. `C:\Program Files\LLVM\bin`). Required because `whisper-rs-sys` generates bindings via `bindgen`, which needs `libclang`. This is the most common first-build failure on a fresh machine.
+- **CMake** — `winget install Kitware.CMake` — plus the Visual Studio Build Tools "Desktop development with C++" workload, both needed to compile `whisper.cpp`.
+- **WebView2** (present by default on Win10/11), the **Rust MSVC toolchain** (`rustup default stable-msvc`), and **Node 20+**/**pnpm**.
+
+Then `pnpm install` and `pnpm tauri:dev` (builds `--features whisper`), same as macOS. See the [README](./README.md#building-on-windows) for the full command list.
+
 ## Getting help
 
-Environment setup details (Rust, Node/pnpm, Xcode CLT, Ollama, first-run model download, macOS permissions) are in the [README](./README.md#requirements) and [`docs/DEVELOPMENT-WORKFLOW.md`](./docs/DEVELOPMENT-WORKFLOW.md). If you get stuck, open an issue describing what you're trying to do and what's blocking you.
+Environment setup details (Rust, Node/pnpm, Xcode CLT, Ollama, first-run model download, macOS permissions, Windows build prerequisites) are in the [README](./README.md#requirements) and [`docs/DEVELOPMENT-WORKFLOW.md`](./docs/DEVELOPMENT-WORKFLOW.md). If you get stuck, open an issue describing what you're trying to do and what's blocking you.

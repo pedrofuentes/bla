@@ -14,7 +14,7 @@
 
 ## 2. Product shape
 - **Product type:** Desktop app (menu-bar/tray utility, Tauri 2)
-- **Hosting / distribution:** Open-source repo (MIT license, public) with GitHub Release binaries (.dmg for macOS; Windows installer must keep compiling, tested when hardware is available). No store distribution for v1.
+- **Hosting / distribution:** Open-source repo (MIT license, public) with GitHub Release binaries (.dmg for macOS). Windows is a supported dev/runtime target (packaging in M5: `.exe`/`.msi` via GitHub Release). No store distribution for v1.
 - **Backend?** **None.** Fully client-side/on-device. Adding any backend, proxy, or external origin is a gated decision.
 - **Design direction:** Quiet, minimal, native-feeling utility — a small always-on-top recording pill with a live waveform, a clean tabbed settings window. Think "invisible until summoned." Dark + light mode.
 
@@ -87,7 +87,7 @@
   - The **AC-7 cofounder smoke test** is `human-required` at every milestone close — never time-boxed, never auto-proceeded.
   - Any addition to the product's §5 network allowlist is `human-required` (restating the floor: this includes swapping model sources).
   - Heavy native dependencies beyond the §3 list (new C/C++-linking crates) are `time-boxed` with a transitive-risk note.
-- **Pre-authorized specifics (`auto`):** the §3 stack + transitive build/test/lint tooling; downloading Whisper GGUF models from huggingface.co for dev/test; standard CI (build matrix macOS + Windows compile-check, tests, lint, Sentinel Method B, scanners).
+- **Pre-authorized specifics (`auto`):** the §3 stack + transitive build/test/lint tooling; downloading Whisper GGUF models from huggingface.co for dev/test; standard CI (build matrix macOS + Windows build/test, lint, Sentinel Method B, scanners).
 
 ## 10. Resource governance (concurrency & cost)
 - **Max concurrent workers / worktrees:** 3
