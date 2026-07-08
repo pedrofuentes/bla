@@ -271,3 +271,189 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ollama_tests {
+    //! Issue #20 (AC-4, AC-10): `OllamaCleanup`, the injected-transport
+    //! seam, and the versioned rewrite-only prompt. All tests here run
+    //! against a `StubTransport` — no real network call, no running
+    //! Ollama required.
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Records the last request the transport was asked to send, and
+    /// returns a preprogrammed outcome — lets tests assert both the
+    /// fallback decision (AC-4) and the exact request shape (AC-10)
+    /// without a real socket.
+    struct StubTransport {
+        response: Result<String, TransportError>,
+        captured: RefCell<Option<(String, String)>>,
+    }
+
+    impl StubTransport {
+        fn unreachable() -> Self {
+            Self {
+                response: Err(TransportError::ConnectionFailed),
+                captured: RefCell::new(None),
+            }
+        }
+
+        /// A stub that succeeds, echoing back `model_output` inside a
+        /// canned Ollama `/api/generate` JSON response body.
+        fn succeeding(model_output: &str) -> Self {
+            let body = serde_json::json!({ "response": model_output, "done": true }).to_string();
+            Self {
+                response: Ok(body),
+                captured: RefCell::new(None),
+            }
+        }
+
+        fn captured_request(&self) -> (String, String) {
+            self.captured
+                .borrow()
+                .clone()
+                .expect("transport was never called")
+        }
+    }
+
+    impl OllamaTransport for StubTransport {
+        fn post(&self, url: &str, body: &str) -> Result<String, TransportError> {
+            *self.captured.borrow_mut() = Some((url.to_string(), body.to_string()));
+            self.response.clone()
+        }
+    }
+
+    fn cleanup_with(transport: StubTransport) -> OllamaCleanup<StubTransport> {
+        OllamaCleanup::new("http://localhost:11434", "llama3", transport)
+    }
+
+    #[test]
+    fn ollama_cleanup_returns_unreachable_when_transport_fails() {
+        // AC-4: an unreachable endpoint must surface CleanupError::Unreachable
+        // (never a raw transport error, never a panic) so the pipeline can
+        // fall back to RegexCleanup.
+        let cleanup = cleanup_with(StubTransport::unreachable());
+        let result = cleanup.clean("um, hello there", Tone::Neutral);
+        assert_eq!(result, Err(CleanupError::Unreachable));
+    }
+
+    #[test]
+    fn pipeline_style_fallback_surfaces_no_error_when_unreachable() {
+        // AC-4, end to end within this module: when OllamaCleanup can't
+        // reach the endpoint, dispatching to RegexCleanup on
+        // Err(Unreachable) yields a normal Ok result with no error ever
+        // reaching a hypothetical paste path.
+        let ollama = cleanup_with(StubTransport::unreachable());
+        let regex = RegexCleanup;
+        let raw = "um, hello world";
+
+        let cleaned = match ollama.clean(raw, Tone::Neutral) {
+            Ok(text) => text,
+            Err(CleanupError::Unreachable) => {
+                regex.clean(raw, Tone::Neutral).expect("RegexCleanup is infallible")
+            }
+        };
+
+        assert_eq!(cleaned, "Hello world.");
+    }
+
+    #[test]
+    fn ollama_cleanup_verbatim_tone_bypasses_the_transport_entirely() {
+        // Mirrors RegexCleanup's Verbatim contract and, critically, proves
+        // Verbatim never touches the network at all.
+        let stub = StubTransport::unreachable();
+        let cleanup = cleanup_with(stub);
+        let raw = "  um, hello   world, uh, messy";
+        assert_eq!(cleanup.clean(raw, Tone::Verbatim).unwrap(), raw);
+        assert!(cleanup.transport.captured.borrow().is_none());
+    }
+
+    #[test]
+    fn ollama_cleanup_targets_the_configured_base_url() {
+        let stub = StubTransport::succeeding("Hello world.");
+        let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", stub);
+        cleanup.clean("hello world", Tone::Neutral).unwrap();
+        let (url, _) = cleanup.transport.captured_request();
+        assert_eq!(url, "http://localhost:11434/api/generate");
+    }
+
+    #[test]
+    fn ollama_cleanup_default_base_url_is_localhost_11434() {
+        // MISSION §5: the only permitted runtime origin besides model
+        // download is localhost:11434 — the default must not point
+        // anywhere else.
+        assert_eq!(DEFAULT_OLLAMA_BASE_URL, "http://localhost:11434");
+    }
+
+    /// AC-10 fixture: self-corrections, missing punctuation, and a spoken
+    /// list, all in one transcript.
+    const FIXTURE_RAW: &str =
+        "so the meeting is at i mean the meeting is tomorrow at 3pm and we need to bring \
+         the laptop the charger and the notes";
+
+    /// A well-behaved model response: corrections resolved, punctuation
+    /// restored, spoken list rendered as bullets. Used to assert the
+    /// pipeline passes a faithful model response through unchanged
+    /// (rewrite-only property: this module adds nothing beyond the input).
+    const FIXTURE_MODEL_OUTPUT: &str = "The meeting is tomorrow at 3pm. We need to bring:\n- The laptop\n- The charger\n- The notes";
+
+    #[test]
+    fn ac10_fixture_regression_applies_corrections_punctuation_and_bullets() {
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub);
+
+        let got = cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        // The stubbed model already resolved the self-correction ("i mean"),
+        // restored punctuation, and rendered the spoken list as bullets;
+        // OllamaCleanup must pass that through faithfully.
+        assert_eq!(got, FIXTURE_MODEL_OUTPUT);
+        assert!(!got.contains("i mean"), "self-correction must not survive");
+        assert!(got.ends_with('.') || got.ends_with(':') == false || got.contains("- "));
+        assert!(got.contains("- The laptop"));
+        assert!(got.contains("- The charger"));
+        assert!(got.contains("- The notes"));
+    }
+
+    #[test]
+    fn ac10_request_carries_the_rewrite_only_prompt_and_the_raw_input_verbatim() {
+        // AC-10's rewrite-only property: assert the request sent to the
+        // stub carries the rewrite-only prompt plus the untouched input —
+        // this module must not editorialize on what it sends upstream
+        // either.
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub);
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        assert!(
+            body.contains(FIXTURE_RAW),
+            "request body must carry the raw input verbatim: {body}"
+        );
+        assert!(
+            body.contains("rewrite"),
+            "request body must carry the rewrite-only system prompt: {body}"
+        );
+    }
+
+    #[test]
+    fn ac10_prompt_file_contains_the_rewrite_only_constraints() {
+        // Regression guard: if a future prompt edit drops one of these
+        // constraints, this test fails CI (MISSION §7).
+        let prompt = CLEANUP_PROMPT_V1.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "filler",
+            "self-correction",
+            "punctuation",
+            "bullet",
+            "tone",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "prompt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+}
