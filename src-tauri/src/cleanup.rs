@@ -8,18 +8,25 @@
 //! Prompts live in `src-tauri/prompts/` as versioned files with fixture-based
 //! regression checks — never inlined here.
 //!
-//! This module currently defines the `Cleanup` trait, `Tone`, `CleanupError`,
-//! and the `RegexCleanup` baseline (ADR-0005, PRD AC-4). `OllamaCleanup` is a
-//! separate, later increment (issue #20) that will slot in behind the same
-//! trait.
+//! This module defines the `Cleanup` trait, `Tone`, `CleanupError`, the
+//! `RegexCleanup` baseline (ADR-0005, PRD AC-4), and `OllamaCleanup`, the
+//! optional LLM pass (issue #20, PRD AC-4/AC-10). `OllamaCleanup`'s HTTP
+//! transport is injected behind the `OllamaTransport` trait so request
+//! shaping, response parsing, and the unreachable-fallback decision are
+//! pure and unit-tested without a network call or a running Ollama
+//! instance; only `UreqTransport::post` touches a real socket, and only
+//! ever the configured `localhost:11434`-by-default origin (MISSION §5).
 //!
 //! `mod cleanup` isn't `pub` and `commands.rs` doesn't call into it yet — that
-//! wiring lands with the pipeline-integration work (issue #25 and friends).
+//! wiring lands with the pipeline-integration work (issue #25 and friends),
+//! including the dispatch that catches `CleanupError::Unreachable` from
+//! `OllamaCleanup` and falls back to `RegexCleanup` (AC-4).
 //! Until then this file's items are only reachable from its own unit tests,
 //! so `dead_code` is silenced here rather than crate-wide.
 #![allow(dead_code)]
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -165,6 +172,145 @@ fn capitalize_sentence_starts(s: &str) -> String {
         }
     }
     result
+}
+
+/// Default Ollama origin (MISSION §5: the only permitted runtime origin
+/// besides model download). Configurable per [`OllamaCleanup::new`] — e.g.
+/// for a non-default port — but the constant here is what ships by default.
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+
+/// The versioned, rewrite-only cleanup prompt (ADR-0005, MISSION §7,
+/// PRD AC-10). Embedded at compile time from the versioned prompt file so
+/// there is no runtime file path to resolve or fail to find; bumping the
+/// prompt means adding `cleanup_v2.txt` and repointing this constant, never
+/// editing `cleanup_v1.txt` in place.
+pub const CLEANUP_PROMPT_V1: &str = include_str!("../prompts/cleanup_v1.txt");
+
+/// Errors an [`OllamaTransport`] may return. `OllamaCleanup::clean` maps
+/// every variant to [`CleanupError::Unreachable`] (AC-4) — transport
+/// internals never propagate past this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportError {
+    /// The endpoint could not be reached at all (connection refused, DNS
+    /// failure, timeout, ...).
+    ConnectionFailed,
+    /// The endpoint responded, but the body wasn't a response this module
+    /// can parse.
+    InvalidResponse,
+}
+
+/// Injected HTTP transport seam (ADR-0005). All of `OllamaCleanup`'s request
+/// shaping, response parsing, and unreachable-fallback logic is pure and
+/// tested against a stub implementation of this trait — the real,
+/// network-touching implementation ([`UreqTransport`]) is thin glue with no
+/// decision-making of its own.
+pub trait OllamaTransport {
+    /// POSTs the JSON-encoded `body` to `url` and returns the raw response
+    /// body on success.
+    fn post(&self, url: &str, body: &str) -> Result<String, TransportError>;
+}
+
+/// The real transport: a synchronous `ureq` POST. Contains no logic beyond
+/// making the call and translating its outcome to [`TransportError`] — by
+/// design, this is the only code in the module that can open a socket, and
+/// it only ever talks to the URL it's given (which `OllamaCleanup` builds
+/// from its configured, localhost-by-default base URL — MISSION §5).
+pub struct UreqTransport;
+
+impl OllamaTransport for UreqTransport {
+    fn post(&self, url: &str, body: &str) -> Result<String, TransportError> {
+        let response = ureq::post(url)
+            .set("Content-Type", "application/json")
+            .send_string(body)
+            .map_err(|_| TransportError::ConnectionFailed)?;
+        response
+            .into_string()
+            .map_err(|_| TransportError::InvalidResponse)
+    }
+}
+
+/// Request body shape for Ollama's `/api/generate` endpoint. `system`
+/// carries the rewrite-only prompt ([`CLEANUP_PROMPT_V1`]); `prompt` carries
+/// the raw transcript, untouched, so the model sees exactly the input the
+/// caller passed in (AC-10's rewrite-only property extends to what this
+/// module sends upstream, not just what it returns).
+#[derive(Serialize)]
+struct GenerateRequest<'a> {
+    model: &'a str,
+    system: &'a str,
+    prompt: &'a str,
+    stream: bool,
+}
+
+/// The subset of Ollama's `/api/generate` response this module reads.
+#[derive(Deserialize)]
+struct GenerateResponse {
+    response: String,
+}
+
+/// Optional LLM-backed cleanup pass over a local Ollama instance
+/// (ADR-0005, PRD AC-4/AC-10). Under [`Tone::Neutral`], sends the raw
+/// transcript to the configured endpoint alongside the versioned
+/// rewrite-only prompt ([`CLEANUP_PROMPT_V1`]) and returns the model's
+/// response verbatim (trimmed). [`Tone::Verbatim`] bypasses the transport
+/// entirely, mirroring [`RegexCleanup`].
+///
+/// Never returns a transport error: any failure to reach or parse a
+/// response from the endpoint is mapped to [`CleanupError::Unreachable`],
+/// which the pipeline (issue #25) catches to fall back to [`RegexCleanup`]
+/// with no error surfaced to the paste path (AC-4). This module never logs
+/// transcript content (MISSION §5).
+pub struct OllamaCleanup<T: OllamaTransport> {
+    base_url: String,
+    model: String,
+    transport: T,
+}
+
+impl<T: OllamaTransport> OllamaCleanup<T> {
+    /// Builds an `OllamaCleanup` against `base_url` (no trailing slash
+    /// required — it's trimmed) using `model` and the given transport.
+    pub fn new(base_url: impl Into<String>, model: impl Into<String>, transport: T) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            transport,
+        }
+    }
+
+    /// Builds an `OllamaCleanup` against [`DEFAULT_OLLAMA_BASE_URL`].
+    pub fn with_default_base_url(model: impl Into<String>, transport: T) -> Self {
+        Self::new(DEFAULT_OLLAMA_BASE_URL, model, transport)
+    }
+
+    fn clean_via_ollama(&self, raw: &str) -> Result<String, CleanupError> {
+        let request = GenerateRequest {
+            model: &self.model,
+            system: CLEANUP_PROMPT_V1,
+            prompt: raw,
+            stream: false,
+        };
+        let body = serde_json::to_string(&request).map_err(|_| CleanupError::Unreachable)?;
+        let url = format!("{}/api/generate", self.base_url.trim_end_matches('/'));
+
+        let response_body = self
+            .transport
+            .post(&url, &body)
+            .map_err(|_| CleanupError::Unreachable)?;
+
+        let parsed: GenerateResponse =
+            serde_json::from_str(&response_body).map_err(|_| CleanupError::Unreachable)?;
+
+        Ok(parsed.response.trim().to_string())
+    }
+}
+
+impl<T: OllamaTransport> Cleanup for OllamaCleanup<T> {
+    fn clean(&self, raw: &str, tone: Tone) -> Result<String, CleanupError> {
+        match tone {
+            Tone::Verbatim => Ok(raw.to_string()),
+            Tone::Neutral => self.clean_via_ollama(raw),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -349,9 +495,9 @@ mod ollama_tests {
 
         let cleaned = match ollama.clean(raw, Tone::Neutral) {
             Ok(text) => text,
-            Err(CleanupError::Unreachable) => {
-                regex.clean(raw, Tone::Neutral).expect("RegexCleanup is infallible")
-            }
+            Err(CleanupError::Unreachable) => regex
+                .clean(raw, Tone::Neutral)
+                .expect("RegexCleanup is infallible"),
         };
 
         assert_eq!(cleaned, "Hello world.");
@@ -409,7 +555,7 @@ mod ollama_tests {
         // OllamaCleanup must pass that through faithfully.
         assert_eq!(got, FIXTURE_MODEL_OUTPUT);
         assert!(!got.contains("i mean"), "self-correction must not survive");
-        assert!(got.ends_with('.') || got.ends_with(':') == false || got.contains("- "));
+        assert!(got.contains('.'), "punctuation must be restored: {got}");
         assert!(got.contains("- The laptop"));
         assert!(got.contains("- The charger"));
         assert!(got.contains("- The notes"));
@@ -431,7 +577,7 @@ mod ollama_tests {
             "request body must carry the raw input verbatim: {body}"
         );
         assert!(
-            body.contains("rewrite"),
+            body.to_lowercase().contains("rewrite only"),
             "request body must carry the rewrite-only system prompt: {body}"
         );
     }
