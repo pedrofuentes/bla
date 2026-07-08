@@ -22,7 +22,7 @@
 
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// A calendar date + wall-clock time, injected wherever templating or
 /// timestamping needs "now" — never read from the OS clock inside this
@@ -124,6 +124,52 @@ impl ClipboardPayload {
     pub fn into_inner(self) -> String {
         self.0
     }
+}
+
+/// Errors from confining a file-mode target path to its configured base
+/// directory (security AC carried from PR #41's Sentinel review into issue
+/// #21, now reachable via the output router).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathConfinementError {
+    /// The expanded path template was absolute, which would ignore
+    /// `base_dir` entirely.
+    AbsolutePath,
+    /// The expanded path template contains a `..` component that climbs
+    /// above `base_dir` at some point while walking it.
+    EscapesBaseDir,
+}
+
+/// Confine an already-expanded (`{{date}}`/`{{time}}` tokens resolved)
+/// relative path to `base_dir`, rejecting absolute paths and any `..`
+/// traversal that would climb above `base_dir`.
+///
+/// Purely lexical: no filesystem access and no symlink resolution. (Note:
+/// symlink-TOCTOU on the confined target and restrictive file permissions
+/// are follow-up items per issue #21's comment — not addressed here.)
+pub fn confine_relative_path(
+    base_dir: &Path,
+    expanded_relative: &str,
+) -> Result<PathBuf, PathConfinementError> {
+    let candidate = Path::new(expanded_relative);
+
+    let mut depth: i64 = 0;
+    for component in candidate.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(PathConfinementError::EscapesBaseDir);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(PathConfinementError::AbsolutePath);
+            }
+        }
+    }
+
+    Ok(base_dir.join(candidate))
 }
 
 /// Given the transcript text we wrote to the clipboard (`set_to`) and what
