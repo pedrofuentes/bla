@@ -9,11 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `stt` module (issue #18, AC-1 partial / AC-21 seam, ADR-0004): an `Stt`
+  trait (`transcribe(samples: &[f32], opts: &TranscribeOpts) -> Result<String, SttError>`)
+  with a `FakeStt` test double for pipeline-shape tests, plus
+  `build_initial_prompt`, the pure, unit-tested function that renders
+  personal-dictionary terms into Whisper's `initial_prompt` (ordering,
+  comma/backslash escaping, blank-term dropping, and a deterministic
+  length cap). `WhisperStt` — the real `whisper-rs` (whisper.cpp,
+  Metal-accelerated on macOS) implementation — lives behind a new
+  default-off `whisper` cargo feature, since it builds whisper.cpp from
+  source and CI has no model file to transcribe with; `cargo test` (no
+  feature) exercises the trait/`FakeStt`/`build_initial_prompt` coverage,
+  and an `#[ignore]`d integration test covers real transcription manually
+  against a downloaded model.
 - Tauri 2 + React-TS + Vite + Tailwind app scaffold: `src-tauri` module stubs
   (`hotkeys`, `audio`, `stt`, `cleanup`, `output`, `context`, `store`,
   `commands`), `src/windows/{settings,pill}` and `src/lib/ipc.ts` UI stubs,
   rustfmt/clippy/ESLint/Prettier/Vitest tooling, and a `Makefile` covering
   `cargo llvm-cov` with OS-glue coverage exclusions. No product logic yet.
+- `audio` module: fixed-capacity ring buffer for captured `f32` samples
+  (drop-oldest overflow), channel-downmix + linear-interpolation resampling
+  to the 16 kHz mono format `stt` expects, RMS/peak level metering for the
+  future pill waveform, and 16-bit PCM WAV export for round-tripping a
+  captured window. All pure logic is unit-tested against in-code synthetic
+  sine-wave signals (ADR-0007 — no real recordings). The `cpal` device-open
+  and stream callback is thin, TDD-exempt OS glue that delegates every
+  decision to the tested pure functions.
 - Pure hold/toggle hotkey state machine in `hotkeys.rs` (AC-8): configurable
   Hold (record while the chord is held; stops when any chord key releases)
   and Toggle (first press starts, next press stops) modes, driven by
@@ -61,6 +82,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the correct fields (so a field swap fails CI). Adds `ureq` (with
   `default-features = false` — no TLS stack needed for localhost plain
   HTTP) as a new dependency.
+- `output.rs`: cursor-paste target and the output router (issue #21, AC-9,
+  ADR-0003). `ClipboardPayload` wraps transcript/clipboard text and
+  implements neither `Debug`, `Display`, nor `Serialize`, locked in by a
+  compile-time trait-assertion test — clipboard/transcript contents can
+  never flow into a log macro, string formatting, or a serializer.
+  `should_restore_clipboard` is the pure restore-decision: after the
+  synthesized paste and a configurable 150–300 ms delay (default 200 ms),
+  the pre-dictation clipboard is restored only if nothing else changed it
+  meanwhile, otherwise the restore is skipped so `bla` never clobbers newer
+  clipboard data. `Clipboard`/`PasteSynthesizer` are thin, fakeable OS-glue
+  traits with real implementations `SystemClipboard` (`arboard`) and
+  `EnigoPaste` (`enigo`, one synthesized Cmd+V/Ctrl+V keystroke).
+  `OutputMode`/`route` dispatch a finished dictation to either the
+  cursor-paste or file target; the file target additionally confines its
+  resolved path to a configured base directory via
+  `confine_relative_path`, rejecting absolute paths and `..` traversal that
+  would escape it (security AC carried from PR #41's Sentinel review into
+  issue #21 — symlink-TOCTOU guarding and restrictive file permissions
+  remain a follow-up). Adds `enigo` and `arboard` as dependencies and
+  `static_assertions` as a dev-dependency.
 
 ### Changed
 

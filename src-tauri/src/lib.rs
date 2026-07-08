@@ -11,14 +11,18 @@
 //! - The UI reaches the core only through `commands` (IPC), mirrored on the
 //!   frontend by `src/lib/ipc.ts`.
 
-mod audio;
+pub mod audio;
 mod cleanup;
 mod commands;
 mod context;
 mod hotkeys;
 mod output;
 mod store;
-mod stt;
+// `pub` (rather than private like its stub siblings): stt's Stt trait,
+// FakeStt, and build_initial_prompt are real, tested, standalone-usable API
+// surface as of this increment (not yet wired into commands.rs), so keeping
+// the module private would make rustc flag them as dead code.
+pub mod stt;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
