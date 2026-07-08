@@ -8,16 +8,29 @@
 //! path; path templating itself should stay pure-logic and unit-testable.
 //! Never logs or persists raw clipboard contents (MISSION §5).
 //!
-//! File-mode target (this increment, AC-3/AC-11): `Clock` is an injected
-//! date/time value (never the real OS clock) so `expand_template` and
-//! `append_entry` are deterministic and unit-testable; a later increment
-//! adds the cursor-paste target (issue #21) and the router that dispatches
-//! between them.
+//! File-mode target (#41, AC-3/AC-11): `Clock` is an injected date/time
+//! value (never the real OS clock) so `expand_template` and `append_entry`
+//! are deterministic and unit-testable.
 //!
-//! `dead_code` is allowed at module scope: nothing outside this module's own
-//! tests calls the file-mode API yet — the output router (issue #21) is the
-//! future, non-test consumer that will dispatch cursor-paste vs. file mode
-//! and call into `append_entry`. Remove this allow once that wiring lands.
+//! Cursor-paste target + router (this increment, issue #21, AC-9,
+//! ADR-0003): `ClipboardPayload` carries transcript/clipboard text without
+//! `Debug`/`Display`/`Serialize` (locked in by a compile-time
+//! trait-assertion test) so it can never be logged or persisted by
+//! accident. `Clipboard`/`PasteSynthesizer` are thin OS-glue seams (real
+//! impls: `SystemClipboard`/`EnigoPaste`, via `arboard`/`enigo`) behind
+//! which `should_restore_clipboard` and `paste_via_clipboard_swap` — the
+//! actual save/set/paste/restore-or-skip decision logic — stay pure and
+//! fakeable in tests. `route`/`OutputMode` dispatch a finished dictation to
+//! either target; the file branch additionally confines its resolved path
+//! to a configured base directory (`confine_relative_path`), rejecting
+//! absolute paths and `..` traversal that would escape it (security AC
+//! carried from PR #41's Sentinel review). Symlink-TOCTOU guarding and
+//! restrictive file permissions on the confined target remain noted
+//! follow-ups, not addressed here.
+//!
+//! `dead_code` is allowed at module scope: `commands.rs` doesn't call into
+//! `route` yet — wiring the router into the live pipeline is a future,
+//! non-test consumer. Remove this allow once that wiring lands.
 #![allow(dead_code)]
 
 use std::fs;
@@ -266,7 +279,8 @@ impl PasteSynthesizer for EnigoPaste {
     fn synthesize_paste(&self) -> io::Result<()> {
         use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| io::Error::other(e.to_string()))?;
+        let mut enigo =
+            Enigo::new(&Settings::default()).map_err(|e| io::Error::other(e.to_string()))?;
 
         #[cfg(target_os = "macos")]
         let modifier = Key::Meta;
@@ -294,7 +308,10 @@ pub enum OutputMode {
     /// Templated append to a file, confined to `base_dir` (AC-3/AC-11, plus
     /// the path-confinement security AC carried from PR #41's Sentinel
     /// review into issue #21).
-    File { base_dir: PathBuf, config: FileConfig },
+    File {
+        base_dir: PathBuf,
+        config: FileConfig,
+    },
 }
 
 /// What happened after [`route`] dispatched a finished dictation.
@@ -474,10 +491,7 @@ mod tests {
         .unwrap();
 
         assert!(*paste.called.borrow());
-        assert_eq!(
-            clipboard.get().unwrap(),
-            "pre-dictation clipboard contents"
-        );
+        assert_eq!(clipboard.get().unwrap(), "pre-dictation clipboard contents");
     }
 
     #[test]
@@ -492,7 +506,9 @@ mod tests {
             &clipboard,
             &paste,
             |_delay| {
-                clipboard.set("someone else's newer clipboard value").unwrap();
+                clipboard
+                    .set("someone else's newer clipboard value")
+                    .unwrap();
             },
             payload,
             Duration::from_millis(200),
@@ -523,10 +539,7 @@ mod tests {
 
         assert_eq!(outcome, OutputOutcome::Pasted);
         assert!(*paste.called.borrow());
-        assert_eq!(
-            clipboard.get().unwrap(),
-            "pre-dictation clipboard contents"
-        );
+        assert_eq!(clipboard.get().unwrap(), "pre-dictation clipboard contents");
     }
 
     #[test]
