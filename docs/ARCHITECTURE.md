@@ -44,12 +44,13 @@ bla/
 | Transcription timing | on-release, not streaming | paragraph-level dictation UX; streaming Whisper adds complexity for little gain |
 | Persistence | rusqlite + tauri-plugin-store | local-only user data (MISSION §5); no server |
 
-Record new decisions as ADRs in `DECISIONS.md`.
+Record new decisions as ADRs in `DECISIONS.md`. The binding versions of the pipeline decisions are ADR-0002…ADR-0007 there: module structure & data flow (ADR-0002), the `ClipboardPayload` no-log wrapper and clipboard-restore semantics (ADR-0003), STT model management (ADR-0004), cleanup layering (ADR-0005), the settings/records persistence split (ADR-0006), and synthetic/public-only test fixtures (ADR-0007).
 
 ## Module Boundaries
 
 - `cleanup`, `store`, and the path-templating/snippet/tone logic are **pure logic** — no OS calls, fully unit-testable, TDD-mandatory.
 - `audio`, `output`, `hotkeys`, `context` are the **only** modules that touch platform APIs (see AGENTS.md §OS-integration exemption); they stay thin and delegate all decisions to pure logic.
+- Clipboard text moves through `output` only inside the `ClipboardPayload` wrapper — no `Debug`/`Display`/`Serialize`, compile-time trait-asserted; restore is delayed (150–300 ms, configurable) and skipped if the clipboard changed meanwhile (ADR-0003, PRD AC-9).
 - The UI talks to the core **only** through `commands.rs` IPC; `src/lib/ipc.ts` wraps every call so the UI runs in a plain browser with mocks for Playwright screenshots.
 
 ## Data Flow
@@ -73,4 +74,4 @@ Privacy invariant (MISSION §5): nothing in this flow touches the network except
 | `src-tauri/src/cleanup.rs` | the Cleanup trait — all text-transform behavior hangs off it |
 | `src-tauri/src/output.rs` | output router — the only paste/file-write path |
 | `src-tauri/prompts/` | versioned LLM prompts with fixture regression checks |
-| `src-tauri/tests/fixtures/` | WAV + transcript fixtures backing AC-1/AC-2/AC-4 |
+| `src-tauri/tests/fixtures/` | WAV + transcript fixtures backing AC-1/AC-2/AC-4 — synthetic (TTS) or public-domain only, never real recordings (ADR-0007) |
