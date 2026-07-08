@@ -648,7 +648,10 @@ mod tests {
         let second = vec![0.25_f32; 10];
         downmix_resample_into(&second, 1, TARGET_SAMPLE_RATE, &mut mono_scratch, &mut out);
         assert_eq!(out.len(), 10);
-        assert_eq!(out, second, "stale samples from the first call must not linger");
+        assert_eq!(
+            out, second,
+            "stale samples from the first call must not linger"
+        );
         assert!(
             out.capacity() >= capacity_after_first,
             "capacity should be retained/reused across calls, not shrunk"
@@ -694,12 +697,19 @@ mod tests {
     fn capture_diagnostics_records_and_overwrites_the_last_error() {
         let diag = CaptureDiagnostics::new();
         diag.record_error(CaptureRuntimeError::BufferLockPoisoned);
-        assert_eq!(diag.last_error(), Some(CaptureRuntimeError::BufferLockPoisoned));
-
-        diag.record_error(CaptureRuntimeError::Stream("device disconnected".to_string()));
         assert_eq!(
             diag.last_error(),
-            Some(CaptureRuntimeError::Stream("device disconnected".to_string())),
+            Some(CaptureRuntimeError::BufferLockPoisoned)
+        );
+
+        diag.record_error(CaptureRuntimeError::Stream(
+            "device disconnected".to_string(),
+        ));
+        assert_eq!(
+            diag.last_error(),
+            Some(CaptureRuntimeError::Stream(
+                "device disconnected".to_string()
+            )),
             "a newer error must overwrite the older one, not accumulate"
         );
     }

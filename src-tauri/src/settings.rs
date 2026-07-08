@@ -176,9 +176,7 @@ impl SettingsStore for InMemorySettingsStore {
     fn load(&self) -> Result<Settings, SettingsLoadError> {
         match &self.raw {
             None => Err(SettingsLoadError::NotFound),
-            Some(json) => {
-                from_json(json).map_err(|e| SettingsLoadError::Corrupt(e.to_string()))
-            }
+            Some(json) => from_json(json).map_err(|e| SettingsLoadError::Corrupt(e.to_string())),
         }
     }
 

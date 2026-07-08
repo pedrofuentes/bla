@@ -43,6 +43,8 @@ sha2 = "0.10"
 # the host actually dialed (a hand-rolled authority parser could, e.g. on
 # `https://evil.com?@huggingface.co`).
 url = "2.5"
+tauri-plugin-store = "2"
+tauri-plugin-global-shortcut = "2"
 
 [dev-dependencies]
 static_assertions = "1.1.0"
