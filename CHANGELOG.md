@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `commands`), `src/windows/{settings,pill}` and `src/lib/ipc.ts` UI stubs,
   rustfmt/clippy/ESLint/Prettier/Vitest tooling, and a `Makefile` covering
   `cargo llvm-cov` with OS-glue coverage exclusions. No product logic yet.
+- Pure hold/toggle hotkey state machine in `hotkeys.rs` (AC-8): configurable
+  Hold (record while the chord is held; stops when any chord key releases)
+  and Toggle (first press starts, next press stops) modes, driven by
+  injected, timestamped key events with no `Instant::now()` calls so it's
+  deterministic in tests. Includes a configurable debounce threshold
+  (default 300 ms) that discards accidentally-short Hold presses without
+  emitting a dictation. OS wiring (`tauri-plugin-global-shortcut`) remains a
+  separate, thin, TDD-exempt stub.
 
 ### Changed
 
