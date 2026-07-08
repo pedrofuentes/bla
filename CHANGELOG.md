@@ -17,28 +17,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `is_allowlisted_url` are the AC-12 network guard's tested seam: every
   registry URL is asserted to resolve only to `huggingface.co`/`hf.co` and
   their subdomains (including the newer Xet-storage CDN hosts, e.g.
-  `us.aws.cdn.hf.co`), with real dot-anchored host matching (not a substring
-  check) that a battery of adversarial tests confirms rejects lookalike
-  hosts (`huggingface.co.evil.com`), the userinfo phishing trick
-  (`https://huggingface.co@evil.com/`), and non-`https` schemes. Checksum
-  verification (`sha256_hex`/`sha256_hex_reader`/`verify_checksum`),
-  progress-percent math (`compute_progress`), and resume-vs-restart planning
-  (`plan_resume`) are pure and unit-tested; the actual HTTP GET, streaming-
-  to-disk, and progress reporting live behind an injected `ModelTransport`
-  trait, so `download_model_with_spec`'s orchestration (URL/allowlist
-  selection, resume planning, checksum verification, target-path promotion)
-  is exercised in tests against a fake in-memory transport — no real network
-  call or downloaded model file needed. A checksum mismatch always errors
-  and removes the corrupt partial file rather than promoting it; the target
-  path is only ever created after a verified checksum. `UreqTransport`, the
-  real transport, additionally re-checks every redirect hop against the same
-  network guard (not just the initial request), so the CDN-only egress
-  invariant holds at the real network boundary too. Adds `sha2` (checksum
-  hashing) as a new dependency and enables `ureq`'s `tls` (rustls-backed)
-  feature, needed for the HTTPS download (the existing `OllamaCleanup`
-  transport stays on plain HTTP to localhost). Not yet wired into
-  `commands.rs`/the UI — that lands with the first-run downloader UI
-  integration.
+  `us.aws.cdn.hf.co`). The guard parses the URL with the **same `url` crate
+  `ureq` itself resolves the connect target with**, so the host it checks
+  cannot diverge from the host that's actually dialed — a battery of
+  adversarial tests confirms it rejects lookalike hosts
+  (`huggingface.co.evil.com`), the userinfo phishing trick
+  (`https://huggingface.co@evil.com/`), authority-ambiguity bypasses
+  (`https://evil.com?@huggingface.co`, `#@`, backslash variants), and
+  non-`https` schemes. Checksum verification
+  (`sha256_hex`/`sha256_hex_reader`/`verify_checksum`), progress-percent math
+  (`compute_progress`, throttled to ~10 Hz so the callback doesn't fire per
+  64 KB chunk), and resume-vs-restart planning (`plan_resume`) are pure and
+  unit-tested; the actual HTTP GET, streaming-to-disk, and progress reporting
+  live behind an injected `ModelTransport` trait, so
+  `download_model_with_spec`'s orchestration (URL/allowlist selection, resume
+  planning, checksum verification, target-path promotion) is exercised in
+  tests against a fake in-memory transport — no real network call or
+  downloaded model file needed. A resume only proceeds on an HTTP `206`
+  response (a `200` full-body reply to a `Range` request restarts from
+  scratch rather than appending full-onto-partial). A checksum mismatch
+  always errors and removes the corrupt partial file rather than promoting
+  it; the target path is only ever created after a verified checksum.
+  `UreqTransport`, the real transport, sets explicit connect/read timeouts
+  (so a black-hole host can't hang the first run) and re-checks every
+  redirect hop against the same network guard via an injected per-hop
+  responder seam (covered by tests: disallowed-host redirect, too-many-
+  redirects, missing `Location`, and the `?@` bypass at the redirect layer),
+  so the CDN-only egress invariant holds at the real network boundary too.
+  Adds `sha2` (checksum hashing) and `url` (shared-parser guard) as
+  dependencies and enables `ureq`'s `tls` (rustls-backed) feature, needed for
+  the HTTPS download (the existing `OllamaCleanup` transport stays on plain
+  HTTP to localhost). Not yet wired into `commands.rs`/the UI — that lands
+  with the first-run downloader UI integration.
+- `tray` module (issue #23, AC-14): a total, deterministic
+  `tray_icon_state(&PipelineState) -> TrayIconState` mapping every pipeline
+  state (`Idle`/`Recording`/`Transcribing`/`Error`) to its tray icon
+  variant (`Idle`/`Active`/`Busy`/`Error`), plus `OutputModeSwitch`, a pure
+  model showing that a tray-driven output-mode switch (`CursorPaste`/
+  `File`) only affects `route_target()` calls made after `set_mode` —
+  i.e. it takes effect starting with the next dictation, not one already
+  in flight. All logic is pure and unit-tested; the real Tauri tray
+  icon/menu rendering is thin OS glue, deliberately minimal, separate, and
+  not wired into `run()` in this increment.
+- `settings` module (issue #23, AC-13, ADR-0006): a `Settings` struct
+  (hotkey binding, hold/toggle `RecordingMode`, `ModelPreset`
+  (`large-v3-turbo`/`small`), `OutputModeSetting` (cursor/file), and a
+  file-path template string) deriving `Serialize`/`Deserialize` — holds
+  config only, never transcript/clipboard text, so that's compatible with
+  MISSION §7's no-log invariant. `to_json`/`from_json` are pure,
+  deterministic (de)serialization; `#[serde(default)]` means any field
+  missing from persisted (or first-run/empty) JSON falls back to
+  `Settings::default()`'s value for that field. `SettingsStore` is the
+  injected persistence seam a future `tauri-plugin-store`-backed
+  implementation would sit behind (thin OS glue, not wired into
+  `commands.rs` in this increment); `InMemorySettingsStore` stands in for
+  it in tests, including a simulated-app-restart round trip. No new
+  dependencies added — the real `tauri-plugin-store` wiring is deferred to
+  a later increment.
 - `stt` module (issue #18, AC-1 partial / AC-21 seam, ADR-0004): an `Stt`
   trait (`transcribe(samples: &[f32], opts: &TranscribeOpts) -> Result<String, SttError>`)
   with a `FakeStt` test double for pipeline-shape tests, plus
@@ -132,9 +167,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   issue #21 — symlink-TOCTOU guarding and restrictive file permissions
   remain a follow-up). Adds `enigo` and `arboard` as dependencies and
   `static_assertions` as a dev-dependency.
+- `pipeline` module (issue #25, ADR-0002/ADR-0005): `Pipeline<S, C, Clip,
+  Paste, Sleep>` composes an injected `Stt` + `Cleanup` + the output router
+  (`crate::output::route`) into a single `Pipeline::run(samples, opts) ->
+  Result<Outcome, PipelineError>` call, so the whole transcribe-clean-route
+  flow runs headlessly from fixtures. `Pipeline` owns the AC-4 fallback
+  decision: a `CleanupError::Unreachable` from the configured `Cleanup` is
+  caught and retried against `RegexCleanup`, recorded in
+  `Outcome::cleanup_fell_back`, and never surfaced as an error. `cleanup`
+  and `output` are now `pub mod`s so the new cumulative acceptance suite
+  (`src-tauri/tests/acceptance.rs`) can reach them from outside the crate;
+  `pipeline` is not yet wired into `commands.rs`.
+- Cumulative acceptance suite `src-tauri/tests/acceptance.rs` (issue #25),
+  entirely from injected fakes/stubs (no live mic, clipboard, model, or
+  network): `ac1_...` runs `FakeStt`'s canned transcript (fillers plus one
+  self-correction) through `OllamaCleanup` backed by a stub transport that
+  returns the cleaned-and-corrected text, asserting no filler words and the
+  corrected phrase survive (AC-1); `ac2_...` times the regex-cleanup path
+  over a 15-second-equivalent (240,000-sample) fixture, logs the measured
+  duration, and asserts it's under the 2 s budget (AC-2; real whisper-rs
+  latency stays a `--features whisper` / AC-7 smoke-test concern, per
+  `stt.rs`); `ac4_...` drives an unreachable Ollama stub and asserts the
+  pipeline falls back to `RegexCleanup` with no error surfaced (AC-4);
+  `ac5_...` builds the pipeline entirely from injected stubs and asserts it
+  completes with zero real network I/O, guarded by a
+  `static_assertions::assert_type_ne_all!` that fails to compile if the
+  real, network-touching `UreqTransport` is ever substituted into this
+  case (AC-5).
 
 ### Changed
 
 ### Fixed
+
+- `RegexCleanup` (`src-tauri/src/cleanup.rs`), three Sentinel-tracked bugs
+  that blocked wiring cleanup into the pipeline (issues #52/#53/#54, all
+  fixed before #25 per Sentinel's instruction):
+  - **#52** comma-flanked "like" is no longer stripped unconditionally —
+    it's only treated as discourse filler when the word right after it is
+    a clause-starter (this/that/it/i/we/you/he/she/they/there, plus
+    contractions), so a genuine list connector like "eggs, like, milk"
+    survives ("like, this is cool" is still correctly stripped as filler).
+  - **#53** a comma left dangling by a trailing filler removal (e.g. "I
+    think, um" -> "I think," once "um" is gone) is now stripped before
+    capitalization/final-punctuation, so the result is "I think." instead
+    of the malformed "I think,.".
+  - **#54** sentence-start capitalization no longer fires on a decimal
+    point: a `.` directly between two digits (e.g. "3.14") is no longer
+    treated as a sentence terminator, so "3.14 exactly" stays "3.14
+    exactly." instead of wrongly capitalizing to "3.14 Exactly.".
 
 ### Removed

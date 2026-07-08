@@ -12,7 +12,13 @@
 //!   frontend by `src/lib/ipc.ts`.
 
 pub mod audio;
-mod cleanup;
+// `pub` (rather than private like their stub siblings): as of the pipeline
+// increment (issue #25), `cleanup`/`output`/`pipeline` are real, tested,
+// standalone-usable API surface — `pipeline` composes `Stt` + `Cleanup` +
+// the output router headlessly, and the cumulative acceptance suite
+// (`tests/acceptance.rs`) exercises them from outside the crate. Still not
+// wired into `commands.rs` / the live Tauri runtime — that's a later step.
+pub mod cleanup;
 mod commands;
 mod context;
 mod hotkeys;
@@ -22,12 +28,11 @@ mod hotkeys;
 // commands.rs), so keeping the module private would make rustc flag them
 // as dead code — same rationale as `stt` below.
 pub mod models;
-mod output;
+pub mod output;
+pub mod pipeline;
 mod store;
-// `pub` (rather than private like its stub siblings): stt's Stt trait,
-// FakeStt, and build_initial_prompt are real, tested, standalone-usable API
-// surface as of this increment (not yet wired into commands.rs), so keeping
-// the module private would make rustc flag them as dead code.
+pub mod settings;
+pub mod tray;
 pub mod stt;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/

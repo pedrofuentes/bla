@@ -28,9 +28,10 @@
 //! restrictive file permissions on the confined target remain noted
 //! follow-ups, not addressed here.
 //!
-//! `dead_code` is allowed at module scope: `commands.rs` doesn't call into
-//! `route` yet — wiring the router into the live pipeline is a future,
-//! non-test consumer. Remove this allow once that wiring lands.
+//! `route`'s first non-test consumer is `pipeline` (issue #25), which calls
+//! it from `Pipeline::run`; `commands.rs` doesn't call into either module
+//! yet — that wiring is a later step. `dead_code` stays allowed at module
+//! scope for any item not yet reached from there.
 #![allow(dead_code)]
 
 use std::fs;

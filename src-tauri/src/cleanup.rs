@@ -17,12 +17,11 @@
 //! instance; only `UreqTransport::post` touches a real socket, and only
 //! ever the configured `localhost:11434`-by-default origin (MISSION §5).
 //!
-//! `mod cleanup` isn't `pub` and `commands.rs` doesn't call into it yet — that
-//! wiring lands with the pipeline-integration work (issue #25 and friends),
-//! including the dispatch that catches `CleanupError::Unreachable` from
-//! `OllamaCleanup` and falls back to `RegexCleanup` (AC-4).
-//! Until then this file's items are only reachable from its own unit tests,
-//! so `dead_code` is silenced here rather than crate-wide.
+//! `pipeline` (issue #25) is the dispatch that catches
+//! `CleanupError::Unreachable` from `OllamaCleanup` and falls back to
+//! `RegexCleanup` (AC-4) — `commands.rs` doesn't call into either module yet;
+//! that wiring is a later step. `dead_code` stays silenced here for any item
+//! not yet reached from `pipeline` or this file's own unit tests.
 #![allow(dead_code)]
 
 use regex::Regex;
@@ -81,18 +80,31 @@ pub trait Cleanup {
 /// Under [`Tone::Neutral`], `RegexCleanup`:
 /// 1. Removes unambiguous filler interjections ("um", "uh", "er" —
 ///    word-boundary, case-insensitive) unconditionally.
-/// 2. Removes "like" / "you know" **only** when comma-flanked on both sides
-///    (e.g. "it's, like, great"), since that punctuation pattern cheaply and
-///    reliably marks discourse-filler usage in speech transcripts. Other
-///    occurrences — comparative ("looks like rain"), literal ("you know the
-///    rules"), or sentence-initial/-final — are deliberately left alone:
-///    telling those apart from genuine filler usage isn't cheap, so this
-///    baseline stays conservative rather than risk stripping real content.
+/// 2. Removes "you know" **only** when comma-flanked on both sides (e.g.
+///    "it's, you know, great"), since that punctuation pattern cheaply and
+///    reliably marks discourse-filler usage in speech transcripts. Removes
+///    comma-flanked "like" the same way, **except** when it isn't followed
+///    by a clause (issue #52): "eggs, like, milk" uses "like" as a genuine
+///    list connector ("such as"), not filler, so it survives when the word
+///    immediately after it isn't a clause-starter (see [`CLAUSE_STARTERS`]).
+///    Other occurrences — comparative ("looks like rain"), literal ("you
+///    know the rules"), or sentence-initial/-final — are deliberately left
+///    alone: telling those apart from genuine filler usage isn't cheap, so
+///    this baseline stays conservative rather than risk stripping real
+///    content.
 /// 3. Collapses runs of whitespace (including any left behind by 1–2) to a
 ///    single space and trims the ends.
-/// 4. Capitalizes the first letter of the string and of every sentence that
-///    follows a `.`, `!`, or `?`.
-/// 5. Ensures the result ends with sentence-final punctuation (`.` added if
+/// 4. Strips any comma left dangling directly before another comma, a
+///    sentence terminator, or the end of the string (issue #53) — the
+///    orphaned punctuation a trailing filler removal can otherwise leave
+///    behind (e.g. "I think, um" would otherwise clean to "I think," and
+///    then collide with step 6's appended period into "I think,.").
+/// 5. Capitalizes the first letter of the string and of every sentence that
+///    follows a **real** sentence-terminating `.`, `!`, or `?` — a `.`
+///    between two digits (a decimal point, issue #54) or with no following
+///    letter never counts, so e.g. "3.14 exactly" doesn't capitalize
+///    "exactly".
+/// 6. Ensures the result ends with sentence-final punctuation (`.` added if
 ///    none of `.`/`!`/`?` is already present).
 ///
 /// `RegexCleanup` does **not** resolve self-corrections (false starts,
@@ -114,20 +126,79 @@ struct FillerPatterns {
     /// Unambiguous filler interjections, plus a directly-trailing comma so
     /// removal doesn't leave orphaned punctuation behind.
     interjection: Regex,
-    /// "like" / "you know" when comma-flanked on both sides — see
-    /// `RegexCleanup`'s doc comment for why this is the chosen heuristic.
-    comma_flanked_filler: Regex,
+    /// Comma-flanked "like" plus the word immediately following it, so the
+    /// replacement closure (see [`strip_filler_like`]) can decide whether
+    /// that occurrence is discourse filler (issue #52).
+    comma_flanked_like: Regex,
+    /// "you know" when comma-flanked on both sides — see `RegexCleanup`'s
+    /// doc comment for why this is the chosen heuristic.
+    comma_flanked_you_know: Regex,
     /// Any run of whitespace, collapsed to a single space.
     whitespace: Regex,
+    /// A comma left dangling directly before another comma or a sentence
+    /// terminator — orphaned punctuation a filler removal can leave behind
+    /// mid-string (issue #53). `regex` has no look-around, so the following
+    /// punctuation is captured and put back rather than merely peeked at.
+    dangling_comma_before_punct: Regex,
+    /// A comma left dangling at the very end of the string — the other half
+    /// of issue #53 (e.g. "I think, um" -> "I think," once "um" is gone,
+    /// with nothing at all following the comma).
+    trailing_dangling_comma: Regex,
 }
 
 fn patterns() -> &'static FillerPatterns {
     static PATTERNS: OnceLock<FillerPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| FillerPatterns {
         interjection: Regex::new(r"(?i)\b(?:um|uh|er)\b,?").expect("valid regex"),
-        comma_flanked_filler: Regex::new(r"(?i),\s*(?:like|you know)\s*,").expect("valid regex"),
+        comma_flanked_like: Regex::new(r"(?i),\s*like\s*,\s*(\w+)").expect("valid regex"),
+        comma_flanked_you_know: Regex::new(r"(?i),\s*you know\s*,").expect("valid regex"),
         whitespace: Regex::new(r"\s+").expect("valid regex"),
+        dangling_comma_before_punct: Regex::new(r",\s*([,.!?])").expect("valid regex"),
+        trailing_dangling_comma: Regex::new(r",\s*$").expect("valid regex"),
     })
+}
+
+/// Strips a comma left dangling before another comma/terminator or at the
+/// end of the string (issue #53) — see [`FillerPatterns::dangling_comma_before_punct`]
+/// / [`FillerPatterns::trailing_dangling_comma`].
+fn strip_dangling_commas(input: &str) -> String {
+    let patterns = patterns();
+    let before_punct = patterns
+        .dangling_comma_before_punct
+        .replace_all(input, "$1");
+    patterns
+        .trailing_dangling_comma
+        .replace_all(&before_punct, "")
+        .into_owned()
+}
+
+/// Words that, immediately after a comma-flanked "like", mark it as a
+/// discourse filler introducing a clause (a pronoun/demonstrative/existential
+/// subject) rather than a genuine list connector (issue #52). E.g. "so,
+/// like, this is cool" — "this" starts a clause, so "like" is filler and
+/// gets stripped. "eggs, like, milk" — "milk" is a plain noun, not a clause
+/// starter, so "like" survives as the list connector it is.
+const CLAUSE_STARTERS: &[&str] = &[
+    "this", "that", "it", "it's", "i", "i'm", "we", "we're", "you", "you're", "he", "he's", "she",
+    "she's", "they", "they're", "there", "there's",
+];
+
+/// Replacement pass for [`FillerPatterns::comma_flanked_like`] (issue #52):
+/// strips comma-flanked "like" only when the word right after it is a
+/// [`CLAUSE_STARTERS`] entry (genuine filler introducing a clause); otherwise
+/// leaves the match untouched so a genuine list connector like "eggs, like,
+/// milk" survives intact.
+fn strip_filler_like(input: &str) -> std::borrow::Cow<'_, str> {
+    patterns()
+        .comma_flanked_like
+        .replace_all(input, |caps: &regex::Captures| {
+            let next_word = &caps[1];
+            if CLAUSE_STARTERS.contains(&next_word.to_lowercase().as_str()) {
+                format!(", {next_word}")
+            } else {
+                caps[0].to_string()
+            }
+        })
 }
 
 /// The deterministic rewrite used by [`RegexCleanup`] under [`Tone::Neutral`].
@@ -136,9 +207,10 @@ fn clean_text(raw: &str) -> String {
     let patterns = patterns();
 
     let without_interjections = patterns.interjection.replace_all(raw, "");
+    let without_like_filler = strip_filler_like(&without_interjections);
     let without_fillers = patterns
-        .comma_flanked_filler
-        .replace_all(&without_interjections, ",");
+        .comma_flanked_you_know
+        .replace_all(&without_like_filler, ",");
     let collapsed = patterns.whitespace.replace_all(&without_fillers, " ");
     let trimmed = collapsed.trim();
 
@@ -146,7 +218,8 @@ fn clean_text(raw: &str) -> String {
         return String::new();
     }
 
-    let capitalized = capitalize_sentence_starts(trimmed);
+    let without_dangling_commas = strip_dangling_commas(trimmed);
+    let capitalized = capitalize_sentence_starts(&without_dangling_commas);
 
     let ends_with_terminal = matches!(capitalized.chars().last(), Some('.' | '!' | '?'));
     if ends_with_terminal {
@@ -157,22 +230,48 @@ fn clean_text(raw: &str) -> String {
 }
 
 /// Capitalizes the first letter of `s` and the first letter following every
-/// `.`, `!`, or `?` (skipping any whitespace in between).
+/// *real* sentence-terminating `.`, `!`, or `?` (skipping any whitespace in
+/// between; any other non-whitespace character in between — e.g. a run of
+/// digits — cancels a pending capitalization, since at that point the
+/// "first letter" opportunity has already passed).
+///
+/// A `.` only counts as a sentence terminator when [`is_sentence_terminator`]
+/// says so (issue #54) — a decimal point embedded between two digits, like
+/// the one in "3.14", never does, so "3.14 exactly" doesn't capitalize
+/// "exactly". `!` and `?` are always terminators.
 fn capitalize_sentence_starts(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(s.len());
     let mut capitalize_next = true;
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            // Whitespace never resolves a pending capitalization either way.
+            result.push(c);
+            continue;
+        }
         if capitalize_next && c.is_alphabetic() {
             result.extend(c.to_uppercase());
             capitalize_next = false;
         } else {
-            if c == '.' || c == '!' || c == '?' {
-                capitalize_next = true;
-            }
             result.push(c);
+            capitalize_next =
+                (c == '.' || c == '!' || c == '?') && is_sentence_terminator(&chars, i);
         }
     }
     result
+}
+
+/// Whether `chars[i]` (a `.`, `!`, or `?`) ends a sentence. `!`/`?` always
+/// do; a `.` does **unless** it sits directly between two ASCII digits — a
+/// decimal point (issue #54), e.g. the `.` in "3.14" — in which case it's
+/// part of a number, not a sentence break.
+fn is_sentence_terminator(chars: &[char], i: usize) -> bool {
+    if chars[i] != '.' {
+        return true;
+    }
+    let prev_is_digit = i > 0 && chars[i - 1].is_ascii_digit();
+    let next_is_digit = chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+    !(prev_is_digit && next_is_digit)
 }
 
 /// Default Ollama origin (MISSION §5: the only permitted runtime origin
@@ -456,6 +555,28 @@ mod tests {
     }
 
     #[test]
+    fn regex_cleanup_does_not_capitalize_after_a_decimal_point_issue_54() {
+        // Sentinel issue #54: the sentence-start capitalization pass fires
+        // on ANY '.', including the decimal point in a number, so "3.14
+        // exactly" wrongly becomes "3.14 Exactly." — the word after a
+        // decimal point isn't a new sentence and must stay lowercase.
+        let cleanup = RegexCleanup;
+        let got = cleanup.clean("3.14 exactly", Tone::Neutral).unwrap();
+        assert_eq!(got, "3.14 exactly.");
+    }
+
+    #[test]
+    fn regex_cleanup_no_orphan_comma_after_trailing_filler_issue_53() {
+        // Sentinel issue #53: removing a trailing comma-preceded filler must
+        // not leave a dangling comma that then collides with the
+        // sentence-final period RegexCleanup appends, e.g. "I think,." —
+        // the comma has to go, not just the filler word.
+        let cleanup = RegexCleanup;
+        let got = cleanup.clean("I think, um", Tone::Neutral).unwrap();
+        assert_eq!(got, "I think.");
+    }
+
+    #[test]
     fn regex_cleanup_is_idempotent_on_already_clean_input() {
         let cleanup = RegexCleanup;
         for (description, _, expected) in CASES {
@@ -478,6 +599,20 @@ mod tests {
         let cleanup = RegexCleanup;
         let raw = "  um, hello   world, like, this is,uh,messy";
         assert_eq!(cleanup.clean(raw, Tone::Verbatim).unwrap(), raw);
+    }
+
+    #[test]
+    fn regex_cleanup_keeps_genuine_list_connector_like_issue_52() {
+        // Sentinel issue #52: comma-flanked "like" isn't always discourse
+        // filler — "eggs, like, milk" uses "like" as a genuine list
+        // connector ("such as"), and stripping it produces a nonsensical
+        // "Eggs, milk." The word must survive when it isn't followed by a
+        // clause (contrast with the CASES table above, where "like," is
+        // followed by a clause starter like "this" and is correctly
+        // stripped as filler).
+        let cleanup = RegexCleanup;
+        let got = cleanup.clean("eggs, like, milk", Tone::Neutral).unwrap();
+        assert_eq!(got, "Eggs, like, milk.");
     }
 
     #[test]

@@ -37,6 +37,12 @@ arboard = "3.6.1"
 # SHA-256 for model-checksum verification (models.rs, ADR-0004/AC-12) — a
 # small, pure-Rust hashing crate with no TLS/native-build surface of its own.
 sha2 = "0.10"
+# URL parsing for the AC-12 network guard (models.rs). Deliberately the SAME
+# crate `ureq` resolves its connect target with (already in the tree via
+# ureq — same version), so the host the guard checks can never diverge from
+# the host actually dialed (a hand-rolled authority parser could, e.g. on
+# `https://evil.com?@huggingface.co`).
+url = "2.5"
 
 [dev-dependencies]
 static_assertions = "1.1.0"
