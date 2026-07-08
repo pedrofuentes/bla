@@ -23,6 +23,28 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+/// Default clipboard-swap restore delay (ADR-0003: 150–300 ms; paste
+/// consumers read the clipboard asynchronously, so restoring too early
+/// truncates the paste). Tuned further during the AC-7 human smoke test.
+pub const DEFAULT_RESTORE_DELAY: Duration = Duration::from_millis(200);
+
+/// Thin OS-glue seam for reading/writing the real system clipboard
+/// (AGENTS.md OS-integration exemption). Implemented for real via `arboard`
+/// in [`SystemClipboard`]; tests inject a fake so
+/// [`paste_via_clipboard_swap`]'s restore-decision logic is exercised
+/// without a real clipboard.
+pub trait Clipboard {
+    fn get(&self) -> io::Result<String>;
+    fn set(&self, contents: &str) -> io::Result<()>;
+}
+
+/// Thin OS-glue seam for synthesizing the paste keystroke (Cmd+V / Ctrl+V).
+/// Implemented for real via `enigo` in [`EnigoPaste`].
+pub trait PasteSynthesizer {
+    fn synthesize_paste(&self) -> io::Result<()>;
+}
 
 /// A calendar date + wall-clock time, injected wherever templating or
 /// timestamping needs "now" — never read from the OS clock inside this
@@ -184,6 +206,34 @@ pub fn confine_relative_path(
 /// contents would lose the user's data — so the restore is skipped.
 pub fn should_restore_clipboard(set_to: &str, observed: &str) -> bool {
     observed == set_to
+}
+
+/// Clipboard-swap paste (AC-9, ADR-0003): save the current clipboard, write
+/// the transcript, synthesize the paste keystroke, wait `restore_delay`,
+/// then restore the saved clipboard unless [`should_restore_clipboard`]
+/// says something else changed it meanwhile.
+///
+/// `clipboard`/`paste` are the thin OS-glue seams (real impls:
+/// [`SystemClipboard`]/[`EnigoPaste`]); `sleep` is injected too so tests
+/// never actually wait — and, in the skip-on-change test, can simulate a
+/// concurrent clipboard write during the delay.
+pub fn paste_via_clipboard_swap(
+    clipboard: &impl Clipboard,
+    paste: &impl PasteSynthesizer,
+    sleep: impl FnOnce(Duration),
+    payload: ClipboardPayload,
+    restore_delay: Duration,
+) -> io::Result<()> {
+    let saved = clipboard.get()?;
+    let transcript = payload.into_inner();
+    clipboard.set(&transcript)?;
+    paste.synthesize_paste()?;
+    sleep(restore_delay);
+    let observed = clipboard.get()?;
+    if should_restore_clipboard(&transcript, &observed) {
+        clipboard.set(&saved)?;
+    }
+    Ok(())
 }
 
 /// Append `entry` to the file-mode target described by `config`, resolving
