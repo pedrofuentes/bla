@@ -236,6 +236,56 @@ pub fn paste_via_clipboard_swap(
     Ok(())
 }
 
+/// Real system clipboard via `arboard`. Thin OS glue (AGENTS.md
+/// OS-integration exemption) — no decisions here, just reading/writing the
+/// platform clipboard; [`should_restore_clipboard`] and
+/// [`paste_via_clipboard_swap`] carry the actual logic and stay behind the
+/// [`Clipboard`] trait so they're testable without this type.
+pub struct SystemClipboard;
+
+impl Clipboard for SystemClipboard {
+    fn get(&self) -> io::Result<String> {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.get_text())
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn set(&self, contents: &str) -> io::Result<()> {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(contents.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+/// Real synthetic Cmd+V (macOS) / Ctrl+V (elsewhere) via `enigo`. Thin OS
+/// glue (AGENTS.md OS-integration exemption) — synthesizes exactly one
+/// keystroke combo and delegates every decision to the pure logic above.
+pub struct EnigoPaste;
+
+impl PasteSynthesizer for EnigoPaste {
+    fn synthesize_paste(&self) -> io::Result<()> {
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+
+        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| io::Error::other(e.to_string()))?;
+
+        #[cfg(target_os = "macos")]
+        let modifier = Key::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let modifier = Key::Control;
+
+        enigo
+            .key(modifier, Direction::Press)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        enigo
+            .key(Key::Unicode('v'), Direction::Click)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        enigo
+            .key(modifier, Direction::Release)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
+    }
+}
+
 /// Selects which output target a finished dictation is routed to (AC-14
 /// switches this per-dictation from settings-derived state).
 pub enum OutputMode {
