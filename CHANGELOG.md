@@ -127,9 +127,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   issue #21 — symlink-TOCTOU guarding and restrictive file permissions
   remain a follow-up). Adds `enigo` and `arboard` as dependencies and
   `static_assertions` as a dev-dependency.
+- `pipeline` module (issue #25, ADR-0002/ADR-0005): `Pipeline<S, C, Clip,
+  Paste, Sleep>` composes an injected `Stt` + `Cleanup` + the output router
+  (`crate::output::route`) into a single `Pipeline::run(samples, opts) ->
+  Result<Outcome, PipelineError>` call, so the whole transcribe-clean-route
+  flow runs headlessly from fixtures. `Pipeline` owns the AC-4 fallback
+  decision: a `CleanupError::Unreachable` from the configured `Cleanup` is
+  caught and retried against `RegexCleanup`, recorded in
+  `Outcome::cleanup_fell_back`, and never surfaced as an error. `cleanup`
+  and `output` are now `pub mod`s so the new cumulative acceptance suite
+  (`src-tauri/tests/acceptance.rs`) can reach them from outside the crate;
+  `pipeline` is not yet wired into `commands.rs`.
+- Cumulative acceptance suite `src-tauri/tests/acceptance.rs` (issue #25),
+  entirely from injected fakes/stubs (no live mic, clipboard, model, or
+  network): `ac1_...` runs `FakeStt`'s canned transcript (fillers plus one
+  self-correction) through `OllamaCleanup` backed by a stub transport that
+  returns the cleaned-and-corrected text, asserting no filler words and the
+  corrected phrase survive (AC-1); `ac2_...` times the regex-cleanup path
+  over a 15-second-equivalent (240,000-sample) fixture, logs the measured
+  duration, and asserts it's under the 2 s budget (AC-2; real whisper-rs
+  latency stays a `--features whisper` / AC-7 smoke-test concern, per
+  `stt.rs`); `ac4_...` drives an unreachable Ollama stub and asserts the
+  pipeline falls back to `RegexCleanup` with no error surfaced (AC-4);
+  `ac5_...` builds the pipeline entirely from injected stubs and asserts it
+  completes with zero real network I/O, guarded by a
+  `static_assertions::assert_type_ne_all!` that fails to compile if the
+  real, network-touching `UreqTransport` is ever substituted into this
+  case (AC-5).
 
 ### Changed
 
 ### Fixed
+
+- `RegexCleanup` (`src-tauri/src/cleanup.rs`), three Sentinel-tracked bugs
+  that blocked wiring cleanup into the pipeline (issues #52/#53/#54, all
+  fixed before #25 per Sentinel's instruction):
+  - **#52** comma-flanked "like" is no longer stripped unconditionally —
+    it's only treated as discourse filler when the word right after it is
+    a clause-starter (this/that/it/i/we/you/he/she/they/there, plus
+    contractions), so a genuine list connector like "eggs, like, milk"
+    survives ("like, this is cool" is still correctly stripped as filler).
+  - **#53** a comma left dangling by a trailing filler removal (e.g. "I
+    think, um" -> "I think," once "um" is gone) is now stripped before
+    capitalization/final-punctuation, so the result is "I think." instead
+    of the malformed "I think,.".
+  - **#54** sentence-start capitalization no longer fires on a decimal
+    point: a `.` directly between two digits (e.g. "3.14") is no longer
+    treated as a sentence terminator, so "3.14 exactly" stays "3.14
+    exactly." instead of wrongly capitalizing to "3.14 Exactly.".
 
 ### Removed
