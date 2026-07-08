@@ -231,22 +231,48 @@ fn clean_text(raw: &str) -> String {
 }
 
 /// Capitalizes the first letter of `s` and the first letter following every
-/// `.`, `!`, or `?` (skipping any whitespace in between).
+/// *real* sentence-terminating `.`, `!`, or `?` (skipping any whitespace in
+/// between; any other non-whitespace character in between — e.g. a run of
+/// digits — cancels a pending capitalization, since at that point the
+/// "first letter" opportunity has already passed).
+///
+/// A `.` only counts as a sentence terminator when [`is_sentence_terminator`]
+/// says so (issue #54) — a decimal point embedded between two digits, like
+/// the one in "3.14", never does, so "3.14 exactly" doesn't capitalize
+/// "exactly". `!` and `?` are always terminators.
 fn capitalize_sentence_starts(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(s.len());
     let mut capitalize_next = true;
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            // Whitespace never resolves a pending capitalization either way.
+            result.push(c);
+            continue;
+        }
         if capitalize_next && c.is_alphabetic() {
             result.extend(c.to_uppercase());
             capitalize_next = false;
         } else {
-            if c == '.' || c == '!' || c == '?' {
-                capitalize_next = true;
-            }
             result.push(c);
+            capitalize_next =
+                (c == '.' || c == '!' || c == '?') && is_sentence_terminator(&chars, i);
         }
     }
     result
+}
+
+/// Whether `chars[i]` (a `.`, `!`, or `?`) ends a sentence. `!`/`?` always
+/// do; a `.` does **unless** it sits directly between two ASCII digits — a
+/// decimal point (issue #54), e.g. the `.` in "3.14" — in which case it's
+/// part of a number, not a sentence break.
+fn is_sentence_terminator(chars: &[char], i: usize) -> bool {
+    if chars[i] != '.' {
+        return true;
+    }
+    let prev_is_digit = i > 0 && chars[i - 1].is_ascii_digit();
+    let next_is_digit = chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+    !(prev_is_digit && next_is_digit)
 }
 
 /// Default Ollama origin (MISSION §5: the only permitted runtime origin
