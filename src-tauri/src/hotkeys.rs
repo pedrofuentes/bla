@@ -486,6 +486,25 @@ mod tests {
         assert_eq!(effective, "Control+Option+Space");
     }
 
+    #[test]
+    fn the_actual_settings_default_hotkey_parses_on_every_platform_issue_98() {
+        // Ties this assertion to `settings::Settings::default().hotkey`
+        // itself — not a copy-pasted literal that could silently drift from
+        // it — so the app can never ship a default hotkey that fails to
+        // register on some platform (`validate_hotkey` runs the identical
+        // `Shortcut::from_str` parser `tauri-plugin-global-shortcut` uses to
+        // register a hotkey, and that parser isn't `cfg`-gated per OS: it's
+        // one accelerator grammar shared by every target). If the default
+        // ever became unregistrable, `resolve_effective_hotkey`'s fallback
+        // (above) would have nothing safe left to fall back to and startup
+        // would never bind a hotkey at all.
+        let default_hotkey = crate::settings::Settings::default().hotkey;
+        assert!(
+            validate_hotkey(&default_hotkey).is_ok(),
+            "the persisted default hotkey {default_hotkey:?} must parse on every platform"
+        );
+    }
+
     // Keys outside the configured chord must be inert.
     #[test]
     fn unrelated_keys_are_ignored() {
