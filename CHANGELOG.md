@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `tray` module (issue #23, AC-14): a total, deterministic
+  `tray_icon_state(&PipelineState) -> TrayIconState` mapping every pipeline
+  state (`Idle`/`Recording`/`Transcribing`/`Error`) to its tray icon
+  variant (`Idle`/`Active`/`Busy`/`Error`), plus `OutputModeSwitch`, a pure
+  model showing that a tray-driven output-mode switch (`CursorPaste`/
+  `File`) only affects `route_target()` calls made after `set_mode` —
+  i.e. it takes effect starting with the next dictation, not one already
+  in flight. All logic is pure and unit-tested; the real Tauri tray
+  icon/menu rendering is thin OS glue, deliberately minimal, separate, and
+  not wired into `run()` in this increment.
+- `settings` module (issue #23, AC-13, ADR-0006): a `Settings` struct
+  (hotkey binding, hold/toggle `RecordingMode`, `ModelPreset`
+  (`large-v3-turbo`/`small`), `OutputModeSetting` (cursor/file), and a
+  file-path template string) deriving `Serialize`/`Deserialize` — holds
+  config only, never transcript/clipboard text, so that's compatible with
+  MISSION §7's no-log invariant. `to_json`/`from_json` are pure,
+  deterministic (de)serialization; `#[serde(default)]` means any field
+  missing from persisted (or first-run/empty) JSON falls back to
+  `Settings::default()`'s value for that field. `SettingsStore` is the
+  injected persistence seam a future `tauri-plugin-store`-backed
+  implementation would sit behind (thin OS glue, not wired into
+  `commands.rs` in this increment); `InMemorySettingsStore` stands in for
+  it in tests, including a simulated-app-restart round trip. No new
+  dependencies added — the real `tauri-plugin-store` wiring is deferred to
+  a later increment.
 - `stt` module (issue #18, AC-1 partial / AC-21 seam, ADR-0004): an `Stt`
   trait (`transcribe(samples: &[f32], opts: &TranscribeOpts) -> Result<String, SttError>`)
   with a `FakeStt` test double for pipeline-shape tests, plus

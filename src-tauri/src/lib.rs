@@ -17,7 +17,17 @@ mod commands;
 mod context;
 mod hotkeys;
 mod output;
+// `pub` (rather than private like most stub siblings): Settings, to_json/
+// from_json, and SettingsStore/InMemorySettingsStore are real, tested,
+// standalone-usable API surface as of this increment (not yet wired into
+// commands.rs), so keeping the module private would make rustc flag them as
+// dead code.
+pub mod settings;
 mod store;
+// `pub` for the same reason as `settings`: PipelineState, TrayIconState,
+// tray_icon_state, OutputMode, and OutputModeSwitch are real, tested API
+// surface not yet wired into `run()`.
+pub mod tray;
 // `pub` (rather than private like its stub siblings): stt's Stt trait,
 // FakeStt, and build_initial_prompt are real, tested, standalone-usable API
 // surface as of this increment (not yet wired into commands.rs), so keeping

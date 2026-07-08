@@ -1,0 +1,137 @@
+//! Tray icon state derivation + output-mode switch-takes-effect-on-the-
+//! next-dictation (issue #23, AC-14).
+//!
+//! All logic in this module is pure — no OS calls, fully deterministic. The
+//! real Tauri tray icon/menu rendering (`TrayIconBuilder`, asset paths) is
+//! thin OS-glue (AGENTS.md OS-integration exemption): it is not wired up in
+//! this increment (`lib.rs::run()` doesn't call into this module yet), kept
+//! separate and minimal so it stays TDD-exempt while every decision it will
+//! eventually delegate to already has full unit coverage here.
+//!
+//! Note: `OutputMode` here is a tray-local model of *which target is live*
+//! (a plain two-way switch) — distinct from `output::OutputMode`, which
+//! additionally carries the file target's resolved config. The two are not
+//! wired together in this increment.
+
+/// Pipeline state as observed by the tray: the overall dictation state
+/// machine (hotkey → capture → transcribe → cleanup → output) collapsed to
+/// the four states the tray icon distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineState {
+    Idle,
+    Recording,
+    Transcribing,
+    Error,
+}
+
+/// Which icon variant the tray should render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIconState {
+    Idle,
+    Active,
+    Busy,
+    Error,
+}
+
+/// Total, deterministic mapping from [`PipelineState`] to [`TrayIconState`]
+/// (AC-14). Pure — no OS calls; the real menu-bar icon swap (thin glue, not
+/// wired in this increment) would call this and hand the result to Tauri's
+/// tray API.
+pub fn tray_icon_state(state: &PipelineState) -> TrayIconState {
+    match state {
+        PipelineState::Idle => TrayIconState::Idle,
+        PipelineState::Recording => TrayIconState::Active,
+        PipelineState::Transcribing => TrayIconState::Busy,
+        PipelineState::Error => TrayIconState::Error,
+    }
+}
+
+/// Which output target a dictation is routed to, as toggled from the tray
+/// menu (AC-14). See the module doc for how this relates to
+/// `output::OutputMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    CursorPaste,
+    File,
+}
+
+/// Holds the output mode live for dictations completing from this point
+/// forward. AC-14: switching the mode from the tray while a dictation is
+/// in flight must not change *that* dictation's routing — a caller that
+/// already read [`route_target`](Self::route_target) holds a plain copied
+/// value, unaffected by a later [`set_mode`](Self::set_mode). The switch
+/// only takes effect for `route_target()` calls made *after* it, i.e.
+/// starting with the next dictation.
+pub struct OutputModeSwitch {
+    current: OutputMode,
+}
+
+impl OutputModeSwitch {
+    /// Start the switch at `initial` (typically `Settings::output_mode`
+    /// mapped to this module's `OutputMode`).
+    pub fn new(initial: OutputMode) -> Self {
+        Self { current: initial }
+    }
+
+    /// Request a mode change, effective for every `route_target()` call
+    /// from this point on.
+    pub fn set_mode(&mut self, mode: OutputMode) {
+        self.current = mode;
+    }
+
+    /// The mode that should route the dictation currently completing.
+    pub fn route_target(&self) -> OutputMode {
+        self.current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_icon_state_maps_every_pipeline_state_ac14() {
+        assert_eq!(tray_icon_state(&PipelineState::Idle), TrayIconState::Idle);
+        assert_eq!(
+            tray_icon_state(&PipelineState::Recording),
+            TrayIconState::Active
+        );
+        assert_eq!(
+            tray_icon_state(&PipelineState::Transcribing),
+            TrayIconState::Busy
+        );
+        assert_eq!(tray_icon_state(&PipelineState::Error), TrayIconState::Error);
+    }
+
+    #[test]
+    fn mode_switch_takes_effect_starting_with_the_next_dictation_ac14() {
+        let mut switch = OutputModeSwitch::new(OutputMode::CursorPaste);
+
+        // The in-flight dictation reads (captures) the mode before any
+        // switch happens.
+        let in_flight_target = switch.route_target();
+        assert_eq!(in_flight_target, OutputMode::CursorPaste);
+
+        // User flips the mode mid-dictation from the tray menu.
+        switch.set_mode(OutputMode::File);
+
+        // The in-flight dictation's already-captured target is unaffected —
+        // it's a plain copied value, not a live reference.
+        assert_eq!(in_flight_target, OutputMode::CursorPaste);
+
+        // The *next* dictation's route_target() call reflects the new mode.
+        assert_eq!(switch.route_target(), OutputMode::File);
+    }
+
+    #[test]
+    fn mode_switch_can_flip_back_and_forth_across_several_dictations_ac14() {
+        let mut switch = OutputModeSwitch::new(OutputMode::File);
+        assert_eq!(switch.route_target(), OutputMode::File);
+
+        switch.set_mode(OutputMode::CursorPaste);
+        assert_eq!(switch.route_target(), OutputMode::CursorPaste);
+
+        switch.set_mode(OutputMode::File);
+        assert_eq!(switch.route_target(), OutputMode::File);
+    }
+}
