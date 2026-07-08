@@ -107,16 +107,14 @@ pub fn downmix_resample(input: &[f32], channels: u16, input_rate: u32) -> Vec<f3
 /// only pays allocation cost the first few times each buffer grows to its
 /// steady-state capacity, never per-callback afterward.
 pub fn downmix_resample_into(
-    _input: &[f32],
-    _channels: u16,
-    _input_rate: u32,
+    input: &[f32],
+    channels: u16,
+    input_rate: u32,
     mono_scratch: &mut Vec<f32>,
     out: &mut Vec<f32>,
 ) {
-    // TODO(#58): not yet implemented — placeholder so the RED test commit
-    // compiles.
-    mono_scratch.clear();
-    out.clear();
+    downmix_to_mono_into(input, channels, mono_scratch);
+    resample_linear_into(mono_scratch, input_rate, TARGET_SAMPLE_RATE, out);
 }
 
 fn downmix_to_mono(input: &[f32], channels: u16) -> Vec<f32> {
@@ -319,28 +317,30 @@ impl CaptureDiagnostics {
     /// Record that one real-time callback dropped its samples because the
     /// ring-buffer lock was contended (issue #58).
     pub fn record_dropped_callback(&self) {
-        // TODO(#58): not yet implemented — placeholder so the RED test
-        // commit compiles.
+        self.dropped_callbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Total callbacks that have dropped samples due to lock contention so
     /// far.
     pub fn dropped_callbacks(&self) -> u64 {
-        0
+        self.dropped_callbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record a structured capture error (issue #59), overwriting whatever
     /// was previously recorded. Best-effort: if the diagnostics mutex itself
     /// were ever poisoned, this silently no-ops rather than panicking the
     /// real-time thread.
-    pub fn record_error(&self, _error: CaptureRuntimeError) {
-        // TODO(#59): not yet implemented — placeholder so the RED test
-        // commit compiles.
+    pub fn record_error(&self, error: CaptureRuntimeError) {
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = Some(error);
+        }
     }
 
     /// The most recently recorded capture error, if any.
     pub fn last_error(&self) -> Option<CaptureRuntimeError> {
-        None
+        self.last_error.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Clear the recorded error (e.g. once the app has surfaced/acknowledged
