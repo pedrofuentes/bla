@@ -347,11 +347,26 @@ pub struct UreqTransport {
 impl UreqTransport {
     /// Builds a transport whose agent enforces `connect_timeout`,
     /// `read_timeout`, and no redirects.
+    ///
+    /// Issue #73: a connect/read timeout alone doesn't bound the *write*
+    /// phase — a peer that accepts the connection but stops draining can
+    /// block `send_string` forever once a large-enough request body
+    /// overflows the OS socket send buffer, defeating the AC-4 fallback
+    /// (the pipeline would hang instead of falling back to `RegexCleanup`).
+    /// This now also sets a write timeout (mirroring `read_timeout`, since
+    /// both bound "how long may a single I/O phase of this request take")
+    /// and an overall request timeout (the sum of all three phases) as a
+    /// second, independent bound in case any single phase's timeout somehow
+    /// doesn't fire.
     pub fn new(connect_timeout: Duration, read_timeout: Duration) -> Self {
+        let write_timeout = read_timeout;
+        let overall_timeout = connect_timeout + read_timeout + write_timeout;
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
             .timeout_connect(connect_timeout)
             .timeout_read(read_timeout)
+            .timeout_write(write_timeout)
+            .timeout(overall_timeout)
             .build();
         Self { agent }
     }
