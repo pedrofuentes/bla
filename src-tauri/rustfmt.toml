@@ -1,0 +1,7 @@
+# rustfmt config for the bla Tauri core (src-tauri).
+# Stable-toolchain-safe subset only — no nightly-only options, so
+# `cargo fmt --check` runs the same locally and in CI.
+edition = "2021"
+max_width = 100
+newline_style = "Unix"
+use_small_heuristics = "Default"
