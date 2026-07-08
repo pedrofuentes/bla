@@ -82,6 +82,157 @@ impl RingBuffer {
     }
 }
 
+/// A ring buffer shared between the capture callback (writer) and the rest
+/// of the app (reader) — the only piece of shared mutable state the OS-glue
+/// entry point below touches.
+pub type SharedRingBuffer = std::sync::Arc<std::sync::Mutex<RingBuffer>>;
+
+/// Downmix an interleaved multi-channel buffer to mono (by averaging the
+/// channels of each frame) and linearly resample it from `input_rate` to
+/// [`TARGET_SAMPLE_RATE`], the rate `stt` expects.
+///
+/// `input` is interleaved: `channels` samples per frame
+/// (`[ch0, ch1, ..., ch0, ch1, ...]`). The resampler is a simple linear
+/// interpolation — adequate for feeding speech into whisper, not a
+/// general-purpose DSP resampler.
+pub fn downmix_resample(input: &[f32], channels: u16, input_rate: u32) -> Vec<f32> {
+    let mono = downmix_to_mono(input, channels);
+    resample_linear(&mono, input_rate, TARGET_SAMPLE_RATE)
+}
+
+fn downmix_to_mono(input: &[f32], channels: u16) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    if channels == 1 {
+        return input.to_vec();
+    }
+    input
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .collect()
+}
+
+/// Linear-interpolation resampler: maps each output sample index back to a
+/// fractional position in the input and interpolates between its two
+/// neighboring samples. Documented tradeoff: simple and dependency-free, at
+/// the cost of some high-frequency aliasing versus a windowed-sinc resampler
+/// — acceptable for speech destined for whisper (ADR-0002).
+fn resample_linear(mono: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
+    if mono.is_empty() || input_rate == 0 {
+        return Vec::new();
+    }
+    if input_rate == output_rate {
+        return mono.to_vec();
+    }
+    let ratio = output_rate as f64 / input_rate as f64;
+    let out_len = ((mono.len() as f64) * ratio).round() as usize;
+    let last_idx = mono.len() - 1;
+    (0..out_len)
+        .map(|i| {
+            let src_pos = i as f64 / ratio;
+            let idx = (src_pos.floor() as usize).min(last_idx);
+            let frac = (src_pos - idx as f64) as f32;
+            let a = mono[idx];
+            let b = mono[(idx + 1).min(last_idx)];
+            a + (b - a) * frac
+        })
+        .collect()
+}
+
+/// Root-mean-square level of a sample window — used to drive the pill's live
+/// waveform meter. Returns `0.0` for an empty window.
+pub fn rms_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Peak (max absolute value) level of a sample window. Returns `0.0` for an
+/// empty window.
+pub fn peak_level(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()))
+}
+
+/// Write a captured window of 16 kHz mono `f32` samples out as a 16-bit PCM
+/// WAV file, so the pipeline and tests can round-trip a captured window
+/// (e.g. as an `stt` input fixture).
+pub fn write_wav_16k_mono(samples: &[f32], path: &std::path::Path) -> std::io::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: TARGET_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(hound_to_io_err)?;
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm = (clamped * i16::MAX as f32).round() as i16;
+        writer.write_sample(pcm).map_err(hound_to_io_err)?;
+    }
+    writer.finalize().map_err(hound_to_io_err)
+}
+
+fn hound_to_io_err(err: hound::Error) -> std::io::Error {
+    std::io::Error::other(err)
+}
+
+/// OS-integration glue (AGENTS.md §OS-integration exemption): opens the
+/// default input device and streams captured audio into `buffer`. Every
+/// decision — downmixing, resampling, overflow behavior — is delegated to
+/// the pure functions above; this function only wires cpal callbacks to
+/// them, so it stays thin and untested (no audio device in CI).
+pub fn start_capture(buffer: SharedRingBuffer) -> Result<cpal::Stream, CaptureError> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or(CaptureError::NoInputDevice)?;
+    let config = device.default_input_config()?;
+    let channels = config.channels();
+    let input_rate = config.sample_rate();
+
+    let stream = device.build_input_stream(
+        config.into(),
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            let mono_16k = downmix_resample(data, channels, input_rate);
+            if let Ok(mut buf) = buffer.lock() {
+                buf.extend(&mono_16k);
+            }
+        },
+        |err| eprintln!("audio capture stream error: {err}"),
+        None,
+    )?;
+    stream.play()?;
+    Ok(stream)
+}
+
+/// Errors from opening the input device or building/starting the capture
+/// stream — OS-glue error plumbing, not decision logic.
+#[derive(Debug)]
+pub enum CaptureError {
+    NoInputDevice,
+    Cpal(cpal::Error),
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::NoInputDevice => write!(f, "no default input audio device available"),
+            CaptureError::Cpal(e) => write!(f, "audio capture error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
+impl From<cpal::Error> for CaptureError {
+    fn from(e: cpal::Error) -> Self {
+        CaptureError::Cpal(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
