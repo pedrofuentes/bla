@@ -24,6 +24,39 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+/// Validate that `hotkey` parses as a registrable global-shortcut
+/// accelerator (e.g. `"Control+Option+Space"`). Pure string parsing via the
+/// **same** parser the OS-glue registration path uses
+/// (`tauri-plugin-global-shortcut`'s `Shortcut::from_str`), so a value that
+/// passes here is exactly the value that will register — there is no parser
+/// divergence between "validated" and "registered". No OS handles are
+/// touched, so this is fully unit-testable.
+///
+/// This is the pure logic behind two OS-glue call sites (issue #91 Sentinel
+/// 🔴): `commands::set_settings` validates a user-typed hotkey with this
+/// *before* persisting it (so a malformed one is rejected at the IPC
+/// boundary and never written), and `run()`'s startup uses
+/// [`resolve_effective_hotkey`] (built on this) so a bad persisted hotkey
+/// falls back to the default instead of bricking launch.
+pub fn validate_hotkey(_hotkey: &str) -> Result<(), String> {
+    // TODO(#91 🔴): not yet implemented — placeholder so the RED test
+    // commit compiles.
+    Ok(())
+}
+
+/// Startup fallback (issue #91 Sentinel 🔴): returns `persisted` if it is a
+/// valid hotkey per [`validate_hotkey`], otherwise `default`. Callers pass
+/// `settings::Settings::default().hotkey` (always a valid accelerator) as
+/// `default`, so the resolved value is guaranteed registrable — a
+/// corrupt/unregistrable persisted hotkey degrades to the default binding
+/// rather than propagating a registration failure into a fatal startup
+/// panic.
+pub fn resolve_effective_hotkey<'a>(persisted: &'a str, _default: &'a str) -> &'a str {
+    // TODO(#91 🔴): not yet implemented — placeholder so the RED test
+    // commit compiles.
+    persisted
+}
+
 /// Injected timestamp abstraction — an opaque duration since some
 /// caller-chosen origin (e.g. `Instant::now().duration_since(origin)` in the
 /// real glue). Tests construct these directly with `Duration::from_millis`,
@@ -404,6 +437,50 @@ mod tests {
         // a phantom already-on session).
         let start_again = sm.handle(KeyEvent::KeyDown(1, ms(1_000)));
         assert_eq!(start_again, Some(Transition::StartRecording));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #91 Sentinel 🔴: pure hotkey validation + startup fallback so a
+    // malformed hotkey can't be persisted (and can't brick launch).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_hotkey_accepts_well_formed_accelerators() {
+        // The persisted default plus a representative user-chosen binding.
+        for good in ["Control+Option+Space", "Cmd+Shift+D", "Alt+F4", "Super+K"] {
+            assert!(
+                validate_hotkey(good).is_ok(),
+                "expected {good:?} to be a valid hotkey"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_hotkey_rejects_malformed_accelerators_issue_91() {
+        // Empty, an unknown key, a dangling '+' (empty token), and a
+        // modifiers-only chord with no main key must all be rejected — so
+        // set_settings never persists one of these.
+        for bad in ["", "NotARealKey", "Ctrl+", "Control+Shift"] {
+            assert!(
+                validate_hotkey(bad).is_err(),
+                "expected {bad:?} to be rejected as an invalid hotkey"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_effective_hotkey_keeps_a_valid_persisted_binding() {
+        let effective = resolve_effective_hotkey("Cmd+Shift+D", "Control+Option+Space");
+        assert_eq!(effective, "Cmd+Shift+D");
+    }
+
+    #[test]
+    fn resolve_effective_hotkey_falls_back_to_default_on_a_bad_persisted_binding_issue_91() {
+        // A corrupt/unregistrable persisted hotkey must resolve to the
+        // (always-valid) default rather than being handed to registration —
+        // this is what keeps a bad settings.json from bricking startup.
+        let effective = resolve_effective_hotkey("NotARealKey", "Control+Option+Space");
+        assert_eq!(effective, "Control+Option+Space");
     }
 
     // Keys outside the configured chord must be inert.

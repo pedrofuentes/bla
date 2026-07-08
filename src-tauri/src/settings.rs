@@ -186,6 +186,30 @@ impl SettingsStore for InMemorySettingsStore {
     }
 }
 
+/// Persist `new` through `store`, but only after `validate` accepts its
+/// hotkey — the validate-before-persist decision (issue #91 Sentinel 🔴).
+///
+/// If `validate(&new.hotkey)` returns `Err`, the settings are rejected and
+/// the store is left **untouched** (nothing is written), so a
+/// malformed/unregistrable hotkey can never reach `settings.json` and brick
+/// the next launch. `validate` is injected (rather than this module calling
+/// `hotkeys::validate_hotkey` directly) so `settings` stays a pure,
+/// dependency-free module and this decision is unit-testable with a fake
+/// validator + [`InMemorySettingsStore`] (whose `persisted()` bytes prove
+/// the store was or wasn't written). `commands::set_settings` performs the
+/// same validate-before-persist ordering against the live
+/// `tauri-plugin-store`.
+pub fn persist_validated<S: SettingsStore>(
+    store: &mut S,
+    new: &Settings,
+    _validate: impl Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    // TODO(#91 🔴): not yet validating before persist — placeholder so the
+    // RED test commit compiles while matching the pre-fix
+    // persist-before-validate behavior being fixed.
+    store.save(new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +332,50 @@ mod tests {
         let mut store = InMemorySettingsStore::new();
         let settings = non_default_settings();
         store.save(&settings).unwrap();
+        assert_eq!(store.load().unwrap(), settings);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #91 Sentinel 🔴: persist_validated must NOT write an invalid
+    // hotkey — an invalid one is rejected and the store is left unchanged,
+    // so a bad hotkey can never reach settings.json and brick launch.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn persist_validated_rejects_an_invalid_hotkey_and_leaves_the_store_unchanged_issue_91() {
+        let mut store = InMemorySettingsStore::new();
+        let good = non_default_settings();
+        store.save(&good).unwrap();
+        let baseline = store.persisted().unwrap().to_string();
+
+        // A would-be update carrying a hotkey the validator rejects.
+        let mut update = good.clone();
+        update.hotkey = "totally invalid hotkey".to_string();
+
+        let result = persist_validated(&mut store, &update, |hk| {
+            if hk == "totally invalid hotkey" {
+                Err("rejected".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_err(), "an invalid hotkey must be rejected");
+        assert_eq!(
+            store.persisted().unwrap(),
+            baseline,
+            "the store must be left byte-for-byte unchanged when validation fails"
+        );
+    }
+
+    #[test]
+    fn persist_validated_persists_when_the_hotkey_validates_issue_91() {
+        let mut store = InMemorySettingsStore::new();
+        let settings = non_default_settings();
+
+        let result = persist_validated(&mut store, &settings, |_| Ok(()));
+
+        assert!(result.is_ok());
         assert_eq!(store.load().unwrap(), settings);
     }
 }
