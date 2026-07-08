@@ -43,13 +43,14 @@
 | sentinel-pr6 | built-in, fable | Sentinel review of PR #6 | round 1 REJECTED @ 23f9e9d; delta re-review pending |
 
 ## Lead lease
-- Session: interactive CLI session e3f8b683 (scratchpad id), leased 2026-07-05. Refresh every tick; successor takes over only on a stale lease (>2 tick intervals).
+- Session: interactive CLI session e3f8b683 (scratchpad id), leased 2026-07-05; **refreshed 2026-07-08** (M1-code-complete turn). Refresh every tick; successor takes over only on a stale lease (>2 tick intervals).
 
 ## HANDOFF (for a cold successor: read docs/KICKOFF.md + MISSION.md + this block)
-- **Where we are:** Phase 1 complete — PRD merged (PR #3 → `c0c6fde`); engine-policy harness change merged (PR #6 → `f0da1f9`). M1 build started: milestone + issues #13–#27 seeded on board 8; three workers dispatched (#13 CI, #14 scaffold, #15 ADRs), each stopping at its PR for red-team/Sentinel.
-- **Open gates:** cofounder merges for the three M1 kickoff PRs when gated (#13 is harness-integrity); ANTHROPIC_API_KEY environment secret for Sentinel-in-CI (cofounder, when #13's PR lands); optional distinct agent identity for Tier-2 (future). **Copilot containment precondition** (MISSION §7): no Copilot implementer spawns until Sentinel-in-CI + harness-guard are required checks on `main`, or the worker credential structurally cannot push/merge.
-- **Open increments:** #13 (ci/sentinel-and-guard), #14 (chore/scaffold), #15 (docs/architecture-adrs) — in worktrees, claimed. Note: #15 branched pre-`f0da1f9`, will need a DECISIONS.md rebase. No untriaged issues; security 0/0/0.
-- **Armed schedules:** Tier-1 watchdog via in-session cron (~20 min ticks, session-only; re-arm on new session per CONTINUOUS-OPERATION.md §Starting & restarting).
-- **Engine policy:** Copilot CLI (headless) for implementation + mechanical work; Claude fable for architecture/Sentinel/native-integration work (MISSION §7, attested at `f0da1f9`).
-- **Single next action:** as each worker reports: red-team #15's ADRs, Sentinel-review all three PRs, hand to cofounder for merge; then add `sentinel` + `harness-guard` to required checks and close #8.
-- **Lease refreshed:** 2026-07-06 board-setup turn (session e3f8b683).
+- **Where we are (2026-07-08):** **All 11 core M1 issues (#16–#26) merged** — hotkeys, audio, STT (whisper behind a default-off `whisper` feature), cleanup (RegexCleanup + OllamaCleanup w/ fallback), output/clipboard, tray/settings, the assembled `Pipeline` + cumulative acceptance suite (AC-1/2/4/5 all green), the security-hardened model downloader, README/CONTRIBUTING. `main` @ `28e7ac6`. Cofounder granted standing admin-merge authority; template upgraded to autonomous-kickoff v2.10.0 (PR #88).
+- **In flight:** the **runtime-wiring capstone #91** (branch feature/runtime-wiring) — wires hotkey→capture→pipeline→paste into the Tauri app and resolves the fix-when-wired blockers (#65 clipboard-clobber, #58 audio RT-safety, #73 Ollama write-timeout, #80 settings Result channel, #86 AC-5 guard, #44/#59 hotkey reconcile/audio errors). When it merges, `pnpm tauri dev` performs real dictation.
+- **Open gates (cofounder):** **#27 the AC-7 human smoke test = the M1 Done gate** (dictate into real apps + Obsidian; only the cofounder can). #30 optional `ANTHROPIC_API_KEY` in a `ci` environment (unlocks real CI-sentinel + lets `sentinel` become a required check → closes #8 containment → unlocks Copilot implementers). #8 containment (Copilot stays gated; using Claude engines meanwhile).
+- **Review/merge model:** every PR gets an independent **Opus** Sentinel review (Fable budget exhausted — MISSION §7 sanctions fable-or-opus); Lead admin-merges on APPROVED/CONDITIONAL after filing follow-ups + rebasing. Required check on `main` = `harness-guard` only (`sentinel.yml` runs keyless → posts non-blocking MALFORMED until the #30 key lands).
+- **Deferred hardening backlog:** ~30 `sentinel:*` follow-up issues (#43–#90), most tied to the wiring step (#91 closes the load-bearing ones) or later milestones.
+- **Armed schedules:** Tier-1 watchdog via in-session cron (session-only; re-arm on new session per CONTINUOUS-OPERATION.md).
+- **Engine policy:** Claude `sonnet` for implementation, Claude `opus` for Sentinel review (Fable exhausted), Claude `haiku` for ticks; Copilot CLI gated until #8 clears.
+- **Single next action:** review + admin-merge #91 when it reports (rebasing onto `main`); then M1 code is complete → hand the cofounder a runnable build for the #27 smoke test = M1 Done.
