@@ -550,7 +550,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(err.to_string().contains("synthetic paste synthesis"), true);
+        assert!(err.to_string().contains("synthetic paste synthesis"));
         assert_eq!(
             clipboard.get().unwrap(),
             "pre-dictation clipboard contents",
