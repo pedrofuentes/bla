@@ -211,10 +211,22 @@ fn hound_to_io_err(err: hound::Error) -> std::io::Error {
 
 /// OS-integration glue (AGENTS.md §OS-integration exemption): opens the
 /// default input device and streams captured audio into `buffer`. Every
-/// decision — downmixing, resampling, overflow behavior — is delegated to
-/// the pure functions above; this function only wires cpal callbacks to
-/// them, so it stays thin and untested (no audio device in CI).
-pub fn start_capture(buffer: SharedRingBuffer) -> Result<cpal::Stream, CaptureError> {
+/// decision — downmixing, resampling, overflow behavior, contention/error
+/// bookkeeping — is delegated to the pure functions/types above; this
+/// function only wires cpal callbacks to them, so it stays thin and
+/// untested (no audio device in CI).
+///
+/// Issue #58: the callback captures two scratch buffers instead of
+/// allocating fresh `Vec`s per call, and uses [`Mutex::try_lock`] instead of
+/// a blocking `lock()` — a contended lock drops that callback's samples and
+/// counts the drop via `diagnostics` rather than stalling the real-time
+/// audio thread. Issue #59: a poisoned lock or a stream error is recorded
+/// into `diagnostics` (structured state the rest of the app can observe)
+/// instead of an invisible `eprintln!`.
+pub fn start_capture(
+    buffer: SharedRingBuffer,
+    diagnostics: std::sync::Arc<CaptureDiagnostics>,
+) -> Result<cpal::Stream, CaptureError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
@@ -225,19 +237,111 @@ pub fn start_capture(buffer: SharedRingBuffer) -> Result<cpal::Stream, CaptureEr
     let channels = config.channels();
     let input_rate = config.sample_rate();
 
+    let mut mono_scratch: Vec<f32> = Vec::new();
+    let mut resampled_scratch: Vec<f32> = Vec::new();
+    let callback_diagnostics = diagnostics.clone();
+    let error_diagnostics = diagnostics;
+
     let stream = device.build_input_stream(
         config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let mono_16k = downmix_resample(data, channels, input_rate);
-            if let Ok(mut buf) = buffer.lock() {
-                buf.extend(&mono_16k);
+            downmix_resample_into(
+                data,
+                channels,
+                input_rate,
+                &mut mono_scratch,
+                &mut resampled_scratch,
+            );
+            match buffer.try_lock() {
+                Ok(mut buf) => buf.extend(&resampled_scratch),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    callback_diagnostics.record_dropped_callback();
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    callback_diagnostics.record_error(CaptureRuntimeError::BufferLockPoisoned);
+                }
             }
         },
-        |err| eprintln!("audio capture stream error: {err}"),
+        move |err| error_diagnostics.record_error(CaptureRuntimeError::Stream(err.to_string())),
         None,
     )?;
     stream.play()?;
     Ok(stream)
+}
+
+/// Runs [`start_capture`] on a dedicated thread for the lifetime of one
+/// hold-to-record session (OS-integration glue, thin): `cpal::Stream` is not
+/// guaranteed `Send` on every platform backend, so rather than move it
+/// across threads, the thread that creates it also owns it until
+/// [`CaptureSession::stop`] signals it to drop the stream and exit. This is
+/// the type `hotkeys`' `StartRecording`/`StopRecording` transitions (wired in
+/// `lib.rs`) actually start/stop.
+pub struct CaptureSession {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CaptureSession {
+    /// Starts capturing into `buffer` on a dedicated thread, blocking until
+    /// the stream is confirmed running (or has failed to start).
+    pub fn start(
+        buffer: SharedRingBuffer,
+        diagnostics: std::sync::Arc<CaptureDiagnostics>,
+    ) -> Result<Self, CaptureError> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), CaptureError>>();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        let handle = std::thread::spawn(move || match start_capture(buffer, diagnostics) {
+            Ok(stream) => {
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                // Block here, keeping `stream` alive, until told to stop.
+                let _ = stop_rx.recv();
+                drop(stream);
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+            }
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                stop_tx: Some(stop_tx),
+                handle: Some(handle),
+            }),
+            Ok(Err(err)) => {
+                let _ = handle.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(CaptureError::NoInputDevice)
+            }
+        }
+    }
+
+    /// Signals the capture thread to drop the stream and stops capturing.
+    /// Blocks until the thread has exited.
+    pub fn stop(mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CaptureSession {
+    /// A dropped-without-`stop()` session (e.g. an early return in the
+    /// caller) still signals the capture thread to exit rather than leaking
+    /// it — `stop()` remains the normal path since it also joins.
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Errors from opening the input device or building/starting the capture
