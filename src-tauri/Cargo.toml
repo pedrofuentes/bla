@@ -23,3 +23,23 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+default = []
+# Heavy native dep (ADR-0004): whisper-rs builds whisper.cpp (C++) from
+# source, which needs cmake/clang and is slow. Default-off so `cargo test`
+# (no feature) covers the Stt trait, FakeStt, and the build_initial_prompt
+# dictionary-seam logic without paying that build cost or needing a model
+# file. Enable with `--features whisper` to build/use the real WhisperStt.
+whisper = ["dep:whisper-rs"]
+
+# whisper-rs is optional and only pulled in by the `whisper` feature above.
+# Metal acceleration (ADR-0004) is macOS-only; other platforms get the CPU
+# backend.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", optional = true, default-features = false, features = [
+  "metal",
+] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.16", optional = true, default-features = false }
+
