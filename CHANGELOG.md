@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `commands`), `src/windows/{settings,pill}` and `src/lib/ipc.ts` UI stubs,
   rustfmt/clippy/ESLint/Prettier/Vitest tooling, and a `Makefile` covering
   `cargo llvm-cov` with OS-glue coverage exclusions. No product logic yet.
+- `audio` module: fixed-capacity ring buffer for captured `f32` samples
+  (drop-oldest overflow), channel-downmix + linear-interpolation resampling
+  to the 16 kHz mono format `stt` expects, RMS/peak level metering for the
+  future pill waveform, and 16-bit PCM WAV export for round-tripping a
+  captured window. All pure logic is unit-tested against in-code synthetic
+  sine-wave signals (ADR-0007 — no real recordings). The `cpal` device-open
+  and stream callback is thin, TDD-exempt OS glue that delegates every
+  decision to the tested pure functions.
 
 ### Changed
 
