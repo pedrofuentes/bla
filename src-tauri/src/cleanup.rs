@@ -444,6 +444,17 @@ mod ollama_tests {
             }
         }
 
+        /// A stub whose call times out (hung-but-reachable endpoint) — the
+        /// real [`UreqTransport`] surfaces this once its read/connect
+        /// timeout fires, so a hung Ollama can't block the sync call
+        /// forever (issue #20 🟡, becomes 🔴 once the paste path is wired).
+        fn timing_out() -> Self {
+            Self {
+                response: Err(TransportError::Timeout),
+                captured: RefCell::new(None),
+            }
+        }
+
         /// A stub that succeeds, echoing back `model_output` inside a
         /// canned Ollama `/api/generate` JSON response body.
         fn succeeding(model_output: &str) -> Self {
@@ -479,6 +490,17 @@ mod ollama_tests {
         // (never a raw transport error, never a panic) so the pipeline can
         // fall back to RegexCleanup.
         let cleanup = cleanup_with(StubTransport::unreachable());
+        let result = cleanup.clean("um, hello there", Tone::Neutral);
+        assert_eq!(result, Err(CleanupError::Unreachable));
+    }
+
+    #[test]
+    fn ollama_cleanup_maps_transport_timeout_to_unreachable() {
+        // AC-4: a hung-but-reachable endpoint whose call times out must
+        // ALSO surface CleanupError::Unreachable (not block forever, not
+        // return Ok), so the timeout path still triggers the RegexCleanup
+        // fallback and never wedges the paste path.
+        let cleanup = cleanup_with(StubTransport::timing_out());
         let result = cleanup.clean("um, hello there", Tone::Neutral);
         assert_eq!(result, Err(CleanupError::Unreachable));
     }
@@ -544,41 +566,69 @@ mod ollama_tests {
     const FIXTURE_MODEL_OUTPUT: &str = "The meeting is tomorrow at 3pm. We need to bring:\n- The laptop\n- The charger\n- The notes";
 
     #[test]
-    fn ac10_fixture_regression_applies_corrections_punctuation_and_bullets() {
+    fn well_behaved_model_response_is_relayed_faithfully_without_added_content() {
+        // NOTE: this is a PASS-THROUGH / faithful-relay test, NOT a test of
+        // rewrite *behavior*. The corrections, punctuation, and bullets in
+        // FIXTURE_MODEL_OUTPUT are produced by the stubbed model, not by any
+        // code under test — so this asserts only that OllamaCleanup relays a
+        // well-behaved response verbatim (modulo trimming) and introduces no
+        // content of its own (the rewrite-only property on the return side).
+        // Actual rewrite-quality coverage against a real model is a recorded-
+        // Ollama integration follow-up (see PR body).
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub);
 
         let got = cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
 
-        // The stubbed model already resolved the self-correction ("i mean"),
-        // restored punctuation, and rendered the spoken list as bullets;
-        // OllamaCleanup must pass that through faithfully.
-        assert_eq!(got, FIXTURE_MODEL_OUTPUT);
-        assert!(!got.contains("i mean"), "self-correction must not survive");
-        assert!(got.contains('.'), "punctuation must be restored: {got}");
-        assert!(got.contains("- The laptop"));
-        assert!(got.contains("- The charger"));
-        assert!(got.contains("- The notes"));
+        assert_eq!(
+            got, FIXTURE_MODEL_OUTPUT,
+            "the model response must be relayed byte-for-byte (after trimming)"
+        );
     }
 
     #[test]
-    fn ac10_request_carries_the_rewrite_only_prompt_and_the_raw_input_verbatim() {
+    fn relayed_response_is_trimmed_but_otherwise_untouched() {
+        // Guards the one transform OllamaCleanup DOES apply to the response:
+        // trimming leading/trailing whitespace. Interior content — including
+        // the newlines/bullets of a list — must survive unchanged.
+        let stub = StubTransport::succeeding("  \nHello.\n- one\n- two\n  ");
+        let cleanup = cleanup_with(stub);
+        let got = cleanup.clean("hello one two", Tone::Neutral).unwrap();
+        assert_eq!(got, "Hello.\n- one\n- two");
+    }
+
+    #[test]
+    fn ac10_request_carries_the_rewrite_only_prompt_and_the_raw_input_in_the_correct_fields() {
         // AC-10's rewrite-only property: assert the request sent to the
         // stub carries the rewrite-only prompt plus the untouched input —
         // this module must not editorialize on what it sends upstream
         // either.
+        //
+        // Deserialize and assert PER FIELD (not substring-over-flattened-
+        // JSON): the `system` field must be the prompt and the `prompt`
+        // field must be the raw input. A substring check would still pass
+        // if the two were swapped (prompt: PROMPT, system: raw), which is a
+        // real request-construction regression — this test must catch it.
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub);
         cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
 
         let (_, body) = cleanup.transport.captured_request();
-        assert!(
-            body.contains(FIXTURE_RAW),
-            "request body must carry the raw input verbatim: {body}"
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+
+        assert_eq!(
+            parsed["system"], CLEANUP_PROMPT_V1,
+            "the `system` field must carry the rewrite-only prompt, not the transcript"
         );
-        assert!(
-            body.to_lowercase().contains("rewrite only"),
-            "request body must carry the rewrite-only system prompt: {body}"
+        assert_eq!(
+            parsed["prompt"], FIXTURE_RAW,
+            "the `prompt` field must carry the raw transcript verbatim, not the prompt"
+        );
+        assert_eq!(parsed["model"], "llama3", "the configured model must be sent");
+        assert_eq!(
+            parsed["stream"], false,
+            "streaming must be disabled so the response is a single JSON object"
         );
     }
 
