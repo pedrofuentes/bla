@@ -188,6 +188,51 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn confine_accepts_a_plain_relative_path() {
+        let base = PathBuf::from("/vault");
+        let out = confine_relative_path(&base, "2026-07-07.md").unwrap();
+        assert_eq!(out, PathBuf::from("/vault/2026-07-07.md"));
+    }
+
+    #[test]
+    fn confine_accepts_a_nested_relative_path() {
+        let base = PathBuf::from("/vault");
+        let out = confine_relative_path(&base, "daily/2026/07-07.md").unwrap();
+        assert_eq!(out, PathBuf::from("/vault/daily/2026/07-07.md"));
+    }
+
+    #[test]
+    fn confine_accepts_a_backtrack_that_stays_within_the_base_dir() {
+        let base = PathBuf::from("/vault");
+        // "daily/../notes.md" nets to "notes.md" — never dips below base.
+        let out = confine_relative_path(&base, "daily/../notes.md").unwrap();
+        assert_eq!(out, PathBuf::from("/vault/daily/../notes.md"));
+    }
+
+    #[test]
+    fn confine_rejects_an_absolute_path() {
+        let base = PathBuf::from("/vault");
+        let err = confine_relative_path(&base, "/etc/passwd").unwrap_err();
+        assert_eq!(err, PathConfinementError::AbsolutePath);
+    }
+
+    #[test]
+    fn confine_rejects_traversal_that_escapes_the_base_dir() {
+        let base = PathBuf::from("/vault");
+        let err = confine_relative_path(&base, "../../etc/passwd").unwrap_err();
+        assert_eq!(err, PathConfinementError::EscapesBaseDir);
+    }
+
+    #[test]
+    fn confine_rejects_traversal_that_dips_below_base_even_if_it_would_return() {
+        let base = PathBuf::from("/vault");
+        // Climbs above the base dir at the second component even though a
+        // later "back" component would net out non-negative overall.
+        let err = confine_relative_path(&base, "../vault/notes.md").unwrap_err();
+        assert_eq!(err, PathConfinementError::EscapesBaseDir);
+    }
+
+    #[test]
     fn restores_when_clipboard_still_holds_what_we_set_ac9() {
         // Nobody else touched the clipboard during the restore delay: safe
         // to restore the pre-dictation contents.
