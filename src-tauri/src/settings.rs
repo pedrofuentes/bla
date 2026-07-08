@@ -174,14 +174,12 @@ impl InMemorySettingsStore {
 
 impl SettingsStore for InMemorySettingsStore {
     fn load(&self) -> Result<Settings, SettingsLoadError> {
-        // TODO(#80): not yet distinguishing NotFound/Corrupt — placeholder
-        // so the RED test commit compiles while still matching the
-        // pre-#80 silent-reset behavior being fixed.
-        Ok(self
-            .raw
-            .as_deref()
-            .and_then(|json| from_json(json).ok())
-            .unwrap_or_default())
+        match &self.raw {
+            None => Err(SettingsLoadError::NotFound),
+            Some(json) => {
+                from_json(json).map_err(|e| SettingsLoadError::Corrupt(e.to_string()))
+            }
+        }
     }
 
     fn save(&mut self, settings: &Settings) -> Result<(), String> {
