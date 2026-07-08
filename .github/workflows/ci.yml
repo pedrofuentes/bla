@@ -1,0 +1,154 @@
+name: ci
+
+# Test/lint/build matrix skeleton (MISSION.md §3, §7; issue #13).
+#
+# Every source-touching step is guarded by a file-existence check so this
+# workflow is a clean no-op pass on the current docs-only tree and turns on
+# step-by-step as Cargo.toml / package.json land (M1).
+#
+# Trigger: plain `pull_request` — unlike harness-guard.yml / sentinel.yml,
+# this workflow's whole job is to compile and test the PR's own code, so
+# running the PR's copy of the workflow (and its code) is expected, not a
+# harness-integrity risk. It needs no secrets and no elevated GITHUB_TOKEN
+# scope (contents: read is enough), so there is nothing privileged for
+# PR-controlled code to reach here.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macos (test / lint / build)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check for Cargo.toml
+        id: cargo
+        run: echo "present=$(test -f Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: cargo fmt --check
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo test --all-features
+
+      - name: Check for package.json
+        id: pnpm
+        run: echo "present=$(test -f package.json && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        if: steps.pnpm.outputs.present == 'true'
+        uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        if: steps.pnpm.outputs.present == 'true'
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0 (commit SHA — the tag object SHA is not resolvable by Actions)
+
+      - name: pnpm install
+        if: steps.pnpm.outputs.present == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm lint
+        if: steps.pnpm.outputs.present == 'true'
+        run: pnpm lint
+
+      - name: pnpm test
+        if: steps.pnpm.outputs.present == 'true'
+        run: pnpm test
+
+      - name: pnpm build
+        if: steps.pnpm.outputs.present == 'true'
+        run: pnpm build
+
+      - name: No manifests present — nothing to build yet
+        if: steps.cargo.outputs.present == 'false' && steps.pnpm.outputs.present == 'false'
+        run: echo "Docs-only tree — no Cargo.toml or package.json yet. Skipping build/test/lint."
+
+  windows:
+    name: windows (compile-check)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check for Cargo.toml
+        id: cargo
+        shell: bash
+        run: echo "present=$(test -f Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: cargo check
+        if: steps.cargo.outputs.present == 'true'
+        run: cargo check --all-targets --all-features
+
+      - name: Check for package.json
+        id: pnpm
+        shell: bash
+        run: echo "present=$(test -f package.json && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        if: steps.pnpm.outputs.present == 'true'
+        uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        if: steps.pnpm.outputs.present == 'true'
+        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0 (commit SHA — the tag object SHA is not resolvable by Actions)
+
+      - name: pnpm install
+        if: steps.pnpm.outputs.present == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm build (compile-check)
+        if: steps.pnpm.outputs.present == 'true'
+        run: pnpm build
+
+      - name: No manifests present — nothing to compile yet
+        if: steps.cargo.outputs.present == 'false' && steps.pnpm.outputs.present == 'false'
+        shell: bash
+        run: echo "Docs-only tree — no Cargo.toml or package.json yet. Skipping compile-check."
+
+  docs-presence:
+    name: docs-presence (warn-only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check M1 docs are present
+        run: |
+          missing=0
+          for f in README.md LICENSE CONTRIBUTING.md; do
+            if [ ! -f "$f" ]; then
+              echo "::warning::docs-presence: $f is missing (expected once M1 docs land)."
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 0 ]; then
+            echo "All M1 docs present."
+          fi
+          exit 0
