@@ -25,6 +25,8 @@ mod hotkeys;
 pub mod output;
 pub mod pipeline;
 mod store;
+pub mod settings;
+pub mod tray;
 pub mod stt;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
