@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Runtime wiring (issue #91): the global hotkey (`tauri-plugin-global-shortcut`)
+  now drives the `hotkeys` state machine end to end — on release, the
+  captured audio window runs through `pipeline::Pipeline`
+  (`OllamaCleanup` with its `RegexCleanup` fallback, AC-4) and the cleaned
+  text is routed per the live output-mode switch (AC-14), seeded from
+  `Settings` persisted via `tauri-plugin-store`. A background check on
+  startup kicks the first-run Whisper model downloader (`models`) if the
+  selected preset is absent, emitting `model-download-progress`/
+  `model-download-error` events (minimal — full onboarding UX is M5). New
+  `commands.rs` handlers (`get_settings`, `set_settings`,
+  `set_output_mode`, `download_selected_model`) expose this to a future
+  settings UI. `WhisperStt` is selected under `--features whisper`
+  (`pnpm tauri:dev` / `pnpm tauri:build`); the default build (`cargo
+  build`/`cargo test`, used by CI) compiles and runs with a clear
+  "model engine unavailable" error path instead.
 - `models` module (issue #24, ADR-0004, MISSION §5, PRD AC-12): the first-run
   Whisper model downloader. A registry of the two supported presets
   (quantized `large-v3-turbo` q5_0, the default, and `small`), each pinned
@@ -199,6 +214,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **#65** `output::paste_via_clipboard_swap` now restores the saved
+  clipboard on every error path (a failing paste synthesizer — e.g.
+  `enigo` failing on first-run macOS before Accessibility is granted —
+  or a failing post-paste observation read), not just the happy path;
+  before this fix, either failure returned early via `?` and permanently
+  left the transcript on the clipboard.
+- **#58** `audio::start_capture`'s real-time callback now reuses two
+  pre-allocated scratch buffers (`downmix_resample_into`) instead of
+  allocating two fresh `Vec`s per callback, and uses `try_lock` instead
+  of a blocking `lock()` — a contended buffer lock drops that callback's
+  samples and counts the drop (`CaptureDiagnostics`) rather than
+  stalling the real-time audio thread.
+- **#59** audio capture errors (a poisoned ring-buffer lock, a `cpal`
+  stream error) are now recorded as structured `CaptureRuntimeError`
+  state (`CaptureDiagnostics`) instead of an invisible `eprintln!`,
+  readable by the rest of the app.
+- **#73** `cleanup::UreqTransport` now sets a write timeout (mirroring
+  the read timeout) and an overall request timeout on its `ureq::Agent`,
+  in addition to the existing connect/read timeouts — a peer that
+  accepts the connection but stops draining could previously block
+  `send_string` forever on a large-enough request body, defeating the
+  AC-4 fallback.
+- **#80** `settings::SettingsStore::load` now returns
+  `Result<Settings, SettingsLoadError>` — distinguishing `NotFound`
+  (first run; safe to silently default) from `Corrupt` (something was
+  persisted but failed to parse) — instead of silently collapsing any
+  load failure to `Settings::default()` with no signal.
+- **#86** the AC-5 privacy-guard test no longer relies on
+  `static_assertions::assert_type_ne_all!` (a tautology: any two
+  distinct named types are always "not equal" to that macro, so it
+  could never catch a real transport being substituted in). Replaced
+  with `cleanup::NoRealNetworkTransport`, a sealed marker trait granted
+  only to the exported `cleanup::StubTransport` test double and
+  deliberately never to `UreqTransport` — a `compile_fail` doctest
+  proves the negative space.
+- **#44** `hotkeys::StateMachine` gained a `reset()`/reconcile entry the
+  runtime wiring calls on window focus-loss: previously, a dropped
+  `KeyUp` (focus loss, screen lock, sleep/resume) left the machine
+  permanently wedged in `Holding` with a stale held-key set, silently
+  swallowing every subsequent hotkey press.
 - `RegexCleanup` (`src-tauri/src/cleanup.rs`), three Sentinel-tracked bugs
   that blocked wiring cleanup into the pipeline (issues #52/#53/#54, all
   fixed before #25 per Sentinel's instruction):
