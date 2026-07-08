@@ -1,10 +1,11 @@
 name: ci
 
-# Test/lint/build matrix skeleton (MISSION.md §3, §7; issue #13).
+# Test/lint/build matrix (MISSION.md §3, §7; issue #13).
 #
-# Every source-touching step is guarded by a file-existence check so this
-# workflow is a clean no-op pass on the current docs-only tree and turns on
-# step-by-step as Cargo.toml / package.json land (M1).
+# Every source-touching step is guarded by a file-existence check (the
+# fallback path lets this workflow stay a clean no-op on a docs-only tree),
+# but the actual crate lives in src-tauri/, not the repo root — the cargo
+# steps check for and run against src-tauri/Cargo.toml (issue #104).
 #
 # Trigger: plain `pull_request` — unlike harness-guard.yml / sentinel.yml,
 # this workflow's whole job is to compile and test the PR's own code, so
@@ -36,18 +37,21 @@ jobs:
 
       - name: Check for Cargo.toml
         id: cargo
-        run: echo "present=$(test -f Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        run: echo "present=$(test -f src-tauri/Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
       - name: cargo fmt --check
         if: steps.cargo.outputs.present == 'true'
+        working-directory: src-tauri
         run: cargo fmt --all --check
 
       - name: cargo clippy
         if: steps.cargo.outputs.present == 'true'
+        working-directory: src-tauri
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: cargo test
         if: steps.cargo.outputs.present == 'true'
+        working-directory: src-tauri
         run: cargo test --all-features
 
       - name: Check for package.json
@@ -96,20 +100,37 @@ jobs:
       - name: Check for Cargo.toml
         id: cargo
         shell: bash
-        run: echo "present=$(test -f Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        run: echo "present=$(test -f src-tauri/Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      # windows-latest ships CMake and the MSVC Build Tools, but not libclang.
       # whisper-rs-sys uses bindgen to generate bindings at build time, and
-      # bindgen needs libclang — install it deterministically here rather than
-      # relying on the runner image happening to have it.
-      - name: Install LLVM (libclang for whisper-rs-sys/bindgen)
-        if: steps.cargo.outputs.present == 'true'
-        run: choco install llvm -y
-
-      - name: Export LIBCLANG_PATH
+      # bindgen needs libclang (libclang.dll). The GitHub windows-latest image
+      # already ships LLVM/Clang pre-installed at C:\Program Files\LLVM, so we
+      # verify-then-fallback rather than `choco install`ing a pinned version:
+      # a pinned install conflicts with the pre-installed package and fails the
+      # job. Prefer the runner's LLVM (reproducible enough — it's part of the
+      # pinned runner image); only `choco install` on a bare runner that lacks
+      # it. A genuinely-missing libclang after both paths still fails loudly.
+      - name: Set up libclang for whisper-rs-sys/bindgen
         if: steps.cargo.outputs.present == 'true'
         shell: pwsh
-        run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+        run: |
+          $llvmBin = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            Write-Host "libclang.dll not found at $llvmBin — installing LLVM via Chocolatey."
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "choco install llvm failed with exit code $LASTEXITCODE"
+              exit 1
+            }
+          } else {
+            Write-Host "Using pre-installed LLVM at $llvmBin (windows-latest image)."
+          }
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            Write-Error "libclang.dll is still missing at $llvmBin after setup — cannot build whisper-rs-sys."
+            exit 1
+          }
+          "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+          Write-Host "LIBCLANG_PATH set to $llvmBin"
 
       - name: Ensure CMake is available
         if: steps.cargo.outputs.present == 'true'
@@ -117,10 +138,12 @@ jobs:
 
       - name: cargo build
         if: steps.cargo.outputs.present == 'true'
+        working-directory: src-tauri
         run: cargo build --all-targets --all-features
 
       - name: cargo test
         if: steps.cargo.outputs.present == 'true'
+        working-directory: src-tauri
         run: cargo test --all-features
 
       - name: Check for package.json

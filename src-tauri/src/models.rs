@@ -496,6 +496,13 @@ impl FileSink {
 
 impl DownloadSink for FileSink {
     fn append(&mut self, buf: &[u8]) -> Result<(), ModelError> {
+        // Seek to EOF before writing so resumed appends still land after the
+        // existing partial bytes. We deliberately open the handle read+write
+        // rather than append-only (see the `.partial` open site): on Windows
+        // an append-only handle lacks FILE_WRITE_DATA, so `restart`'s
+        // `set_len(0)` would be denied (os error 5). Managing the position
+        // explicitly here keeps `restart` truncation valid on every platform.
+        self.file.seek(SeekFrom::End(0)).map_err(io_err)?;
         self.file.write_all(buf).map_err(io_err)
     }
 
@@ -741,7 +748,16 @@ pub fn download_model_with_spec<T: ModelTransport>(
                 // Resume: keep existing bytes, append after them. The
                 // transport may still `restart` this handle (truncate) if the
                 // server ignores the Range and sends a full 200 body (🟡#3).
-                OpenOptions::new().append(true).open(&partial)
+                // Open read+write (NOT append-only): FileSink::append seeks to
+                // EOF before writing, and a plain write handle lets `restart`'s
+                // set_len(0) truncate on Windows too (an append-only handle
+                // there lacks FILE_WRITE_DATA → set_len denied, os error 5).
+                OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&partial)
             } else {
                 OpenOptions::new()
                     .create(true)
