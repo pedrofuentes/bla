@@ -102,21 +102,35 @@ jobs:
         shell: bash
         run: echo "present=$(test -f src-tauri/Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      # windows-latest ships CMake and the MSVC Build Tools, but not libclang.
       # whisper-rs-sys uses bindgen to generate bindings at build time, and
-      # bindgen needs libclang — install it deterministically here rather than
-      # relying on the runner image happening to have it.
-      #
-      # Version pinned for reproducibility (Chocolatey community repo, as of
-      # this writing); bump deliberately, not implicitly via an unpinned `-y`.
-      - name: Install LLVM (libclang for whisper-rs-sys/bindgen)
-        if: steps.cargo.outputs.present == 'true'
-        run: choco install llvm --version=18.1.8 -y --no-progress
-
-      - name: Export LIBCLANG_PATH
+      # bindgen needs libclang (libclang.dll). The GitHub windows-latest image
+      # already ships LLVM/Clang pre-installed at C:\Program Files\LLVM, so we
+      # verify-then-fallback rather than `choco install`ing a pinned version:
+      # a pinned install conflicts with the pre-installed package and fails the
+      # job. Prefer the runner's LLVM (reproducible enough — it's part of the
+      # pinned runner image); only `choco install` on a bare runner that lacks
+      # it. A genuinely-missing libclang after both paths still fails loudly.
+      - name: Set up libclang for whisper-rs-sys/bindgen
         if: steps.cargo.outputs.present == 'true'
         shell: pwsh
-        run: echo "LIBCLANG_PATH=$env:ProgramFiles\LLVM\bin" >> $env:GITHUB_ENV
+        run: |
+          $llvmBin = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            Write-Host "libclang.dll not found at $llvmBin — installing LLVM via Chocolatey."
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "choco install llvm failed with exit code $LASTEXITCODE"
+              exit 1
+            }
+          } else {
+            Write-Host "Using pre-installed LLVM at $llvmBin (windows-latest image)."
+          }
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            Write-Error "libclang.dll is still missing at $llvmBin after setup — cannot build whisper-rs-sys."
+            exit 1
+          }
+          "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+          Write-Host "LIBCLANG_PATH set to $llvmBin"
 
       - name: Ensure CMake is available
         if: steps.cargo.outputs.present == 'true'
