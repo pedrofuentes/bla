@@ -16,23 +16,18 @@
 use std::io;
 use std::time::Duration;
 
-use bla_lib::cleanup::{OllamaCleanup, OllamaTransport, RegexCleanup, Tone, TransportError};
+use bla_lib::cleanup::{
+    NoRealNetworkTransport, OllamaCleanup, RegexCleanup, StubTransport, Tone, TransportError,
+};
 use bla_lib::output::{Clipboard, Clock, FileConfig, OutputMode, PasteSynthesizer};
 use bla_lib::pipeline::{Pipeline, PipelineOpts};
 use bla_lib::stt::{FakeStt, TranscribeOpts};
 
-/// A stub `OllamaTransport` that never touches a real socket: it just
-/// returns a preprogrammed outcome. Used by AC-1 (a well-behaved model
-/// response) and AC-4/AC-5 (an unreachable endpoint).
-struct StubTransport {
-    response: Result<String, TransportError>,
-}
-
-impl OllamaTransport for StubTransport {
-    fn post(&self, _url: &str, _body: &str) -> Result<String, TransportError> {
-        self.response.clone()
-    }
-}
+// `StubTransport` (a preprogrammed-outcome `OllamaTransport` that never
+// touches a real socket) is imported from `bla_lib::cleanup` rather than
+// defined locally: it carries the sealed `NoRealNetworkTransport` marker
+// (issue #86) the AC-5 test below asserts against, which only `cleanup.rs`
+// itself can grant.
 
 /// Encodes `model_output` as the Ollama `/api/generate` JSON body
 /// `OllamaCleanup` expects to parse.
@@ -265,11 +260,20 @@ fn ac5_full_pipeline_run_makes_no_network_io_outside_allowlist() {
     // socket, so this run opens zero sockets by construction.
     //
     // The only component in this crate that can ever touch a real socket
-    // is `UreqTransport` (cleanup.rs), and it is never constructed here;
-    // this assertion fails to compile if a future edit ever swapped the
-    // stub for it in this test, guarding against silently reintroducing
-    // real network I/O into what must stay a network-free acceptance case.
-    static_assertions::assert_type_ne_all!(StubTransport, bla_lib::cleanup::UreqTransport);
+    // is `UreqTransport` (cleanup.rs), and it is never constructed here.
+    // Issue #86: this is a REAL type-level guard, not the tautological
+    // `assert_type_ne_all!(StubTransport, UreqTransport)` it replaces (any
+    // two distinct named types are always "not equal" to that macro, so it
+    // could never actually catch a real transport being substituted in —
+    // it just restated that the two type names differ). `StubTransport`
+    // carries the sealed `NoRealNetworkTransport` marker that only
+    // `cleanup.rs` can grant, and `UreqTransport` deliberately does not
+    // implement it — so this line fails to COMPILE if a future edit ever
+    // swapped the stub for the real transport in this test, guarding
+    // against silently reintroducing real network I/O into what must stay
+    // a network-free acceptance case.
+    fn assert_no_real_network_transport<T: NoRealNetworkTransport>() {}
+    assert_no_real_network_transport::<StubTransport>();
 
     let raw_transcript = "um, hello there, you know";
     let stt = FakeStt::new(raw_transcript);

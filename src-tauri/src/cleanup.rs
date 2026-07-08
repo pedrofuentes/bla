@@ -412,6 +412,64 @@ fn classify_ureq_error(err: ureq::Error) -> TransportError {
     }
 }
 
+mod sealed {
+    /// Private supertrait (issue #86): only types defined *within this
+    /// crate* can implement it, since external code has no path to name
+    /// `crate::cleanup::sealed::Sealed`. This is what makes
+    /// [`super::NoRealNetworkTransport`] a genuine sealed marker rather than
+    /// something any caller could self-declare conformance with.
+    pub trait Sealed {}
+}
+
+/// Sealed marker (issue #86, AC-5): implemented only by [`OllamaTransport`]s
+/// that provably never open a real network socket — i.e. test stubs like
+/// [`StubTransport`]. [`UreqTransport`] (the real, network-touching
+/// transport) deliberately does **not** implement this.
+///
+/// This replaces a previous AC-5 guard
+/// (`static_assertions::assert_type_ne_all!(StubTransport, UreqTransport)`)
+/// that was a tautology: any two distinct *named* types are always "not
+/// equal" to that macro, so it could never actually catch a real transport
+/// being substituted in for the stub — it just restated that the two type
+/// names differ. A test that requires `T: NoRealNetworkTransport` instead
+/// fails to **compile** if `UreqTransport` (or any other real transport)
+/// were ever swapped in, because sealing means only this module can grant
+/// the marker, and it deliberately never grants it to `UreqTransport`. See
+/// the `compile_fail` doctest below for the negative-space proof.
+///
+/// ```compile_fail
+/// fn assert_no_real_network_transport<T: bla_lib::cleanup::NoRealNetworkTransport>() {}
+/// // Must NOT compile: UreqTransport is the real, network-touching
+/// // transport and deliberately does not implement the sealed marker.
+/// assert_no_real_network_transport::<bla_lib::cleanup::UreqTransport>();
+/// ```
+pub trait NoRealNetworkTransport: OllamaTransport + sealed::Sealed {}
+
+/// A minimal, reusable [`OllamaTransport`] test double that returns a
+/// preprogrammed outcome and never touches a real socket. `pub` (rather than
+/// confined to `#[cfg(test)]`) so external integration tests —
+/// `tests/acceptance.rs`'s AC-5 case in particular — can drive
+/// `OllamaCleanup` and assert, via [`NoRealNetworkTransport`], that they are
+/// provably not using the real transport (issue #86).
+pub struct StubTransport {
+    pub response: Result<String, TransportError>,
+}
+
+impl StubTransport {
+    pub fn new(response: Result<String, TransportError>) -> Self {
+        Self { response }
+    }
+}
+
+impl OllamaTransport for StubTransport {
+    fn post(&self, _url: &str, _body: &str) -> Result<String, TransportError> {
+        self.response.clone()
+    }
+}
+
+impl sealed::Sealed for StubTransport {}
+impl NoRealNetworkTransport for StubTransport {}
+
 /// Request body shape for Ollama's `/api/generate` endpoint. `system`
 /// carries the rewrite-only prompt ([`CLEANUP_PROMPT_V1`]); `prompt` carries
 /// the raw transcript, untouched, so the model sees exactly the input the
@@ -628,6 +686,17 @@ mod tests {
         let cleanup = RegexCleanup;
         let got = cleanup.clean("eggs, like, milk", Tone::Neutral).unwrap();
         assert_eq!(got, "Eggs, like, milk.");
+    }
+
+    #[test]
+    fn stub_transport_satisfies_the_sealed_no_real_network_transport_marker_issue_86() {
+        // Issue #86: this is the positive-space half of the AC-5 guard — it
+        // fails to compile if `StubTransport`'s sealed-marker impl were ever
+        // removed. The negative-space half (UreqTransport must NOT satisfy
+        // the bound) is the `compile_fail` doctest on
+        // `NoRealNetworkTransport`.
+        fn assert_no_real_network_transport<T: NoRealNetworkTransport>() {}
+        assert_no_real_network_transport::<StubTransport>();
     }
 
     #[test]
