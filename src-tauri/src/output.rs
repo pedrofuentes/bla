@@ -294,9 +294,28 @@ impl Clipboard for SystemClipboard {
     }
 }
 
-/// Real synthetic Cmd+V (macOS) / Ctrl+V (elsewhere) via `enigo`. Thin OS
-/// glue (AGENTS.md OS-integration exemption) — synthesizes exactly one
-/// keystroke combo and delegates every decision to the pure logic above.
+/// The modifier key synthesized alongside `V` for a platform's native paste
+/// shortcut: `Cmd+V` on macOS, `Ctrl+V` everywhere else (Windows, Linux).
+/// Pure, `cfg`-selected lookup — no `enigo` call, no OS handle — so the
+/// per-platform choice is unit-tested directly (issue #98) rather than only
+/// implied by an inline `#[cfg]` inside [`EnigoPaste::synthesize_paste`].
+/// Exactly one of the two `cfg`-gated definitions below is compiled for any
+/// given target.
+#[cfg(target_os = "macos")]
+pub const fn paste_modifier() -> enigo::Key {
+    enigo::Key::Meta
+}
+
+/// Windows/Linux variant of [`paste_modifier`] — see its doc comment above.
+#[cfg(not(target_os = "macos"))]
+pub const fn paste_modifier() -> enigo::Key {
+    enigo::Key::Control
+}
+
+/// Real synthetic Cmd+V (macOS) / Ctrl+V (Windows, Linux) via `enigo`. Thin
+/// OS glue (AGENTS.md OS-integration exemption) — synthesizes exactly one
+/// keystroke combo, using [`paste_modifier`] (pure, unit-tested) to pick the
+/// modifier; no decision logic lives in this impl.
 pub struct EnigoPaste;
 
 impl PasteSynthesizer for EnigoPaste {
@@ -306,10 +325,7 @@ impl PasteSynthesizer for EnigoPaste {
         let mut enigo =
             Enigo::new(&Settings::default()).map_err(|e| io::Error::other(e.to_string()))?;
 
-        #[cfg(target_os = "macos")]
-        let modifier = Key::Meta;
-        #[cfg(not(target_os = "macos"))]
-        let modifier = Key::Control;
+        let modifier = paste_modifier();
 
         enigo
             .key(modifier, Direction::Press)
@@ -835,6 +851,29 @@ mod tests {
         assert_eq!(payload.into_inner(), "hello from the transcript");
     }
 
+    // -----------------------------------------------------------------
+    // Issue #98: paste modifier is a pure, cfg-selected lookup — Cmd on
+    // macOS, Ctrl everywhere else (Windows, Linux) — so it's asserted here
+    // rather than only inline inside `EnigoPaste::synthesize_paste`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn paste_modifier_matches_this_platforms_native_shortcut() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            paste_modifier(),
+            enigo::Key::Meta,
+            "macOS pastes with Cmd+V, not Ctrl+V"
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            paste_modifier(),
+            enigo::Key::Control,
+            "Windows/Linux paste with Ctrl+V, not Cmd+V"
+        );
+    }
+
     fn clock(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Clock {
         Clock {
             year,
@@ -933,5 +972,75 @@ mod tests {
         assert_eq!(written, dir.path().join("2026/12/03.md"));
         let contents = fs::read_to_string(&written).unwrap();
         assert_eq!(contents, "[23:59]nested dirs entry\n");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #98: a file-mode template with literal `/` separators (as a
+    // user would type into settings — this app's templating convention
+    // always uses `/`, never the host OS's separator) must still create the
+    // right nested directories and append correctly. Built by string
+    // concatenation with a hard-coded `/`, deliberately *not*
+    // `Path::join` (which would silently use the host separator and defeat
+    // the point), so this exercises the same literal-`/` string a Windows
+    // build would receive from settings.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn append_entry_creates_nested_dirs_from_a_literal_forward_slash_template_issue_98() {
+        let dir = tempdir().unwrap();
+        let template = format!(
+            "{}/sub/dir/{{{{date:YYYY-MM-DD}}}}.md",
+            dir.path().display()
+        );
+        let config = FileConfig {
+            path_template: template,
+            timestamp_prefix_template: None,
+        };
+
+        let written = append_entry(&config, "literal slash entry", clock(2026, 7, 7, 9, 5))
+            .expect("append_entry must succeed for a literal-'/' template");
+
+        let expected = dir.path().join("sub").join("dir").join("2026-07-07.md");
+        assert_eq!(written, expected);
+        assert!(
+            dir.path().join("sub").join("dir").is_dir(),
+            "intermediate directories from the literal-'/' template must be created"
+        );
+        assert_eq!(
+            fs::read_to_string(&expected).unwrap(),
+            "literal slash entry\n"
+        );
+    }
+
+    #[test]
+    fn append_entry_creates_nested_dirs_from_a_slash_date_token_plus_trailing_segment_issue_98() {
+        let dir = tempdir().unwrap();
+        // `{{date:YYYY/MM/DD}}` expands to a string containing its own `/`
+        // separators, followed by a literal `/note.md` segment — two
+        // sources of `/` compounding in one template.
+        let template = format!("{}/{{{{date:YYYY/MM/DD}}}}/note.md", dir.path().display());
+        let config = FileConfig {
+            path_template: template,
+            timestamp_prefix_template: Some("{{time:HH:mm}} ".to_string()),
+        };
+
+        let written = append_entry(&config, "compound slash entry", clock(2026, 12, 3, 23, 59))
+            .expect("append_entry must succeed for a slash-producing date token");
+
+        let expected = dir
+            .path()
+            .join("2026")
+            .join("12")
+            .join("03")
+            .join("note.md");
+        assert_eq!(written, expected);
+        assert!(
+            dir.path().join("2026").join("12").join("03").is_dir(),
+            "every intermediate directory implied by the date token's '/'s must be created"
+        );
+        assert_eq!(
+            fs::read_to_string(&expected).unwrap(),
+            "23:59 compound slash entry\n"
+        );
     }
 }

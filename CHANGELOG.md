@@ -218,6 +218,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **#98** Windows runtime-seam hardening pass (test-first, no OS access):
+  `output::EnigoPaste`'s Cmd/Ctrl paste-modifier choice is now a pure,
+  `cfg`-selected function (`output::paste_modifier`) instead of an inline
+  `#[cfg]` block, unit-tested directly per platform; the file-mode path
+  templating (`output::expand_template`/`append_entry`) and
+  `models::model_target_path` are confirmed — with new discriminating
+  tests, no behavior change — to resolve correctly for `/`-separated
+  templates and Windows-style app-data bases respectively; and the
+  persisted default hotkey (`settings::Settings::default().hotkey`) is
+  confirmed to parse on every platform via the same accelerator grammar
+  `tauri-plugin-global-shortcut` registers with, so a corrupt default could
+  never leave `resolve_effective_hotkey`'s fallback with nothing valid to
+  fall back to. `enigo`/`arboard` OS calls and `cpal`'s WASAPI selection on
+  Windows remain thin glue, verified for real by the cofounder's
+  `pnpm tauri:dev` run rather than by this repo's macOS-only test suite.
+
 ### Fixed
 
 - **#65** `output::paste_via_clipboard_swap` now restores the saved
