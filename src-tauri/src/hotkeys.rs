@@ -5,10 +5,179 @@
 //! start/stop-recording events for `audio` to act on.
 //!
 //! OS-integration module (AGENTS.md §OS-integration exemption): thin glue only —
-//! no decision logic. Keep state-machine *rules* testable in pure functions if
-//! they grow non-trivial; this file just wires the platform API.
+//! no decision logic; the platform wiring around `tauri-plugin-global-shortcut`
+//! is a stub, implemented in a later M1 increment (TDD-exempt OS glue, kept
+//! separate from the logic below).
 //!
-//! Stub — no logic yet; implemented in a later M1 increment.
+//! ## Pure state machine (AC-8)
+//!
+//! [`StateMachine`] is the pure hold/toggle logic: no OS calls, driven
+//! entirely by injected [`KeyEvent`]s carrying a caller-supplied
+//! [`Timestamp`], so it never calls `Instant::now()` itself and is fully
+//! deterministic in tests. The (future) OS glue above will construct one
+//! `StateMachine`, feed it real key events translated from
+//! `tauri-plugin-global-shortcut` callbacks, and react to the
+//! [`Transition`]s it emits by starting/stopping `audio` capture.
+
+#![allow(dead_code)] // Not yet wired to the OS-glue layer or `commands`.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+/// Injected timestamp abstraction — an opaque duration since some
+/// caller-chosen origin (e.g. `Instant::now().duration_since(origin)` in the
+/// real glue). Tests construct these directly with `Duration::from_millis`,
+/// so the state machine never touches the system clock.
+pub type Timestamp = Duration;
+
+/// Identifies one physical key participating in the configured hotkey chord.
+pub type KeyId = u32;
+
+/// Recording trigger mode (PRD AC-8), configurable via settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Record while the configured chord is held; releasing any chord key
+    /// stops recording (subject to the debounce threshold).
+    Hold,
+    /// The first full chord press starts recording; the next full chord
+    /// press stops it. Physical key release has no effect.
+    Toggle,
+}
+
+/// A single physical key press or release, timestamped by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyEvent {
+    KeyDown(KeyId, Timestamp),
+    KeyUp(KeyId, Timestamp),
+}
+
+/// Emitted by [`StateMachine::handle`] in response to a [`KeyEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// The chord was newly pressed — begin capturing audio.
+    StartRecording,
+    /// A completed dictation: the recording should be transcribed.
+    StopRecording,
+    /// A Hold-mode press shorter than the debounce threshold — treated as
+    /// accidental. Recording must be discarded; no dictation is produced.
+    Cancelled,
+}
+
+/// Default debounce threshold for Hold mode (PRD AC-8): a press shorter than
+/// this is treated as an accidental key touch.
+pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    /// Hold-mode recording in progress; started when the chord completed.
+    Holding {
+        started_at: Timestamp,
+    },
+    /// Toggle-mode recording in progress.
+    ToggledOn,
+}
+
+/// Pure hold/toggle hotkey state machine (AC-8). Holds no OS handles and
+/// performs no I/O — see the module docs for how the OS-glue layer above
+/// drives it.
+pub struct StateMachine {
+    mode: Mode,
+    chord: HashSet<KeyId>,
+    debounce: Duration,
+    held: HashSet<KeyId>,
+    phase: Phase,
+}
+
+impl StateMachine {
+    /// `chord` is the set of keys that must be simultaneously down to
+    /// trigger the hotkey; `debounce` is the minimum Hold-mode press
+    /// duration for a dictation to be emitted (default: [`DEFAULT_DEBOUNCE`]).
+    pub fn new(mode: Mode, chord: impl IntoIterator<Item = KeyId>, debounce: Duration) -> Self {
+        Self {
+            mode,
+            chord: chord.into_iter().collect(),
+            debounce,
+            held: HashSet::new(),
+            phase: Phase::Idle,
+        }
+    }
+
+    fn chord_complete(&self) -> bool {
+        !self.chord.is_empty() && self.chord.iter().all(|key| self.held.contains(key))
+    }
+
+    /// Feed one key event into the machine; returns the [`Transition`] it
+    /// produces, if any.
+    pub fn handle(&mut self, event: KeyEvent) -> Option<Transition> {
+        match event {
+            KeyEvent::KeyDown(key, at) => {
+                if !self.chord.contains(&key) || self.held.contains(&key) {
+                    // Not a chord key, or an OS key-repeat of an
+                    // already-held key — no edge, nothing to do.
+                    self.held.insert(key);
+                    return None;
+                }
+                let was_complete = self.chord_complete();
+                self.held.insert(key);
+                if !was_complete && self.chord_complete() {
+                    self.on_chord_pressed(at)
+                } else {
+                    None
+                }
+            }
+            KeyEvent::KeyUp(key, at) => {
+                if !self.chord.contains(&key) || !self.held.contains(&key) {
+                    self.held.remove(&key);
+                    return None;
+                }
+                let was_complete = self.chord_complete();
+                self.held.remove(&key);
+                if was_complete && !self.chord_complete() {
+                    self.on_chord_released(at)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The chord transitioned from not-fully-held to fully-held.
+    fn on_chord_pressed(&mut self, at: Timestamp) -> Option<Transition> {
+        match (self.mode, self.phase) {
+            (Mode::Hold, Phase::Idle) => {
+                self.phase = Phase::Holding { started_at: at };
+                Some(Transition::StartRecording)
+            }
+            (Mode::Toggle, Phase::Idle) => {
+                self.phase = Phase::ToggledOn;
+                Some(Transition::StartRecording)
+            }
+            (Mode::Toggle, Phase::ToggledOn) => {
+                self.phase = Phase::Idle;
+                Some(Transition::StopRecording)
+            }
+            _ => None,
+        }
+    }
+
+    /// The chord transitioned from fully-held to not-fully-held (any one
+    /// chord key released).
+    fn on_chord_released(&mut self, at: Timestamp) -> Option<Transition> {
+        match (self.mode, self.phase) {
+            (Mode::Hold, Phase::Holding { started_at }) => {
+                self.phase = Phase::Idle;
+                if at.saturating_sub(started_at) < self.debounce {
+                    Some(Transition::Cancelled)
+                } else {
+                    Some(Transition::StopRecording)
+                }
+            }
+            // Toggle mode ignores physical key release entirely.
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
