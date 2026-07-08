@@ -1027,7 +1027,12 @@ mod tests {
         let written = append_entry(&config, "compound slash entry", clock(2026, 12, 3, 23, 59))
             .expect("append_entry must succeed for a slash-producing date token");
 
-        let expected = dir.path().join("2026").join("12").join("03").join("note.md");
+        let expected = dir
+            .path()
+            .join("2026")
+            .join("12")
+            .join("03")
+            .join("note.md");
         assert_eq!(written, expected);
         assert!(
             dir.path().join("2026").join("12").join("03").is_dir(),
