@@ -81,13 +81,18 @@ pub trait Cleanup {
 /// Under [`Tone::Neutral`], `RegexCleanup`:
 /// 1. Removes unambiguous filler interjections ("um", "uh", "er" —
 ///    word-boundary, case-insensitive) unconditionally.
-/// 2. Removes "like" / "you know" **only** when comma-flanked on both sides
-///    (e.g. "it's, like, great"), since that punctuation pattern cheaply and
-///    reliably marks discourse-filler usage in speech transcripts. Other
-///    occurrences — comparative ("looks like rain"), literal ("you know the
-///    rules"), or sentence-initial/-final — are deliberately left alone:
-///    telling those apart from genuine filler usage isn't cheap, so this
-///    baseline stays conservative rather than risk stripping real content.
+/// 2. Removes "you know" **only** when comma-flanked on both sides (e.g.
+///    "it's, you know, great"), since that punctuation pattern cheaply and
+///    reliably marks discourse-filler usage in speech transcripts. Removes
+///    comma-flanked "like" the same way, **except** when it isn't followed
+///    by a clause (issue #52): "eggs, like, milk" uses "like" as a genuine
+///    list connector ("such as"), not filler, so it survives when the word
+///    immediately after it isn't a clause-starter (see [`CLAUSE_STARTERS`]).
+///    Other occurrences — comparative ("looks like rain"), literal ("you
+///    know the rules"), or sentence-initial/-final — are deliberately left
+///    alone: telling those apart from genuine filler usage isn't cheap, so
+///    this baseline stays conservative rather than risk stripping real
+///    content.
 /// 3. Collapses runs of whitespace (including any left behind by 1–2) to a
 ///    single space and trims the ends.
 /// 4. Capitalizes the first letter of the string and of every sentence that
@@ -114,9 +119,13 @@ struct FillerPatterns {
     /// Unambiguous filler interjections, plus a directly-trailing comma so
     /// removal doesn't leave orphaned punctuation behind.
     interjection: Regex,
-    /// "like" / "you know" when comma-flanked on both sides — see
-    /// `RegexCleanup`'s doc comment for why this is the chosen heuristic.
-    comma_flanked_filler: Regex,
+    /// Comma-flanked "like" plus the word immediately following it, so the
+    /// replacement closure (see [`strip_filler_like`]) can decide whether
+    /// that occurrence is discourse filler (issue #52).
+    comma_flanked_like: Regex,
+    /// "you know" when comma-flanked on both sides — see `RegexCleanup`'s
+    /// doc comment for why this is the chosen heuristic.
+    comma_flanked_you_know: Regex,
     /// Any run of whitespace, collapsed to a single space.
     whitespace: Regex,
 }
@@ -125,9 +134,39 @@ fn patterns() -> &'static FillerPatterns {
     static PATTERNS: OnceLock<FillerPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| FillerPatterns {
         interjection: Regex::new(r"(?i)\b(?:um|uh|er)\b,?").expect("valid regex"),
-        comma_flanked_filler: Regex::new(r"(?i),\s*(?:like|you know)\s*,").expect("valid regex"),
+        comma_flanked_like: Regex::new(r"(?i),\s*like\s*,\s*(\w+)").expect("valid regex"),
+        comma_flanked_you_know: Regex::new(r"(?i),\s*you know\s*,").expect("valid regex"),
         whitespace: Regex::new(r"\s+").expect("valid regex"),
     })
+}
+
+/// Words that, immediately after a comma-flanked "like", mark it as a
+/// discourse filler introducing a clause (a pronoun/demonstrative/existential
+/// subject) rather than a genuine list connector (issue #52). E.g. "so,
+/// like, this is cool" — "this" starts a clause, so "like" is filler and
+/// gets stripped. "eggs, like, milk" — "milk" is a plain noun, not a clause
+/// starter, so "like" survives as the list connector it is.
+const CLAUSE_STARTERS: &[&str] = &[
+    "this", "that", "it", "it's", "i", "i'm", "we", "we're", "you", "you're", "he", "he's", "she",
+    "she's", "they", "they're", "there", "there's",
+];
+
+/// Replacement pass for [`FillerPatterns::comma_flanked_like`] (issue #52):
+/// strips comma-flanked "like" only when the word right after it is a
+/// [`CLAUSE_STARTERS`] entry (genuine filler introducing a clause); otherwise
+/// leaves the match untouched so a genuine list connector like "eggs, like,
+/// milk" survives intact.
+fn strip_filler_like(input: &str) -> std::borrow::Cow<'_, str> {
+    patterns()
+        .comma_flanked_like
+        .replace_all(input, |caps: &regex::Captures| {
+            let next_word = &caps[1];
+            if CLAUSE_STARTERS.contains(&next_word.to_lowercase().as_str()) {
+                format!(", {next_word}")
+            } else {
+                caps[0].to_string()
+            }
+        })
 }
 
 /// The deterministic rewrite used by [`RegexCleanup`] under [`Tone::Neutral`].
@@ -136,9 +175,10 @@ fn clean_text(raw: &str) -> String {
     let patterns = patterns();
 
     let without_interjections = patterns.interjection.replace_all(raw, "");
+    let without_like_filler = strip_filler_like(&without_interjections);
     let without_fillers = patterns
-        .comma_flanked_filler
-        .replace_all(&without_interjections, ",");
+        .comma_flanked_you_know
+        .replace_all(&without_like_filler, ",");
     let collapsed = patterns.whitespace.replace_all(&without_fillers, " ");
     let trimmed = collapsed.trim();
 
