@@ -14,6 +14,133 @@
 //! OS glue, not wired into `commands.rs` in this increment —
 //! [`InMemorySettingsStore`] stands in for it in tests).
 
+use serde::{Deserialize, Serialize};
+
+/// Hold-to-record vs. toggle hotkey behavior (AC-8's state machine reads
+/// this from settings; the machine itself lives in `hotkeys.rs`, untouched
+/// here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordingMode {
+    Hold,
+    Toggle,
+}
+
+/// The selectable Whisper model presets (ADR-0004, PRD AC-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelPreset {
+    LargeV3Turbo,
+    Small,
+}
+
+/// Persisted output-mode preference (cursor-paste vs. file). Distinct from
+/// `tray::OutputMode` (the live, in-memory switch) and `output::OutputMode`
+/// (the router's dispatch target with resolved file config) — this is just
+/// the durable user preference the other two are seeded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputModeSetting {
+    Cursor,
+    File,
+}
+
+/// All user-configurable settings (AC-13): hotkey binding, hold/toggle
+/// mode, selected Whisper model preset, output mode, and the file-mode
+/// path template. Config only — never holds transcript/clipboard text, so
+/// deriving `Serialize`/`Debug` here doesn't touch the no-log invariant
+/// `output::ClipboardPayload` enforces (MISSION §7).
+///
+/// `#[serde(default)]` at the struct level means any field missing from a
+/// persisted (or first-run/empty) JSON blob falls back to
+/// `Settings::default()`'s value for that field, rather than failing to
+/// deserialize (AC-13's default-on-missing requirement).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub hotkey: String,
+    pub recording_mode: RecordingMode,
+    pub model_preset: ModelPreset,
+    pub output_mode: OutputModeSetting,
+    pub file_path_template: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            hotkey: "Control+Option+Space".to_string(),
+            recording_mode: RecordingMode::Hold,
+            model_preset: ModelPreset::LargeV3Turbo,
+            output_mode: OutputModeSetting::Cursor,
+            file_path_template: "{{date:YYYY-MM-DD}}.md".to_string(),
+        }
+    }
+}
+
+/// Serialize `settings` to a JSON string. Pure, deterministic, infallible
+/// (every field is a plain string or unit-variant enum).
+pub fn to_json(settings: &Settings) -> String {
+    serde_json::to_string(settings).expect("Settings serialization is infallible")
+}
+
+/// Deserialize a JSON string into [`Settings`], defaulting any field the
+/// JSON omits (AC-13). Fails only on genuinely malformed JSON or a field
+/// present with the wrong shape.
+pub fn from_json(json: &str) -> Result<Settings, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
+/// Persistence seam behind which a real `tauri-plugin-store`-backed
+/// implementation would sit (thin OS glue, not wired into `commands.rs` in
+/// this increment). Keeping this as a trait — rather than calling the
+/// plugin directly — is what makes AC-13's restart-persistence behavior
+/// testable without a live Tauri app context.
+pub trait SettingsStore {
+    /// Load persisted settings, or [`Settings::default()`] on first run /
+    /// when nothing has been saved yet.
+    fn load(&self) -> Settings;
+    /// Persist `settings`, replacing whatever was previously stored.
+    fn save(&mut self, settings: &Settings);
+}
+
+/// In-memory stand-in for the real store, used to test [`SettingsStore`]
+/// consumers (and AC-13's restart-persistence behavior) without a real
+/// `tauri-plugin-store`-backed app context. A "restart" is simulated by
+/// extracting the persisted bytes via [`persisted`](Self::persisted) and
+/// handing them to a fresh instance via [`from_persisted`](Self::from_persisted).
+#[derive(Default)]
+pub struct InMemorySettingsStore {
+    raw: Option<String>,
+}
+
+impl InMemorySettingsStore {
+    /// A store with nothing persisted yet (first run).
+    pub fn new() -> Self {
+        Self { raw: None }
+    }
+
+    /// A store pre-loaded with previously persisted JSON bytes, as if
+    /// re-opened after an app restart.
+    pub fn from_persisted(raw: String) -> Self {
+        Self { raw: Some(raw) }
+    }
+
+    /// The raw JSON currently persisted, if anything has been saved yet.
+    pub fn persisted(&self) -> Option<&str> {
+        self.raw.as_deref()
+    }
+}
+
+impl SettingsStore for InMemorySettingsStore {
+    fn load(&self) -> Settings {
+        self.raw
+            .as_deref()
+            .and_then(|json| from_json(json).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&mut self, settings: &Settings) {
+        self.raw = Some(to_json(settings));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

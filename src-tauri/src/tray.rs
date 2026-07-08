@@ -13,6 +13,78 @@
 //! additionally carries the file target's resolved config. The two are not
 //! wired together in this increment.
 
+/// Pipeline state as observed by the tray: the overall dictation state
+/// machine (hotkey → capture → transcribe → cleanup → output) collapsed to
+/// the four states the tray icon distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineState {
+    Idle,
+    Recording,
+    Transcribing,
+    Error,
+}
+
+/// Which icon variant the tray should render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIconState {
+    Idle,
+    Active,
+    Busy,
+    Error,
+}
+
+/// Total, deterministic mapping from [`PipelineState`] to [`TrayIconState`]
+/// (AC-14). Pure — no OS calls; the real menu-bar icon swap (thin glue, not
+/// wired in this increment) would call this and hand the result to Tauri's
+/// tray API.
+pub fn tray_icon_state(state: &PipelineState) -> TrayIconState {
+    match state {
+        PipelineState::Idle => TrayIconState::Idle,
+        PipelineState::Recording => TrayIconState::Active,
+        PipelineState::Transcribing => TrayIconState::Busy,
+        PipelineState::Error => TrayIconState::Error,
+    }
+}
+
+/// Which output target a dictation is routed to, as toggled from the tray
+/// menu (AC-14). See the module doc for how this relates to
+/// `output::OutputMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    CursorPaste,
+    File,
+}
+
+/// Holds the output mode live for dictations completing from this point
+/// forward. AC-14: switching the mode from the tray while a dictation is
+/// in flight must not change *that* dictation's routing — a caller that
+/// already read [`route_target`](Self::route_target) holds a plain copied
+/// value, unaffected by a later [`set_mode`](Self::set_mode). The switch
+/// only takes effect for `route_target()` calls made *after* it, i.e.
+/// starting with the next dictation.
+pub struct OutputModeSwitch {
+    current: OutputMode,
+}
+
+impl OutputModeSwitch {
+    /// Start the switch at `initial` (typically `Settings::output_mode`
+    /// mapped to this module's `OutputMode`).
+    pub fn new(initial: OutputMode) -> Self {
+        Self { current: initial }
+    }
+
+    /// Request a mode change, effective for every `route_target()` call
+    /// from this point on.
+    pub fn set_mode(&mut self, mode: OutputMode) {
+        self.current = mode;
+    }
+
+    /// The mode that should route the dictation currently completing.
+    pub fn route_target(&self) -> OutputMode {
+        self.current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,10 +100,7 @@ mod tests {
             tray_icon_state(&PipelineState::Transcribing),
             TrayIconState::Busy
         );
-        assert_eq!(
-            tray_icon_state(&PipelineState::Error),
-            TrayIconState::Error
-        );
+        assert_eq!(tray_icon_state(&PipelineState::Error), TrayIconState::Error);
     }
 
     #[test]
