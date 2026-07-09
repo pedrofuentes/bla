@@ -7,7 +7,7 @@
 //! window itself is M2; these commands exist so that UI has something real
 //! to call against as of this increment, issue #91).
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     output_mode_toggle_label, register_hotkey, save_settings_to_store, spec_for_preset,
@@ -89,6 +89,14 @@ pub fn set_output_mode(
         let _ = item.set_text(output_mode_toggle_label(tray_mode));
     }
 
+    // Issue #110: this command is called from BOTH the status window's
+    // toggle button and the tray menu's item. A tray-triggered switch never
+    // runs the window's React handler, so without this the window's state
+    // goes stale (it and the tray would disagree about the live mode).
+    // Emit the new mode so the window reconciles regardless of which trigger
+    // fired — the brief required window and tray always agree.
+    let _ = app.emit("output-mode-changed", mode);
+
     Ok(())
 }
 
@@ -97,8 +105,8 @@ pub fn set_output_mode(
 /// Returns immediately with `"already-present"` if the model file already
 /// exists, or `"downloading"` once the background download has started;
 /// progress is reported via the `model-download-progress` event
-/// (`models::DownloadProgress`) and a terminal `model-download-error` event
-/// on failure.
+/// (`models::DownloadProgress`), with a terminal `model-download-complete`
+/// event on success or `model-download-error` on failure.
 #[tauri::command]
 pub fn download_selected_model(
     app: AppHandle,
@@ -115,7 +123,6 @@ pub fn download_selected_model(
 
     let progress_handle = app.clone();
     std::thread::spawn(move || {
-        use tauri::Emitter;
         let transport = crate::models::UreqTransport::new();
         let result = crate::models::download_model_with_spec(&transport, &spec, &app_data_dir, {
             let progress_handle = progress_handle.clone();
@@ -123,8 +130,16 @@ pub fn download_selected_model(
                 let _ = progress_handle.emit("model-download-progress", progress);
             }
         });
-        if let Err(err) = result {
-            let _ = progress_handle.emit("model-download-error", err.to_string());
+        match result {
+            // Issue #110: signal completion so the UI leaves the
+            // "Downloading… 100%" state and shows Ready (mirrors the
+            // first-run path in lib.rs::run()'s setup()).
+            Ok(_) => {
+                let _ = progress_handle.emit("model-download-complete", ());
+            }
+            Err(err) => {
+                let _ = progress_handle.emit("model-download-error", err.to_string());
+            }
         }
     });
 

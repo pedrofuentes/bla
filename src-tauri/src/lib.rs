@@ -351,12 +351,13 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
 }
 
 /// Loads the bundled placeholder tray-icon PNG for `state` (issue #110): a
-/// minimal monochrome glyph per [`tray::TrayIconState`] variant (a hollow
+/// minimal monochrome glyph per [`tray::TrayIconState`] variant — a hollow
 /// ring for Idle, a filled dot for Active, a filled dot with a notch for
-/// Busy, an "X" for Error — see `icons/tray/`'s generator script). Loading
-/// bundled bytes isn't a live OS call, but building `tauri::image::Image`
-/// values is still Tauri-specific glue, so it lives here rather than in
-/// `tray.rs` (which stays OS-call-free per its module doc).
+/// Busy, and an "X" for Error (the four hand-authored 32×32 PNGs under
+/// `icons/tray/`). Loading bundled bytes isn't a live OS call, but building
+/// `tauri::image::Image` values is still Tauri-specific glue, so it lives
+/// here rather than in `tray.rs` (which stays OS-call-free per its module
+/// doc).
 fn tray_icon_image(state: tray::TrayIconState) -> Image<'static> {
     let bytes: &[u8] = match state {
         tray::TrayIconState::Idle => include_bytes!("../icons/tray/idle.png"),
@@ -374,17 +375,26 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
     let icon_label = format!("{icon_state:?}");
     let _ = app.emit("pipeline-state-changed", icon_label.clone());
 
-    // Issue #110: reflect the same derived state on the real tray icon +
-    // its disabled current-state menu line. Both are best-effort (`let _ =`)
-    // — a transient failure to repaint the tray must never take down the
-    // dictation pipeline itself.
-    if let Some(tray_icon) = app.tray_by_id(TRAY_ID) {
-        let _ = tray_icon.set_icon(Some(tray_icon_image(icon_state)));
-    }
-    let tray_state_item = state.tray_state_item.lock().unwrap();
-    if let Some(item) = tray_state_item.as_ref() {
-        let _ = item.set_text(&icon_label);
-    }
+    // Issue #110: reflect the same derived state on the real tray icon + its
+    // disabled current-state menu line. `set_pipeline_state` runs on the
+    // spawned pipeline thread and the global-shortcut callback thread, but
+    // the tray icon/menu are AppKit objects on macOS that must only be
+    // mutated on the main thread (off-main-thread AppKit mutation is
+    // undefined behavior — it can crash or glitch mid-dictation). So clone
+    // the (Send) handles and marshal the actual mutation onto the main
+    // thread via `run_on_main_thread`. Best-effort throughout (`let _ =`): a
+    // failure to repaint the tray must never take down the dictation
+    // pipeline itself.
+    let tray_icon = app.tray_by_id(TRAY_ID);
+    let state_item = state.tray_state_item.lock().unwrap().clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray_icon) = tray_icon {
+            let _ = tray_icon.set_icon(Some(tray_icon_image(icon_state)));
+        }
+        if let Some(item) = state_item {
+            let _ = item.set_text(&icon_label);
+        }
+    });
 }
 
 /// Dispatches a click on one of the tray menu's items (issue #110), by the
@@ -751,9 +761,21 @@ pub fn run() {
                                 let _ = progress_handle.emit("model-download-progress", progress);
                             },
                         );
-                        if let Err(err) = result {
-                            eprintln!("bla: first-run model download failed: {err}");
-                            let _ = handle.emit("model-download-error", err.to_string());
+                        match result {
+                            // Issue #110: a completed download must announce
+                            // itself, or the status window is stuck showing
+                            // "Downloading… 100%" forever (the final progress
+                            // event lands before the checksum+rename, and
+                            // nothing signals "ready" afterward). Emit a
+                            // terminal completion event the UI flips to Ready
+                            // on.
+                            Ok(_) => {
+                                let _ = handle.emit("model-download-complete", ());
+                            }
+                            Err(err) => {
+                                eprintln!("bla: first-run model download failed: {err}");
+                                let _ = handle.emit("model-download-error", err.to_string());
+                            }
                         }
                     });
                 }

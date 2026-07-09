@@ -68,10 +68,20 @@ function App() {
         setModelStatus("downloading");
         setDownloadPercent(progress.percent);
       }),
+      onEvent("model-download-complete", () => {
+        if (cancelled) return;
+        setModelStatus("ready");
+        setDownloadPercent(undefined);
+      }),
       onEvent("model-download-error", (message) => {
         if (!cancelled) {
           setModelStatus("error");
           setError(message);
+        }
+      }),
+      onEvent("output-mode-changed", (mode) => {
+        if (!cancelled) {
+          setSettings((prev) => (prev ? { ...prev, output_mode: mode } : prev));
         }
       }),
     ]);

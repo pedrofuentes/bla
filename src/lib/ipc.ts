@@ -75,8 +75,20 @@ export interface Events {
    */
   "pipeline-state-changed": string;
   "model-download-progress": DownloadProgress;
+  /**
+   * The selected model finished downloading (checksum verified + renamed
+   * into place). Emitted from both download threads' success arm so the UI
+   * leaves the "Downloading…" state. Unit payload (`null`).
+   */
+  "model-download-complete": null;
   /** A human-readable error message — never transcript/clipboard text. */
   "model-download-error": string;
+  /**
+   * The live output mode changed (`commands::set_output_mode`), emitted for
+   * either trigger — the status window's toggle button or the tray menu's
+   * item — so the window's state can't drift from the tray's.
+   */
+  "output-mode-changed": OutputModeSetting;
 }
 
 /**
