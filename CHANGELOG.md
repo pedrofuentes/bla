@@ -15,10 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shows "Hold `<hotkey>` to dictate", the live output mode with a
   Cursor/File toggle (`set_output_mode`), the selected Whisper model's
   ready/downloading/error status (`download_selected_model` +
-  `model-download-progress`/`model-download-error` events), and a
-  labeled "Full settings coming in M2" summary; it subscribes to the
+  `model-download-progress`/`model-download-complete`/`model-download-error`
+  events — completion flips the window out of "Downloading…" to Ready), and
+  a labeled "Full settings coming in M2" summary; it subscribes to the
   existing `pipeline-state-changed` event to reflect Idle/Recording/
-  Transcribing/Error live. Display formatting (hotkey chord → readable
+  Transcribing/Error live, and to an `output-mode-changed` event so a
+  tray-menu toggle keeps the window's state in sync. Display formatting (hotkey chord → readable
   label, status/mode/model copy) is factored into pure, Vitest-covered
   helpers (`src/lib/status.ts`) so `App.tsx` stays a thin view. A real
   `TrayIconBuilder`-built tray icon (`lib.rs::run()`'s `setup()`) now wires
@@ -26,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   logic: the icon and a disabled menu line track pipeline state live, and
   a Cursor/File menu toggle calls the *same* `commands::set_output_mode`
   path as the status window's button (AC-14), so tray- and
-  window-triggered switches can never disagree. Show/Hide/Quit menu items
+  window-triggered switches can never disagree; tray icon/menu mutations
+  are marshaled onto the main thread (`run_on_main_thread`) since they run
+  from pipeline/shortcut-callback threads and AppKit objects must only be
+  touched on the main thread on macOS. Show/Hide/Quit menu items
   round out the menu; closing the window now hides it instead of quitting
   (the tray's Quit item is the only way to exit) — a small placeholder
   monochrome icon set ships under `src-tauri/icons/tray/`. Default hotkey
