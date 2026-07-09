@@ -505,6 +505,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_actual_settings_default_hotkey_avoids_the_macos_only_option_alias_issue_110() {
+        // Issue #110: the default used to be "Control+Option+Space".
+        // "Option" is macOS terminology for the Alt key; even though the
+        // parser accepts it as a synonym for Alt on every platform (the test
+        // above), shipping it as the *default* reads as unfamiliar on
+        // Windows. Pin the default away from that alias (and any other
+        // macOS-only spelling) so this can't silently regress, on top of
+        // the parses-everywhere assertion above.
+        let default_hotkey = crate::settings::Settings::default().hotkey;
+        let upper = default_hotkey.to_uppercase();
+        assert!(
+            !upper.contains("OPTION"),
+            "the default hotkey {default_hotkey:?} must not rely on the macOS-only \
+             \"Option\" spelling of the Alt modifier"
+        );
+        assert!(
+            validate_hotkey(&default_hotkey).is_ok(),
+            "the default hotkey {default_hotkey:?} must parse as a registrable \
+             accelerator on every platform"
+        );
+    }
+
     // Keys outside the configured chord must be inert.
     #[test]
     fn unrelated_keys_are_ignored() {
