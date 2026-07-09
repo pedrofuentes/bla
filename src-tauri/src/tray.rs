@@ -2,11 +2,14 @@
 //! next-dictation (issue #23, AC-14).
 //!
 //! All logic in this module is pure — no OS calls, fully deterministic. The
-//! real Tauri tray icon/menu rendering (`TrayIconBuilder`, asset paths) is
-//! thin OS-glue (AGENTS.md OS-integration exemption): it is not wired up in
-//! this increment (`lib.rs::run()` doesn't call into this module yet), kept
-//! separate and minimal so it stays TDD-exempt while every decision it will
-//! eventually delegate to already has full unit coverage here.
+//! real Tauri tray icon/menu rendering (`TrayIconBuilder`, asset paths,
+//! `tauri::menu` wiring) is thin OS-glue (AGENTS.md OS-integration
+//! exemption) that lives in `lib.rs::run()`'s `setup()` (issue #110): it
+//! builds the tray icon/menu and, on every `set_pipeline_state` call, maps
+//! the current `PipelineState` through [`tray_icon_state`] here to decide
+//! which bundled icon (`icons/tray/*.png`) and menu-state label to show.
+//! Kept separate and minimal so this module stays TDD-exempt while every
+//! decision it delegates to already has full unit coverage here.
 //!
 //! Note: `OutputMode` here is a tray-local model of *which target is live*
 //! (a plain two-way switch) — distinct from `output::OutputMode`, which

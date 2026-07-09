@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- M1 minimal shell (issue #110): replaced the create-tauri-app boilerplate
+  (greet demo) with a real status window and a system-tray/menu-bar icon —
+  MISSION §4's "minimal shell". The status window reads `get_settings` and
+  shows "Hold `<hotkey>` to dictate", the live output mode with a
+  Cursor/File toggle (`set_output_mode`), the selected Whisper model's
+  ready/downloading/error status (`download_selected_model` +
+  `model-download-progress`/`model-download-complete`/`model-download-error`
+  events — completion flips the window out of "Downloading…" to Ready), and
+  a labeled "Full settings coming in M2" summary; it subscribes to the
+  existing `pipeline-state-changed` event to reflect Idle/Recording/
+  Transcribing/Error live, and to an `output-mode-changed` event so a
+  tray-menu toggle keeps the window's state in sync. Display formatting (hotkey chord → readable
+  label, status/mode/model copy) is factored into pure, Vitest-covered
+  helpers (`src/lib/status.ts`) so `App.tsx` stays a thin view. A real
+  `TrayIconBuilder`-built tray icon (`lib.rs::run()`'s `setup()`) now wires
+  to the already-tested `tray::tray_icon_state`/`tray::OutputModeSwitch`
+  logic: the icon and a disabled menu line track pipeline state live, and
+  a Cursor/File menu toggle calls the *same* `commands::set_output_mode`
+  path as the status window's button (AC-14), so tray- and
+  window-triggered switches can never disagree; tray icon/menu mutations
+  are marshaled onto the main thread (`run_on_main_thread`) since they run
+  from pipeline/shortcut-callback threads and AppKit objects must only be
+  touched on the main thread on macOS. Show/Hide/Quit menu items
+  round out the menu; closing the window now hides it instead of quitting
+  (the tray's Quit item is the only way to exit) — a small placeholder
+  monochrome icon set ships under `src-tauri/icons/tray/`. Default hotkey
+  changed from `Control+Option+Space` to `Control+Shift+Space`: the parser
+  already accepted the macOS-only "Option" spelling of Alt on every
+  platform, but shipping it as the *default* read as unfamiliar on
+  Windows — the new default uses only modifier names spelled identically
+  on both platforms, with a regression test pinning that choice.
 - Runtime wiring (issue #91): the global hotkey (`tauri-plugin-global-shortcut`)
   now drives the `hotkeys` state machine end to end — on release, the
   captured audio window runs through `pipeline::Pipeline`

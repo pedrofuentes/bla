@@ -7,11 +7,11 @@
 //! window itself is M2; these commands exist so that UI has something real
 //! to call against as of this increment, issue #91).
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
-    register_hotkey, save_settings_to_store, spec_for_preset, to_models_preset,
-    to_tray_output_mode, AppState,
+    output_mode_toggle_label, register_hotkey, save_settings_to_store, spec_for_preset,
+    to_models_preset, to_tray_output_mode, AppState,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -61,22 +61,43 @@ pub fn set_settings(
 
 /// Switch the live output-mode target (AC-14) without otherwise touching
 /// settings. `set_settings` also updates this as part of a full settings
-/// save; this is the lightweight path for a bare tray-menu toggle.
+/// save; this is the lightweight path both the status window's toggle
+/// button and the tray menu's Cursor/File item call (issue #110) — the
+/// single shared path keeps `tray::OutputModeSwitch`, persisted `Settings`,
+/// and the tray menu's own label all in agreement regardless of which
+/// trigger fired.
 #[tauri::command]
 pub fn set_output_mode(
     app: AppHandle,
     state: State<'_, AppState>,
     mode: crate::settings::OutputModeSetting,
 ) -> Result<(), String> {
-    state
-        .output_switch
-        .lock()
-        .unwrap()
-        .set_mode(to_tray_output_mode(mode));
+    let tray_mode = to_tray_output_mode(mode);
+    state.output_switch.lock().unwrap().set_mode(tray_mode);
 
-    let mut settings = state.settings.lock().unwrap();
-    settings.output_mode = mode;
-    save_settings_to_store(&app, &settings)
+    {
+        let mut settings = state.settings.lock().unwrap();
+        settings.output_mode = mode;
+        save_settings_to_store(&app, &settings)?;
+    }
+
+    // Issue #110: best-effort — the tray may not have finished building yet
+    // (or this build has no tray item at all in a future headless context),
+    // and a failure to relabel the menu must never fail the mode switch
+    // itself, which has already been persisted above.
+    if let Some(item) = state.tray_output_toggle_item.lock().unwrap().as_ref() {
+        let _ = item.set_text(output_mode_toggle_label(tray_mode));
+    }
+
+    // Issue #110: this command is called from BOTH the status window's
+    // toggle button and the tray menu's item. A tray-triggered switch never
+    // runs the window's React handler, so without this the window's state
+    // goes stale (it and the tray would disagree about the live mode).
+    // Emit the new mode so the window reconciles regardless of which trigger
+    // fired — the brief required window and tray always agree.
+    let _ = app.emit("output-mode-changed", mode);
+
+    Ok(())
 }
 
 /// Kicks the first-run Whisper model downloader for the currently selected
@@ -84,8 +105,8 @@ pub fn set_output_mode(
 /// Returns immediately with `"already-present"` if the model file already
 /// exists, or `"downloading"` once the background download has started;
 /// progress is reported via the `model-download-progress` event
-/// (`models::DownloadProgress`) and a terminal `model-download-error` event
-/// on failure.
+/// (`models::DownloadProgress`), with a terminal `model-download-complete`
+/// event on success or `model-download-error` on failure.
 #[tauri::command]
 pub fn download_selected_model(
     app: AppHandle,
@@ -102,7 +123,6 @@ pub fn download_selected_model(
 
     let progress_handle = app.clone();
     std::thread::spawn(move || {
-        use tauri::Emitter;
         let transport = crate::models::UreqTransport::new();
         let result = crate::models::download_model_with_spec(&transport, &spec, &app_data_dir, {
             let progress_handle = progress_handle.clone();
@@ -110,8 +130,16 @@ pub fn download_selected_model(
                 let _ = progress_handle.emit("model-download-progress", progress);
             }
         });
-        if let Err(err) = result {
-            let _ = progress_handle.emit("model-download-error", err.to_string());
+        match result {
+            // Issue #110: signal completion so the UI leaves the
+            // "Downloading… 100%" state and shows Ready (mirrors the
+            // first-run path in lib.rs::run()'s setup()).
+            Ok(_) => {
+                let _ = progress_handle.emit("model-download-complete", ());
+            }
+            Err(err) => {
+                let _ = progress_handle.emit("model-download-error", err.to_string());
+            }
         }
     });
 

@@ -65,7 +65,18 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            hotkey: "Control+Option+Space".to_string(),
+            // Issue #110: previously "Control+Option+Space". "Option" is
+            // macOS terminology for the Alt key — the accelerator parser
+            // (`tauri_plugin_global_shortcut::Shortcut::from_str`) accepts
+            // it as an alias for Alt on every platform (see
+            // `hotkeys::the_actual_settings_default_hotkey_parses_on_every_platform_issue_98`),
+            // but shipping a macOS-flavored default reads as unfamiliar on
+            // Windows and risks colliding with Alt-based window/menu
+            // accelerators there. `Control+Shift+Space` uses only modifier
+            // names that mean the same thing, spelled the same way, on both
+            // platforms — a documented cross-platform combo with no reliance
+            // on a platform-specific alias.
+            hotkey: "Control+Shift+Space".to_string(),
             recording_mode: RecordingMode::Hold,
             model_preset: ModelPreset::LargeV3Turbo,
             output_mode: OutputModeSetting::Cursor,
