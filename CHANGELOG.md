@@ -265,6 +265,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Windows remain thin glue, verified for real by the cofounder's
   `pnpm tauri:dev` run rather than by this repo's macOS-only test suite.
 
+### Performance
+
+- **#115** Cache the Whisper model across dictations instead of reloading it
+  from disk on every one (the cofounder's smoke test found dictation working
+  but slow: `WhisperContext::new_with_params` — a ~574 MB read for the
+  default `large-v3-turbo` preset — was re-run per dictation).
+  `AppState::stt_cache` now holds an `Arc<stt::WhisperStt>` keyed by the
+  `settings::ModelPreset` it was built for; `lib.rs::build_stt` reuses that
+  `Arc` (a refcount clone, not a reload) whenever the cache already holds the
+  currently-selected preset, and rebuilds — replacing the cache entry — only
+  when the preset changes or the cache is empty. The reuse-vs-rebuild
+  decision is factored into a pure, unit-tested function
+  (`should_reuse_cached_stt`); the `WhisperContext` build/store itself stays
+  native glue (TDD-exempt) since it needs a real model file. The cache is
+  also warmed in the background (`spawn_stt_cache_warm`, never on the
+  main/UI thread) both at startup — if the selected model is already on disk
+  — and right after the first-run model download completes (hooking the
+  `model-download-complete` event added in #111) — so even the *first*
+  dictation of a session is fast, not just the second one onward; a warm-up
+  failure is logged and leaves the cache empty, falling back to the
+  dictation path's own lazy build rather than panicking.
+  `WhisperStt::transcribe` is unchanged in shape — it still creates a fresh
+  `WhisperState` per call via `create_state()`, the correct cheap per-call
+  scratch; only the expensive `WhisperContext` load is now shared/cached.
+  Also (behind `--features whisper`): flash attention is enabled on the
+  context (`WhisperContextParameters::flash_attn(true)`) and decoding now
+  uses every available core (`FullParams::set_n_threads`,
+  `std::thread::available_parallelism()`, falling back to 4) instead of
+  whisper.cpp's conservative `min(4, hardware_concurrency())` default — both
+  pure decode-latency wins verified against the actual whisper-rs 0.16
+  source (native glue, TDD-exempt; the cofounder's re-run is the real
+  latency verification).
+
 ### Fixed
 
 - **#65** `output::paste_via_clipboard_swap` now restores the saved
