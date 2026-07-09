@@ -87,7 +87,8 @@
   - The **AC-7 cofounder smoke test** is `human-required` at every milestone close — never time-boxed, never auto-proceeded.
   - Any addition to the product's §5 network allowlist is `human-required` (restating the floor: this includes swapping model sources).
   - Heavy native dependencies beyond the §3 list (new C/C++-linking crates) are `time-boxed` with a transitive-risk note.
-- **Pre-authorized specifics (`auto`):** the §3 stack + transitive build/test/lint tooling; downloading Whisper GGUF models from huggingface.co for dev/test; standard CI (build matrix macOS + Windows build/test, lint, Sentinel Method B, scanners).
+  - **No AI/LLM review gate in CI** (cofounder DECISION, issue #121): CI must not call a hosted language model to review PRs. Deterministic checks only. This is `human-required` to reverse — an agent may not re-add or re-enable an LLM-in-CI review gate on its own.
+- **Pre-authorized specifics (`auto`):** the §3 stack + transitive build/test/lint tooling; downloading Whisper GGUF models from huggingface.co for dev/test; standard CI (build matrix macOS + Windows build/test, lint, scanners).
 
 ## 10. Resource governance (concurrency & cost)
 - **Max concurrent workers / worktrees:** 3
