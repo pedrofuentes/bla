@@ -64,6 +64,21 @@ mod store;
 pub mod stt;
 pub mod tray;
 
+/// The Whisper engine cached in [`AppState::stt_cache`] (issue #115), keyed
+/// by the [`settings::ModelPreset`] it was built for so a later preset
+/// switch is detected (see [`should_reuse_cached_stt`]) rather than silently
+/// serving transcriptions from the wrong model. `Arc` (not a bare
+/// `WhisperStt`) so the cache can hand a dictation thread a cheap refcount
+/// clone of the already-loaded engine instead of moving/rebuilding it —
+/// `whisper_rs::WhisperContext` is `Send + Sync`, and `WhisperStt::transcribe`
+/// still creates a fresh `WhisperState` per call (the correct cheap per-call
+/// scratch; only the expensive context load itself is shared/cached here).
+#[cfg(feature = "whisper")]
+struct CachedStt {
+    preset: settings::ModelPreset,
+    stt: Arc<stt::WhisperStt>,
+}
+
 /// Shared runtime state the OS glue below drives (issue #91): the hotkeys
 /// state machine, the live audio capture session, and pipeline/output
 /// state. Everything is behind a `Mutex` since Tauri commands and plugin
@@ -88,6 +103,14 @@ pub(crate) struct AppState {
     /// so tray- and window-triggered switches never disagree about which
     /// mode is live.
     tray_output_toggle_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// Issue #115: the cached Whisper engine, so it's loaded from disk (a
+    /// ~574 MB read for the default preset) at most once per selected
+    /// preset rather than on every dictation. `None` until the first build
+    /// (lazily, from `build_stt`, or eagerly from a background warm —
+    /// see `spawn_stt_cache_warm`). Only present in `--features whisper`
+    /// builds; the default build has no `WhisperStt` to cache.
+    #[cfg(feature = "whisper")]
+    stt_cache: Mutex<Option<CachedStt>>,
 }
 
 /// Max capacity of the capture ring buffer: a generous 5 minutes at 16 kHz
@@ -146,9 +169,67 @@ fn output_mode_toggle_label(current: tray::OutputMode) -> String {
     }
 }
 
+/// Issue #115's pure reuse-vs-rebuild decision for the cached Whisper
+/// engine: `true` only when a cached engine exists (`cached: Some(_)`) AND
+/// it was built for exactly the currently-selected `wanted` preset.
+/// Anything else — nothing cached yet, or the cached engine is for a
+/// *different* preset than the one now selected (the user switched models)
+/// — must rebuild. `build_stt`/`spawn_stt_cache_warm` (native glue,
+/// TDD-exempt) are the only callers; this decision itself has no OS/Tauri
+/// dependency, so it's independently unit-tested without a whisper model or
+/// a live `AppState`. Its only production callers (`build_stt`,
+/// `spawn_stt_cache_warm`) are behind `--features whisper`, so the default
+/// build's non-test compile never calls it — `allow(dead_code)` there is
+/// deliberate (mirrors `models.rs`'s own module-level allowance for a
+/// similar not-yet-wired-in-this-build situation), not a sign it's unused
+/// dead logic; the tests above exercise it in every build.
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+fn should_reuse_cached_stt(
+    cached: Option<&settings::ModelPreset>,
+    wanted: &settings::ModelPreset,
+) -> bool {
+    cached == Some(wanted)
+}
+
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+
+    #[test]
+    fn should_reuse_cached_stt_reuses_when_the_cached_preset_matches_issue_115() {
+        assert!(should_reuse_cached_stt(
+            Some(&settings::ModelPreset::LargeV3Turbo),
+            &settings::ModelPreset::LargeV3Turbo
+        ));
+        assert!(should_reuse_cached_stt(
+            Some(&settings::ModelPreset::Small),
+            &settings::ModelPreset::Small
+        ));
+    }
+
+    #[test]
+    fn should_reuse_cached_stt_rebuilds_when_the_selected_preset_differs_issue_115() {
+        assert!(!should_reuse_cached_stt(
+            Some(&settings::ModelPreset::LargeV3Turbo),
+            &settings::ModelPreset::Small
+        ));
+        assert!(!should_reuse_cached_stt(
+            Some(&settings::ModelPreset::Small),
+            &settings::ModelPreset::LargeV3Turbo
+        ));
+    }
+
+    #[test]
+    fn should_reuse_cached_stt_rebuilds_when_the_cache_is_empty_issue_115() {
+        assert!(!should_reuse_cached_stt(
+            None,
+            &settings::ModelPreset::LargeV3Turbo
+        ));
+        assert!(!should_reuse_cached_stt(
+            None,
+            &settings::ModelPreset::Small
+        ));
+    }
 
     #[test]
     fn output_mode_toggle_label_names_the_mode_it_would_switch_to() {
@@ -440,14 +521,43 @@ fn toggle_output_mode_from_tray(app: &tauri::AppHandle) {
 /// resolving the model path from `settings`/`app_data_dir` via `models`'s
 /// already-tested registry lookup (native glue, TDD-exempt per `stt.rs`'s
 /// own module doc).
+///
+/// Issue #115: reuses `cache`'s already-built engine when
+/// [`should_reuse_cached_stt`] says the cached preset still matches
+/// `settings.model_preset` — returning an `Arc` clone (a refcount bump, not
+/// a reload) rather than paying the ~574 MB `WhisperContext::new_with_params`
+/// load again on every dictation. Only rebuilds (and replaces the cache
+/// entry) when the cache is empty or the user switched presets. The whole
+/// check-then-build-then-store sequence runs under `cache`'s lock, so two
+/// dictations racing on an empty/stale cache can't both pay the load cost —
+/// the second simply reuses whatever the first just stored — at the cost of
+/// (harmlessly) blocking a concurrent dictation behind an in-progress
+/// rebuild rather than double-loading.
 #[cfg(feature = "whisper")]
 fn build_stt(
     settings: &settings::Settings,
     app_data_dir: &std::path::Path,
-) -> Result<stt::WhisperStt, String> {
-    let spec = spec_for_preset(to_models_preset(settings.model_preset));
+    cache: &Mutex<Option<CachedStt>>,
+) -> Result<Arc<stt::WhisperStt>, String> {
+    let wanted = settings.model_preset;
+    let mut guard = cache.lock().unwrap();
+    if should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &wanted) {
+        return Ok(Arc::clone(
+            &guard
+                .as_ref()
+                .expect("should_reuse_cached_stt only returns true when a cached engine exists")
+                .stt,
+        ));
+    }
+
+    let spec = spec_for_preset(to_models_preset(wanted));
     let model_path = models::model_target_path(app_data_dir, &spec);
-    stt::WhisperStt::new(&model_path).map_err(|e| e.to_string())
+    let stt = Arc::new(stt::WhisperStt::new(&model_path).map_err(|e| e.to_string())?);
+    *guard = Some(CachedStt {
+        preset: wanted,
+        stt: Arc::clone(&stt),
+    });
+    Ok(stt)
 }
 
 /// Default (no `whisper` feature) build: no real STT engine is compiled in
@@ -468,6 +578,72 @@ fn build_stt(
          `cargo tauri dev --features whisper`)"
             .to_string(),
     )
+}
+
+/// Warms `AppState::stt_cache` on a spawned thread (issue #115) so even the
+/// *first* dictation after startup/first-run download is fast, rather than
+/// paying the ~574 MB `WhisperContext` load synchronously on the first
+/// hotkey release. Callers: `setup()` at startup (if the selected model file
+/// is already on disk) and the first-run model-download-complete path (once
+/// the download finishes). Guarded by the same [`should_reuse_cached_stt`]
+/// check `build_stt` uses, so calling this when the cache already holds the
+/// right preset (e.g. a dictation already warmed it, or this is called
+/// twice) is a cheap no-op rather than a redundant reload. Never blocks its
+/// caller — the load happens entirely on the spawned thread — and a load
+/// failure is logged (structured, no transcript/model bytes) and leaves the
+/// cache empty rather than panicking: `build_stt`'s lazy path is always the
+/// fallback if warming didn't happen or failed.
+#[cfg(feature = "whisper")]
+fn spawn_stt_cache_warm(
+    app: tauri::AppHandle,
+    app_data_dir: std::path::PathBuf,
+    preset: settings::ModelPreset,
+) {
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        {
+            let guard = state.stt_cache.lock().unwrap();
+            if should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &preset) {
+                return;
+            }
+        }
+
+        let spec = spec_for_preset(to_models_preset(preset));
+        let model_path = models::model_target_path(&app_data_dir, &spec);
+        match stt::WhisperStt::new(&model_path) {
+            Ok(built) => {
+                let mut guard = state.stt_cache.lock().unwrap();
+                // Re-check under the lock: a dictation's own `build_stt` may
+                // have already loaded (and cached) this exact preset while
+                // this warm was in flight — don't clobber it with a second,
+                // redundant engine.
+                if !should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &preset) {
+                    *guard = Some(CachedStt {
+                        preset,
+                        stt: Arc::new(built),
+                    });
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "bla: background whisper model warm-up failed (dictation will load it \
+                     lazily instead): {err}"
+                );
+            }
+        }
+    });
+}
+
+/// Default (no `whisper` feature) build: nothing to warm — there is no
+/// `WhisperStt`/`stt_cache` compiled in, so this is a no-op with the same
+/// signature as the `--features whisper` build above (mirrors `build_stt`'s
+/// two-body pattern so call sites never need a feature-gated branch).
+#[cfg(not(feature = "whisper"))]
+fn spawn_stt_cache_warm(
+    _app: tauri::AppHandle,
+    _app_data_dir: std::path::PathBuf,
+    _preset: settings::ModelPreset,
+) {
 }
 
 /// Runs the dictation pipeline (issue #25's `pipeline::Pipeline`) over
@@ -514,7 +690,20 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
             cleanup::UreqTransport::default(),
         );
 
-        match build_stt(&settings, &app_data_dir) {
+        // Issue #115: `build_stt`'s two bodies differ only in whether they
+        // consult/populate `AppState::stt_cache` (whisper feature) — the
+        // default build has no cache to pass. `state` is re-fetched here
+        // (cheap: just a managed-state lookup) rather than threaded through
+        // from the block above, since only the `whisper` build needs it.
+        #[cfg(feature = "whisper")]
+        let stt_result = {
+            let state = app.state::<AppState>();
+            build_stt(&settings, &app_data_dir, &state.stt_cache)
+        };
+        #[cfg(not(feature = "whisper"))]
+        let stt_result = build_stt(&settings, &app_data_dir);
+
+        match stt_result {
             Ok(stt_engine) => {
                 let pipeline = pipeline::Pipeline::new(
                     stt_engine,
@@ -693,6 +882,8 @@ pub fn run() {
                 pipeline_state: Mutex::new(tray::PipelineState::Idle),
                 tray_state_item: Mutex::new(Some(tray_state_item)),
                 tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
+                #[cfg(feature = "whisper")]
+                stt_cache: Mutex::new(None),
             };
             app.manage(state);
 
@@ -746,11 +937,20 @@ pub fn run() {
             // AC-7 smoke test by getting a model onto disk automatically,
             // matching MISSION §9's pre-authorized "downloading Whisper
             // GGUF models from huggingface.co for dev/test".
+            //
+            // Issue #115: either way, warm `AppState::stt_cache` on a
+            // background thread rather than leaving the very first
+            // dictation to pay the ~574 MB `WhisperContext` load
+            // synchronously — if the model is already on disk, warm it now;
+            // if it still needs downloading, warm it once that finishes
+            // (right after the `model-download-complete` emit below).
             {
                 let spec = spec_for_preset(to_models_preset(settings.model_preset));
                 let target = models::model_target_path(&app_data_dir, &spec);
                 if !target.exists() {
                     let progress_handle = handle.clone();
+                    let warm_handle = handle.clone();
+                    let warm_preset = settings.model_preset;
                     std::thread::spawn(move || {
                         let transport = models::UreqTransport::new();
                         let result = models::download_model_with_spec(
@@ -771,6 +971,14 @@ pub fn run() {
                             // on.
                             Ok(_) => {
                                 let _ = handle.emit("model-download-complete", ());
+                                // Issue #115: the model just landed on disk —
+                                // warm the cache now so the first dictation
+                                // after a first-run download is still fast.
+                                spawn_stt_cache_warm(
+                                    warm_handle,
+                                    app_data_dir.clone(),
+                                    warm_preset,
+                                );
                             }
                             Err(err) => {
                                 eprintln!("bla: first-run model download failed: {err}");
@@ -778,6 +986,16 @@ pub fn run() {
                             }
                         }
                     });
+                } else {
+                    // Issue #115: the model is already on disk from a
+                    // previous run — warm the cache in the background so the
+                    // first dictation of this session doesn't pay the load
+                    // cost synchronously.
+                    spawn_stt_cache_warm(
+                        handle.clone(),
+                        app_data_dir.clone(),
+                        settings.model_preset,
+                    );
                 }
             }
 

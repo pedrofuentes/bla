@@ -155,12 +155,32 @@ impl WhisperStt {
     /// smoke test.
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self, SttError> {
         let model_path = model_path.as_ref();
-        let context = whisper_rs::WhisperContext::new_with_params(
-            model_path,
-            whisper_rs::WhisperContextParameters::default(),
-        )
-        .map_err(|e| SttError::ModelLoad(format!("{e} (path: {})", model_path.display())))?;
+        // Issue #115 decode tuning: flash attention is whisper.cpp's fused
+        // attention-computation kernel — a pure decode-latency win with no
+        // accuracy cost for the greedy, non-DTW decoding `transcribe` below
+        // does (the one thing flash attention can't combine with is DTW
+        // token-level timestamps, which this engine never requests).
+        let mut params = whisper_rs::WhisperContextParameters::default();
+        params.flash_attn(true);
+        let context = whisper_rs::WhisperContext::new_with_params(model_path, params)
+            .map_err(|e| SttError::ModelLoad(format!("{e} (path: {})", model_path.display())))?;
         Ok(Self { context })
+    }
+}
+
+/// Lets a cached, shared [`WhisperStt`] (issue #115: `AppState::stt_cache`
+/// hands dictation threads an `Arc` clone of the already-loaded engine
+/// instead of rebuilding it) satisfy [`Pipeline`](crate::pipeline::Pipeline)'s
+/// `S: Stt` bound directly, with no wrapper type. Delegates via
+/// `Arc::as_ref` rather than calling `self.transcribe(..)` (which would
+/// recurse on this very impl); the underlying `WhisperContext` is
+/// `Send + Sync`, so sharing it behind an `Arc` across dictation threads is
+/// sound, and `transcribe` still creates a fresh `WhisperState` per call
+/// either way.
+#[cfg(feature = "whisper")]
+impl Stt for std::sync::Arc<WhisperStt> {
+    fn transcribe(&self, samples: &[f32], opts: &TranscribeOpts) -> Result<String, SttError> {
+        self.as_ref().transcribe(samples, opts)
     }
 }
 
@@ -182,6 +202,19 @@ impl Stt for WhisperStt {
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);
+        // Issue #115 decode tuning: whisper.cpp's own default is
+        // `min(4, hardware_concurrency())`, deliberately conservative for a
+        // library that doesn't know how it'll be deployed. This engine is
+        // always the single, dedicated transcription worker for one
+        // dictation at a time (never run concurrently with itself), so
+        // using every available core is a straightforward decode-latency
+        // win rather than a resource-contention risk. Falls back to 4 (the
+        // same number whisper.cpp itself would pick) if the platform can't
+        // report a core count.
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4) as i32;
+        params.set_n_threads(n_threads);
         if !initial_prompt.is_empty() {
             params.set_initial_prompt(&initial_prompt);
         }
