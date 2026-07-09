@@ -10,8 +10,8 @@
 use tauri::{AppHandle, Manager, State};
 
 use crate::{
-    register_hotkey, save_settings_to_store, spec_for_preset, to_models_preset,
-    to_tray_output_mode, AppState,
+    output_mode_toggle_label, register_hotkey, save_settings_to_store, spec_for_preset,
+    to_models_preset, to_tray_output_mode, AppState,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -61,22 +61,35 @@ pub fn set_settings(
 
 /// Switch the live output-mode target (AC-14) without otherwise touching
 /// settings. `set_settings` also updates this as part of a full settings
-/// save; this is the lightweight path for a bare tray-menu toggle.
+/// save; this is the lightweight path both the status window's toggle
+/// button and the tray menu's Cursor/File item call (issue #110) — the
+/// single shared path keeps `tray::OutputModeSwitch`, persisted `Settings`,
+/// and the tray menu's own label all in agreement regardless of which
+/// trigger fired.
 #[tauri::command]
 pub fn set_output_mode(
     app: AppHandle,
     state: State<'_, AppState>,
     mode: crate::settings::OutputModeSetting,
 ) -> Result<(), String> {
-    state
-        .output_switch
-        .lock()
-        .unwrap()
-        .set_mode(to_tray_output_mode(mode));
+    let tray_mode = to_tray_output_mode(mode);
+    state.output_switch.lock().unwrap().set_mode(tray_mode);
 
-    let mut settings = state.settings.lock().unwrap();
-    settings.output_mode = mode;
-    save_settings_to_store(&app, &settings)
+    {
+        let mut settings = state.settings.lock().unwrap();
+        settings.output_mode = mode;
+        save_settings_to_store(&app, &settings)?;
+    }
+
+    // Issue #110: best-effort — the tray may not have finished building yet
+    // (or this build has no tray item at all in a future headless context),
+    // and a failure to relabel the menu must never fail the mode switch
+    // itself, which has already been persisted above.
+    if let Some(item) = state.tray_output_toggle_item.lock().unwrap().as_ref() {
+        let _ = item.set_text(output_mode_toggle_label(tray_mode));
+    }
+
+    Ok(())
 }
 
 /// Kicks the first-run Whisper model downloader for the currently selected

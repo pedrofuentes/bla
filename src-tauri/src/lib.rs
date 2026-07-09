@@ -31,9 +31,17 @@
 
 use std::sync::{Arc, Mutex};
 
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_store::StoreExt;
+
+/// Id of the single system-tray/menu-bar icon this app creates (issue #110),
+/// used to look it up again from `set_pipeline_state` via
+/// [`tauri::Manager::tray_by_id`].
+const TRAY_ID: &str = "bla-tray";
 
 pub mod audio;
 // `pub` (rather than private like their stub siblings): as of the pipeline
@@ -69,6 +77,17 @@ pub(crate) struct AppState {
     settings: Mutex<settings::Settings>,
     output_switch: Mutex<tray::OutputModeSwitch>,
     pipeline_state: Mutex<tray::PipelineState>,
+    /// The tray menu's disabled current-state line (issue #110):
+    /// `set_pipeline_state` keeps its text in sync with the emitted
+    /// `pipeline-state-changed` event/icon. `None` until `setup()` builds
+    /// the tray (always `Some` afterward).
+    tray_state_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// The tray menu's Cursor/File output-mode toggle line (issue #110):
+    /// kept in sync by `commands::set_output_mode` — the same command path
+    /// both this menu item and the status window's toggle button call —
+    /// so tray- and window-triggered switches never disagree about which
+    /// mode is live.
+    tray_output_toggle_item: Mutex<Option<MenuItem<tauri::Wry>>>,
 }
 
 /// Max capacity of the capture ring buffer: a generous 5 minutes at 16 kHz
@@ -117,9 +136,31 @@ fn spec_for_preset(preset: models::ModelPreset) -> models::ModelSpec {
         .expect("model_registry() covers every ModelPreset variant")
 }
 
+/// Label for the tray menu's output-mode toggle line (issue #110): names
+/// the mode the click would switch *to*, not the current mode, matching how
+/// a toggle control conventionally reads.
+fn output_mode_toggle_label(current: tray::OutputMode) -> String {
+    match current {
+        tray::OutputMode::CursorPaste => "Switch to File output".to_string(),
+        tray::OutputMode::File => "Switch to Cursor output".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+
+    #[test]
+    fn output_mode_toggle_label_names_the_mode_it_would_switch_to() {
+        assert_eq!(
+            output_mode_toggle_label(tray::OutputMode::CursorPaste),
+            "Switch to File output"
+        );
+        assert_eq!(
+            output_mode_toggle_label(tray::OutputMode::File),
+            "Switch to Cursor output"
+        );
+    }
 
     #[test]
     fn hotkey_mode_mapping_round_trips_every_variant() {
@@ -309,14 +350,80 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
     }
 }
 
+/// Loads the bundled placeholder tray-icon PNG for `state` (issue #110): a
+/// minimal monochrome glyph per [`tray::TrayIconState`] variant (a hollow
+/// ring for Idle, a filled dot for Active, a filled dot with a notch for
+/// Busy, an "X" for Error — see `icons/tray/`'s generator script). Loading
+/// bundled bytes isn't a live OS call, but building `tauri::image::Image`
+/// values is still Tauri-specific glue, so it lives here rather than in
+/// `tray.rs` (which stays OS-call-free per its module doc).
+fn tray_icon_image(state: tray::TrayIconState) -> Image<'static> {
+    let bytes: &[u8] = match state {
+        tray::TrayIconState::Idle => include_bytes!("../icons/tray/idle.png"),
+        tray::TrayIconState::Active => include_bytes!("../icons/tray/active.png"),
+        tray::TrayIconState::Busy => include_bytes!("../icons/tray/busy.png"),
+        tray::TrayIconState::Error => include_bytes!("../icons/tray/error.png"),
+    };
+    Image::from_bytes(bytes).expect("bundled tray icon PNGs (icons/tray/*.png) are well-formed")
+}
+
 fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
     let state = app.state::<AppState>();
     *state.pipeline_state.lock().unwrap() = new_state;
     let icon_state = tray::tray_icon_state(&new_state);
-    // Real tray icon asset rendering (TrayIconBuilder) is thin OS glue left
-    // as a follow-up (no icon assets are part of this increment); this
-    // emits the derived state so any UI/tray consumer can react to it.
-    let _ = app.emit("pipeline-state-changed", format!("{icon_state:?}"));
+    let icon_label = format!("{icon_state:?}");
+    let _ = app.emit("pipeline-state-changed", icon_label.clone());
+
+    // Issue #110: reflect the same derived state on the real tray icon +
+    // its disabled current-state menu line. Both are best-effort (`let _ =`)
+    // — a transient failure to repaint the tray must never take down the
+    // dictation pipeline itself.
+    if let Some(tray_icon) = app.tray_by_id(TRAY_ID) {
+        let _ = tray_icon.set_icon(Some(tray_icon_image(icon_state)));
+    }
+    let tray_state_item = state.tray_state_item.lock().unwrap();
+    if let Some(item) = tray_state_item.as_ref() {
+        let _ = item.set_text(&icon_label);
+    }
+}
+
+/// Dispatches a click on one of the tray menu's items (issue #110), by the
+/// id assigned when the item was built in `run()`'s `setup()`.
+fn handle_tray_menu_event(app: &tauri::AppHandle, id: &str) {
+    match id {
+        "toggle-output" => toggle_output_mode_from_tray(app),
+        "show" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        "hide" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    }
+}
+
+/// The tray menu's Cursor/File toggle (issue #110): flips to whichever mode
+/// isn't currently live and persists it through the **same**
+/// `commands::set_output_mode` path the status window's toggle button calls
+/// (AC-14), so both triggers update `tray::OutputModeSwitch`, `Settings`,
+/// and the tray menu's own label identically — there is no second, drifting
+/// copy of this decision.
+fn toggle_output_mode_from_tray(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let current = state.output_switch.lock().unwrap().route_target();
+    let next = match current {
+        tray::OutputMode::CursorPaste => settings::OutputModeSetting::File,
+        tray::OutputMode::File => settings::OutputModeSetting::Cursor,
+    };
+    if let Err(err) = commands::set_output_mode(app.clone(), state, next) {
+        eprintln!("bla: tray output-mode toggle failed to persist: {err}");
+    }
 }
 
 /// Selects the real `WhisperStt` engine under `--features whisper`,
@@ -480,12 +587,6 @@ mod clock_tests {
     }
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -493,7 +594,6 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
-            greet,
             commands::get_settings,
             commands::set_settings,
             commands::set_output_mode,
@@ -519,6 +619,54 @@ pub fn run() {
                 }
             };
 
+            // Issue #110: build the tray icon + menu before `app.manage`,
+            // since the menu items' handles are stashed in `AppState` for
+            // `set_pipeline_state`/`commands::set_output_mode` to relabel
+            // later. Menu: a disabled current-state line, the Cursor/File
+            // toggle (shares `commands::set_output_mode` with the status
+            // window), Show/Hide window, and Quit.
+            let initial_output_mode = to_tray_output_mode(settings.output_mode);
+            let tray_state_item = MenuItem::with_id(
+                &handle,
+                "state",
+                format!("{:?}", tray::tray_icon_state(&tray::PipelineState::Idle)),
+                false,
+                None::<&str>,
+            )?;
+            let tray_toggle_item = MenuItem::with_id(
+                &handle,
+                "toggle-output",
+                output_mode_toggle_label(initial_output_mode),
+                true,
+                None::<&str>,
+            )?;
+            let tray_show_item =
+                MenuItem::with_id(&handle, "show", "Show Window", true, None::<&str>)?;
+            let tray_hide_item =
+                MenuItem::with_id(&handle, "hide", "Hide Window", true, None::<&str>)?;
+            let tray_quit_item = MenuItem::with_id(&handle, "quit", "Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(
+                &handle,
+                &[
+                    &tray_state_item,
+                    &PredefinedMenuItem::separator(&handle)?,
+                    &tray_toggle_item,
+                    &PredefinedMenuItem::separator(&handle)?,
+                    &tray_show_item,
+                    &tray_hide_item,
+                    &PredefinedMenuItem::separator(&handle)?,
+                    &tray_quit_item,
+                ],
+            )?;
+            TrayIconBuilder::with_id(TRAY_ID)
+                .icon(tray_icon_image(tray::TrayIconState::Idle))
+                .icon_as_template(true)
+                .tooltip("bla")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| handle_tray_menu_event(app, event.id().as_ref()))
+                .build(&handle)?;
+
             let state = AppState {
                 hotkeys: Mutex::new(hotkeys::StateMachine::new(
                     to_hotkey_mode(settings.recording_mode),
@@ -531,10 +679,10 @@ pub fn run() {
                 diagnostics: Arc::new(audio::CaptureDiagnostics::new()),
                 capture: Mutex::new(None),
                 settings: Mutex::new(settings.clone()),
-                output_switch: Mutex::new(tray::OutputModeSwitch::new(to_tray_output_mode(
-                    settings.output_mode,
-                ))),
+                output_switch: Mutex::new(tray::OutputModeSwitch::new(initial_output_mode)),
                 pipeline_state: Mutex::new(tray::PipelineState::Idle),
+                tray_state_item: Mutex::new(Some(tray_state_item)),
+                tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
             };
             app.manage(state);
 
@@ -559,13 +707,25 @@ pub fn run() {
             }
 
             // Issue #44: reconcile a possibly-dropped KeyUp on window
-            // focus-loss so the machine can never wedge in Holding.
+            // focus-loss so the machine can never wedge in Holding. Issue
+            // #110: closing the window (the titlebar close button) hides it
+            // instead of quitting the whole app — this is a tray-resident
+            // utility now, so "close" and "quit" are deliberately different
+            // actions; the tray menu's Quit item is the only way to exit.
             if let Some(window) = app.get_webview_window("main") {
                 let focus_handle = handle.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Focused(false) = event {
+                let close_handle = handle.clone();
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Focused(false) => {
                         reconcile_hotkeys_on_focus_loss(&focus_handle);
                     }
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        if let Some(window) = close_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
+                    _ => {}
                 });
             }
 
