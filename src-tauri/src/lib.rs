@@ -156,7 +156,7 @@ fn output_mode_toggle_label(current: tray::OutputMode) -> String {
 /// dependency, so it's independently unit-tested without a whisper model or
 /// a live `AppState`.
 fn should_reuse_cached_stt(cached: Option<&settings::ModelPreset>, wanted: &settings::ModelPreset) -> bool {
-    false // TODO: implement
+    cached == Some(wanted)
 }
 
 #[cfg(test)]
