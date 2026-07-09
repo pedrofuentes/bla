@@ -51,37 +51,33 @@ describe("hotkeyInstruction", () => {
 });
 
 describe("statusLabel", () => {
-  it("labels every PipelineState distinctly", () => {
-    const labels = ["Idle", "Active", "Busy", "Error", "Unknown"] as const;
-    const seen = new Set(labels.map(statusLabel));
-    expect(seen.size).toBe(labels.length);
-  });
-
-  it("labels Idle as Idle and Error as an error message", () => {
+  // Exact-value asserts per state — pins the mapping so swapping any two
+  // labels (e.g. Active <-> Busy) fails, not just that they're all distinct.
+  it("maps each PipelineState to its exact label", () => {
     expect(statusLabel("Idle")).toBe("Idle");
+    expect(statusLabel("Active")).toBe("Recording…");
+    expect(statusLabel("Busy")).toBe("Transcribing…");
     expect(statusLabel("Error")).toBe("Something went wrong");
+    expect(statusLabel("Unknown")).toBe("Connecting…");
   });
 });
 
 describe("modeLabel / otherMode", () => {
-  it("labels Cursor and File distinctly", () => {
-    expect(modeLabel("Cursor")).not.toBe(modeLabel("File"));
+  it("maps each output mode to its exact label", () => {
+    expect(modeLabel("Cursor")).toBe("Cursor");
+    expect(modeLabel("File")).toBe("File");
   });
 
-  it("otherMode is its own inverse", () => {
-    expect(otherMode(otherMode("Cursor"))).toBe("Cursor");
-    expect(otherMode(otherMode("File"))).toBe("File");
-  });
-
-  it("otherMode never returns the mode it was given", () => {
-    expect(otherMode("Cursor")).not.toBe("Cursor");
-    expect(otherMode("File")).not.toBe("File");
+  it("otherMode returns the opposite mode", () => {
+    expect(otherMode("Cursor")).toBe("File");
+    expect(otherMode("File")).toBe("Cursor");
   });
 });
 
 describe("modelPresetLabel", () => {
-  it("labels every ModelPreset distinctly", () => {
-    expect(modelPresetLabel("LargeV3Turbo")).not.toBe(modelPresetLabel("Small"));
+  it("maps each ModelPreset to its exact label", () => {
+    expect(modelPresetLabel("LargeV3Turbo")).toBe("Whisper large-v3-turbo (quantized)");
+    expect(modelPresetLabel("Small")).toBe("Whisper small");
   });
 });
 
@@ -94,13 +90,10 @@ describe("modelStatusLabel", () => {
     expect(modelStatusLabel("downloading", undefined)).toBe("Downloading…");
   });
 
-  it("labels ready/checking/error distinctly from downloading and each other", () => {
-    const labels = [
-      modelStatusLabel("checking"),
-      modelStatusLabel("ready"),
-      modelStatusLabel("downloading"),
-      modelStatusLabel("error"),
-    ];
-    expect(new Set(labels).size).toBe(labels.length);
+  // Exact-value asserts per status — a swap of any two labels must fail.
+  it("maps each non-progress status to its exact label", () => {
+    expect(modelStatusLabel("checking")).toBe("Checking…");
+    expect(modelStatusLabel("ready")).toBe("Ready");
+    expect(modelStatusLabel("error")).toBe("Download failed");
   });
 });
