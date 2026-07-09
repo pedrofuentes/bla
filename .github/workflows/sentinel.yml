@@ -51,8 +51,22 @@ name: sentinel
 # only and self-edit protection does NOT hold.
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  # DISABLED — cofounder decision (2026-07-09): bla does not run AI/LLM
+  # review in CI. This workflow is intentionally kept on disk for
+  # recoverability but no longer runs automatically on pull requests; it is
+  # reachable only by manual `workflow_dispatch`. The whole Sentinel-in-CI
+  # design (rationale, security model) is preserved below unchanged.
+  #
+  # To FULLY re-enable later you must do BOTH:
+  #   1. Restore the automatic trigger (uncomment the `pull_request` block).
+  #   2. Install the `ANTHROPIC_API_KEY` secret in the `ci` GitHub
+  #      Environment (without it the first step fails closed anyway).
+  # See docs/SENTINEL.md and MISSION.md §9. Rationale is recorded in the
+  # DECISION board issue linked from the PR that disabled this.
+  #
+  # pull_request:
+  #   types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
