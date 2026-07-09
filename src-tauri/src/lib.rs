@@ -146,9 +146,55 @@ fn output_mode_toggle_label(current: tray::OutputMode) -> String {
     }
 }
 
+/// Issue #115's pure reuse-vs-rebuild decision for the cached Whisper
+/// engine: `true` only when a cached engine exists (`cached: Some(_)`) AND
+/// it was built for exactly the currently-selected `wanted` preset.
+/// Anything else — nothing cached yet, or the cached engine is for a
+/// *different* preset than the one now selected (the user switched models)
+/// — must rebuild. `build_stt`/`spawn_stt_cache_warm` (native glue,
+/// TDD-exempt) are the only callers; this decision itself has no OS/Tauri
+/// dependency, so it's independently unit-tested without a whisper model or
+/// a live `AppState`.
+fn should_reuse_cached_stt(cached: Option<&settings::ModelPreset>, wanted: &settings::ModelPreset) -> bool {
+    false // TODO: implement
+}
+
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+
+    #[test]
+    fn should_reuse_cached_stt_reuses_when_the_cached_preset_matches_issue_115() {
+        assert!(should_reuse_cached_stt(
+            Some(&settings::ModelPreset::LargeV3Turbo),
+            &settings::ModelPreset::LargeV3Turbo
+        ));
+        assert!(should_reuse_cached_stt(
+            Some(&settings::ModelPreset::Small),
+            &settings::ModelPreset::Small
+        ));
+    }
+
+    #[test]
+    fn should_reuse_cached_stt_rebuilds_when_the_selected_preset_differs_issue_115() {
+        assert!(!should_reuse_cached_stt(
+            Some(&settings::ModelPreset::LargeV3Turbo),
+            &settings::ModelPreset::Small
+        ));
+        assert!(!should_reuse_cached_stt(
+            Some(&settings::ModelPreset::Small),
+            &settings::ModelPreset::LargeV3Turbo
+        ));
+    }
+
+    #[test]
+    fn should_reuse_cached_stt_rebuilds_when_the_cache_is_empty_issue_115() {
+        assert!(!should_reuse_cached_stt(
+            None,
+            &settings::ModelPreset::LargeV3Turbo
+        ));
+        assert!(!should_reuse_cached_stt(None, &settings::ModelPreset::Small));
+    }
 
     #[test]
     fn output_mode_toggle_label_names_the_mode_it_would_switch_to() {
