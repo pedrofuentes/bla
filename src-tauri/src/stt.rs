@@ -20,6 +20,38 @@
 #[cfg(feature = "whisper")]
 use std::path::Path;
 
+/// Pure decision for whether opt-in performance logging is active, given the
+/// raw value of the `BLA_PERF_LOG` environment variable (`None` = unset).
+///
+/// Perf logging (issue #115 follow-up) is a measurement aid for the
+/// dictation hot path — model-load duration, per-dictation transcription
+/// latency, and cache hit/miss — so the caching/decode-tuning win can be
+/// read as numbers instead of judged by feel. It's **off by default** and
+/// enabled only when the variable is present and not an explicit disable
+/// (`"0"` or empty), so a normal run stays silent and `BLA_PERF_LOG=1`
+/// turns it on. Factored out as a pure function so the gating rule is
+/// unit-tested without touching real process env or stderr.
+pub fn perf_logging_enabled(env_value: Option<&str>) -> bool {
+    // STUB (test-first): real logic lands in the follow-up commit.
+    let _ = env_value;
+    false
+}
+
+/// Emits `msg` to stderr as a `bla[perf]` line, but only when
+/// [`perf_logging_enabled`] says so for the current `BLA_PERF_LOG` value
+/// (read once and cached). Callers pass timing/enum diagnostics **only** —
+/// never transcript, clipboard, or audio content (MISSION §7 no-log
+/// invariant); this helper is for measuring latency, not inspecting output.
+pub fn perf_log(msg: &str) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED
+        .get_or_init(|| perf_logging_enabled(std::env::var("BLA_PERF_LOG").ok().as_deref()));
+    if enabled {
+        eprintln!("bla[perf]: {msg}");
+    }
+}
+
 /// Errors returned by [`Stt::transcribe`] or [`WhisperStt::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SttError {
@@ -265,6 +297,25 @@ mod tests {
 
     fn terms(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn perf_logging_is_off_when_unset_or_explicitly_disabled() {
+        // Default posture: a normal run (no BLA_PERF_LOG) stays silent, and
+        // an explicit disable ("0" or empty) is honored — so perf output
+        // never leaks into an ordinary session.
+        assert!(!perf_logging_enabled(None));
+        assert!(!perf_logging_enabled(Some("")));
+        assert!(!perf_logging_enabled(Some("0")));
+    }
+
+    #[test]
+    fn perf_logging_is_on_when_set_to_a_non_disable_value() {
+        // Any present, non-disable value turns it on — the measurement
+        // opt-in (`BLA_PERF_LOG=1`) and forgiving variants.
+        assert!(perf_logging_enabled(Some("1")));
+        assert!(perf_logging_enabled(Some("true")));
+        assert!(perf_logging_enabled(Some("yes")));
     }
 
     #[test]
