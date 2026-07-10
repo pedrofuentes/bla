@@ -262,8 +262,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `tauri-plugin-global-shortcut` registers with, so a corrupt default could
   never leave `resolve_effective_hotkey`'s fallback with nothing valid to
   fall back to. `enigo`/`arboard` OS calls and `cpal`'s WASAPI selection on
-  Windows remain thin glue, verified for real by the cofounder's
-  `pnpm tauri:dev` run rather than by this repo's macOS-only test suite.
+  Windows remain thin glue; their real Windows runtime behavior is out of
+  scope for this repo's macOS-only test suite and stays an AC-7 human
+  smoke-test concern (the cofounder's pending `pnpm tauri:dev` run on
+  Windows) — not something this pass verifies (#106).
 
 ### Performance
 
