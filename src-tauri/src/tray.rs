@@ -93,6 +93,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pill_visibility_for_hides_on_idle_and_shows_otherwise_issue_126() {
+        assert!(!pill_visibility_for(&PipelineState::Idle));
+        assert!(pill_visibility_for(&PipelineState::Recording));
+        assert!(pill_visibility_for(&PipelineState::Transcribing));
+        assert!(pill_visibility_for(&PipelineState::Error));
+    }
+
+    #[test]
     fn tray_icon_state_maps_every_pipeline_state_ac14() {
         assert_eq!(tray_icon_state(&PipelineState::Idle), TrayIconState::Idle);
         assert_eq!(
