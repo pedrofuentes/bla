@@ -315,6 +315,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **#118 / #117** `build_stt` no longer holds the `stt_cache` mutex across
+  the multi-second `WhisperStt::new` model load. The dictation path now
+  mirrors `spawn_stt_cache_warm`'s pattern — check for a cache hit under a
+  narrow lock scope, release, load the ~574 MB model with no lock held, then
+  re-acquire and re-check before populating. Before this fix, a panic inside
+  the native load (e.g. a corrupt/truncated model) unwound while holding the
+  guard, poisoning the mutex so every later dictation *and* the background
+  warm panicked on `lock().unwrap()` — leaving dictation dead until an app
+  restart (#118). Loading outside the lock also stops a first-launch
+  dictation and the background warm from serializing on, or redundantly
+  double-loading, the model (#117).
 - **#65** `output::paste_via_clipboard_swap` now restores the saved
   clipboard on every error path (a failing paste synthesizer — e.g.
   `enigo` failing on first-run macOS before Accessibility is granted —
