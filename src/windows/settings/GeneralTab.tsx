@@ -25,6 +25,21 @@ type SaveStatus = "idle" | "saving" | "saved";
  * immediately, and `handleSave` refuses to call `set_settings` at all while
  * a validation error is outstanding — an invalid hotkey can never reach
  * `set_settings` from this form.
+ *
+ * Event subscriptions (PR #134 Sentinel 🔴-1) are established individually,
+ * not via a single `Promise.all`: a rejected subscription (the observable
+ * shape of a capability/ACL misconfiguration — exactly what silently broke
+ * this window when `capabilities/` only covered the main window) is
+ * surfaced in the UI instead of vanishing as an unhandled rejection, and
+ * the subscriptions that DID succeed keep their unlisten cleanup on
+ * unmount. The window's own event access is granted by
+ * `src-tauri/capabilities/settings.json`.
+ *
+ * The `settings` snapshot tracks `output-mode-changed` (PR #134 Sentinel
+ * 🔴-2, mirroring `App.tsx`): the tray menu / status window can flip the
+ * output mode while this window is open, and Save spreads the snapshot into
+ * a full `set_settings` payload — without the subscription, Save would
+ * silently revert + re-persist the concurrent change.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -37,6 +52,7 @@ export function GeneralTab() {
   const [downloadPercent, setDownloadPercent] = useState<number | undefined>(undefined);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [eventsError, setEventsError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,7 +81,12 @@ export function GeneralTab() {
         }
       });
 
-    const unlisten = Promise.all([
+    // PR #134 Sentinel 🔴-1: NOT a single Promise.all — one rejected
+    // subscription must neither hide the failure (it's surfaced via
+    // eventsError) nor discard the unlisten cleanup of the subscriptions
+    // that succeeded.
+    const active: Array<() => void> = [];
+    const subscriptions: Array<Promise<() => void>> = [
       onEvent("model-download-progress", (progress) => {
         if (cancelled) return;
         setModelStatus("downloading");
@@ -82,11 +103,30 @@ export function GeneralTab() {
           setSaveError(message);
         }
       }),
-    ]);
+      // PR #134 Sentinel 🔴-2 (mirrors App.tsx): keep the snapshot Save
+      // spreads in sync with tray-/status-window-triggered mode switches.
+      onEvent("output-mode-changed", (mode) => {
+        if (!cancelled) {
+          setSettings((prev) => (prev ? { ...prev, output_mode: mode } : prev));
+        }
+      }),
+    ];
+    for (const subscription of subscriptions) {
+      subscription
+        .then((unlisten) => {
+          // Resolved after unmount: unsubscribe immediately instead of
+          // pushing to a list nobody will drain.
+          if (cancelled) unlisten();
+          else active.push(unlisten);
+        })
+        .catch((err) => {
+          if (!cancelled) setEventsError(String(err));
+        });
+    }
 
     return () => {
       cancelled = true;
-      unlisten.then((fns) => fns.forEach((fn) => fn()));
+      for (const unlisten of active) unlisten();
     };
   }, []);
 
@@ -227,10 +267,16 @@ export function GeneralTab() {
             </option>
           ))}
         </select>
-        <p className="text-xs text-neutral-500 dark:text-neutral-400">
+        <p data-testid="model-status" className="text-xs text-neutral-500 dark:text-neutral-400">
           {modelStatusLabel(modelStatus, downloadPercent)}
         </p>
       </div>
+
+      {eventsError && (
+        <p data-testid="events-error" className="text-xs text-red-600 dark:text-red-400">
+          Live status updates are unavailable: {eventsError}
+        </p>
+      )}
 
       {saveError && (
         <p data-testid="save-error" className="text-xs text-red-600 dark:text-red-400">
