@@ -117,10 +117,22 @@ jobs:
           $llvmBin = "$env:ProgramFiles\LLVM\bin"
           if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
             Write-Host "libclang.dll not found at $llvmBin — installing LLVM via Chocolatey."
-            choco install llvm -y --no-progress
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "choco install llvm failed with exit code $LASTEXITCODE"
-              exit 1
+            # Bounded retry (#109): a `choco install` can fail transiently
+            # (network blip, rate-limit, mirror hiccup). Retry a few times with
+            # a short backoff before failing the job, so a flaky download on the
+            # fallback path doesn't red a build that would otherwise pass. This
+            # runs ONLY on a bare runner missing the pre-installed LLVM, so the
+            # common (pre-installed) path is unaffected.
+            $maxAttempts = 3
+            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+              choco install llvm -y --no-progress
+              if ($LASTEXITCODE -eq 0) { break }
+              if ($attempt -eq $maxAttempts) {
+                Write-Error "choco install llvm failed with exit code $LASTEXITCODE after $maxAttempts attempts"
+                exit 1
+              }
+              Write-Host "choco install llvm failed (attempt $attempt/$maxAttempts, exit $LASTEXITCODE) — retrying in 15s."
+              Start-Sleep -Seconds 15
             }
           } else {
             Write-Host "Using pre-installed LLVM at $llvmBin (windows-latest image)."
