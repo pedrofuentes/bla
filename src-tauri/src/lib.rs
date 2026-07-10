@@ -540,14 +540,49 @@ fn build_stt(
     cache: &Mutex<Option<CachedStt>>,
 ) -> Result<Arc<stt::WhisperStt>, String> {
     let wanted = settings.model_preset;
+
+    // Fast path in a narrow lock scope: check for a HIT, then *release* the
+    // guard before doing anything slow. Issues #117/#118: the cache lock is
+    // never held across the multi-second `WhisperStt::new` load below, so a
+    // panic in that native load can't poison the mutex (which would otherwise
+    // wedge every later dictation *and* the warm thread), and a concurrent
+    // background warm isn't blocked for the whole load. Mirrors
+    // `spawn_stt_cache_warm`'s check → release → load → re-check → populate.
+    {
+        let guard = cache.lock().unwrap();
+        if should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &wanted) {
+            // Perf instrumentation (issue #115 follow-up): a cache HIT means
+            // this dictation paid no model-load cost — the whole point of #115.
+            // Off unless BLA_PERF_LOG is set.
+            stt::perf_log(&format!(
+                "dictation: whisper cache HIT (preset={wanted:?}) — reused, no reload"
+            ));
+            return Ok(Arc::clone(
+                &guard
+                    .as_ref()
+                    .expect("should_reuse_cached_stt only returns true when a cached engine exists")
+                    .stt,
+            ));
+        }
+    }
+
+    // Perf instrumentation: a cache MISS pays the model load inline on the
+    // dictation thread (WhisperStt::new logs the load ms) — expected only on
+    // the first dictation of a preset before the background warm lands, or
+    // right after a preset switch. Loaded with NO lock held (see above).
+    stt::perf_log(&format!(
+        "dictation: whisper cache MISS (preset={wanted:?}) — loading model now"
+    ));
+    let spec = spec_for_preset(to_models_preset(wanted));
+    let model_path = models::model_target_path(app_data_dir, &spec);
+    let stt = Arc::new(stt::WhisperStt::new(&model_path).map_err(|e| e.to_string())?);
+
+    // Re-acquire and re-check under the lock: a concurrent background warm (or
+    // another dictation) may have cached this exact preset while our load was
+    // in flight — reuse theirs and drop ours rather than clobbering it with a
+    // second, redundant engine (mirrors `spawn_stt_cache_warm`'s re-check).
     let mut guard = cache.lock().unwrap();
     if should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &wanted) {
-        // Perf instrumentation (issue #115 follow-up): a cache HIT means this
-        // dictation paid no model-load cost — the whole point of #115. Off
-        // unless BLA_PERF_LOG is set.
-        stt::perf_log(&format!(
-            "dictation: whisper cache HIT (preset={wanted:?}) — reused, no reload"
-        ));
         return Ok(Arc::clone(
             &guard
                 .as_ref()
@@ -555,17 +590,6 @@ fn build_stt(
                 .stt,
         ));
     }
-
-    // Perf instrumentation: a cache MISS pays the model load inline on the
-    // dictation thread (WhisperStt::new logs the load ms) — expected only on
-    // the first dictation of a preset before the background warm lands, or
-    // right after a preset switch.
-    stt::perf_log(&format!(
-        "dictation: whisper cache MISS (preset={wanted:?}) — loading model now"
-    ));
-    let spec = spec_for_preset(to_models_preset(wanted));
-    let model_path = models::model_target_path(app_data_dir, &spec);
-    let stt = Arc::new(stt::WhisperStt::new(&model_path).map_err(|e| e.to_string())?);
     *guard = Some(CachedStt {
         preset: wanted,
         stt: Arc::clone(&stt),
