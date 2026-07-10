@@ -1028,6 +1028,26 @@ pub fn run() {
                 });
             }
 
+            // Issue #126 (Sentinel 🔴 #2 on PR #127): the settings window's
+            // titlebar close button must hide, not destroy, the window —
+            // a destroyed webview makes the tray's "Settings…" item's
+            // `get_webview_window` lookup return `None` forever, silently
+            // no-oping until app restart. Same close-to-hide pattern as the
+            // main window above (only the CloseRequested arm; the
+            // focus-loss hotkey reconcile stays main-window-only).
+            if let Some(window) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
+                let close_handle = handle.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(window) = close_handle.get_webview_window(SETTINGS_WINDOW_LABEL)
+                        {
+                            let _ = window.hide();
+                        }
+                    }
+                });
+            }
+
             // Minimal first-run model check (issue #91 Part B): if the
             // selected Whisper model is absent, kick the downloader in the
             // background and emit progress events. Full onboarding UX
