@@ -1,3 +1,4 @@
+import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { change, click, flush, focus, keydown, mount, type Mounted } from "../../testUtils";
 import type { Settings } from "../../lib/ipc";
@@ -13,6 +14,21 @@ vi.mock("../../lib/ipc", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
   onEvent: (...args: unknown[]) => onEvent(...args),
 }));
+
+/**
+ * Handlers/unlisten-spies captured by the default `onEvent` mock (PR #134
+ * Sentinel finding 9: the previous stub resolved without ever recording the
+ * handler, so no test could FIRE a backend event and observe the UI react).
+ */
+let eventHandlers: Record<string, (payload: unknown) => void> = {};
+let unlistenSpies: Record<string, ReturnType<typeof vi.fn>> = {};
+
+/** Fires a captured backend-event handler, wrapped in `act`. No-op if the component never subscribed. */
+function fire(event: string, payload: unknown) {
+  act(() => {
+    eventHandlers[event]?.(payload);
+  });
+}
 
 const BASE_SETTINGS: Settings = {
   hotkey: "Control+Shift+Space",
@@ -43,9 +59,16 @@ function setupInvoke(overrides: Partial<Record<string, (...args: unknown[]) => u
 let mounted: Mounted | undefined;
 
 beforeEach(() => {
+  eventHandlers = {};
+  unlistenSpies = {};
   invoke.mockReset();
   onEvent.mockReset();
-  onEvent.mockResolvedValue(() => {});
+  onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
+    eventHandlers[event] = handler;
+    const unlisten = vi.fn();
+    unlistenSpies[event] = unlisten;
+    return Promise.resolve(unlisten);
+  });
   setupInvoke();
 });
 
@@ -193,6 +216,135 @@ describe("GeneralTab", () => {
         recording_mode: "Toggle",
         model_preset: "Small",
       },
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // PR #134 Sentinel 🔴-1 (+ finding 9): the model-download-* handlers must
+  // actually be exercised — fired, not just subscribed — and a failed event
+  // subscription (e.g. a capability/ACL rejection like the one that
+  // silently broke this window) must be visible in the UI, with the
+  // successful listeners still cleaned up on unmount.
+  // -------------------------------------------------------------------
+
+  it("shows live download progress when model-download-progress fires", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    fire("model-download-progress", { bytes_downloaded: 42, total_bytes: 100, percent: 42 });
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="model-status"]')?.textContent).toContain(
+      "Downloading… 42%",
+    );
+  });
+
+  it("shows Ready when model-download-complete fires after progress", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    fire("model-download-progress", { bytes_downloaded: 42, total_bytes: 100, percent: 42 });
+    fire("model-download-complete", null);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="model-status"]')?.textContent).toBe(
+      "Ready",
+    );
+  });
+
+  it("shows the failure and the backend's message when model-download-error fires", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    fire("model-download-error", "checksum mismatch for model file");
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="model-status"]')?.textContent).toBe(
+      "Download failed",
+    );
+    expect(mounted.container.textContent).toContain("checksum mismatch for model file");
+  });
+
+  it("surfaces an event-subscription failure in the UI instead of failing silently", async () => {
+    // The shape of the real-world failure this guards against: Tauri's
+    // capability ACL rejecting `event.listen` for an uncovered window.
+    onEvent.mockImplementation(() =>
+      Promise.reject(new Error("event.listen not allowed on window")),
+    );
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="events-error"]')?.textContent).toContain(
+      "event.listen not allowed on window",
+    );
+  });
+
+  it("still unsubscribes the successful listeners on unmount when one subscription fails", async () => {
+    const succeeded: ReturnType<typeof vi.fn>[] = [];
+    onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
+      if (event === "model-download-progress") {
+        return Promise.reject(new Error("event.listen not allowed on window"));
+      }
+      eventHandlers[event] = handler;
+      const unlisten = vi.fn();
+      succeeded.push(unlisten);
+      return Promise.resolve(unlisten);
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    expect(succeeded.length).toBeGreaterThan(0);
+    mounted.unmount();
+    mounted = undefined;
+
+    for (const unlisten of succeeded) {
+      expect(unlisten).toHaveBeenCalled();
+    }
+  });
+
+  it("unsubscribes every listener on unmount in the all-successful case", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const spies = Object.values(unlistenSpies);
+    expect(spies.length).toBeGreaterThan(0);
+    mounted.unmount();
+    mounted = undefined;
+
+    for (const unlisten of spies) {
+      expect(unlisten).toHaveBeenCalled();
+    }
+  });
+
+  // -------------------------------------------------------------------
+  // PR #134 Sentinel 🔴-2: Save must not clobber a concurrent settings
+  // change made elsewhere (tray menu / status window's output-mode toggle)
+  // while this window is open — the snapshot Save spreads must track
+  // `output-mode-changed`, mirroring App.tsx.
+  // -------------------------------------------------------------------
+
+  it("does not clobber a concurrent output-mode change when saving", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    // The user flips output mode via the tray while this window is open.
+    fire("output-mode-changed", "File");
+    await flush();
+
+    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="save-button"]',
+    )!;
+    invoke.mockClear();
+    click(saveButton);
+    await flush();
+
+    // Before the fix, the mount-time snapshot (output_mode: "Cursor") was
+    // spread into the payload, silently reverting + re-persisting the
+    // concurrent change.
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, output_mode: "File" },
     });
   });
 });
