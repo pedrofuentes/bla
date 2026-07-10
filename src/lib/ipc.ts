@@ -41,6 +41,21 @@ export interface DownloadProgress {
 export type DownloadStartResult = "already-present" | "downloading";
 
 /**
+ * Mirrors `errors::PipelineErrorEvent` (src-tauri/src/errors.rs) — the
+ * `pipeline-error` event payload. `kind` is one of `errors::ErrorKind`'s
+ * discriminants (`"ModelMissing" | "OllamaUnreachable" |
+ * "MicPermissionDenied" | "Other"`), kept as `string` here rather than a
+ * union so an unrecognized future kind still type-checks instead of a hard
+ * TS compile error. `message` is always static/kind-derived on the Rust
+ * side (never transcript/clipboard/audio content — see that module's HARD
+ * RULE) and safe to render as-is.
+ */
+export interface PipelineErrorEvent {
+  kind: string;
+  message: string;
+}
+
+/**
  * Command name → { args, result } typing. Extend this map as `commands.rs`
  * grows; each key must match a `#[tauri::command]` name exactly.
  */
@@ -97,6 +112,15 @@ export interface Events {
    * a scalar — raw audio samples never leave the core as an event.
    */
   "audio-level": number;
+  /**
+   * A typed pipeline error/notice (issue #126, M2 PR 2.4) — emitted from
+   * `lib.rs`'s capture-start failure, `run_pipeline_in_background`'s error
+   * paths, and the AC-4 Ollama-unreachable fallback path (informational,
+   * alongside a successful dictation, not in place of one). The pill
+   * window's toast (`src/windows/pill/Toast.tsx`) is the only current
+   * subscriber.
+   */
+  "pipeline-error": PipelineErrorEvent;
 }
 
 /**
