@@ -527,12 +527,19 @@ fn toggle_output_mode_from_tray(app: &tauri::AppHandle) {
 /// `settings.model_preset` — returning an `Arc` clone (a refcount bump, not
 /// a reload) rather than paying the ~574 MB `WhisperContext::new_with_params`
 /// load again on every dictation. Only rebuilds (and replaces the cache
-/// entry) when the cache is empty or the user switched presets. The whole
-/// check-then-build-then-store sequence runs under `cache`'s lock, so two
-/// dictations racing on an empty/stale cache can't both pay the load cost —
-/// the second simply reuses whatever the first just stored — at the cost of
-/// (harmlessly) blocking a concurrent dictation behind an in-progress
-/// rebuild rather than double-loading.
+/// entry) when the cache is empty or the user switched presets.
+///
+/// Issues #117/#118: the ~574 MB load is performed with **no lock held**.
+/// This mirrors [`spawn_stt_cache_warm`]: check for a hit under a narrow lock
+/// scope and release the guard, load the model unlocked, then re-acquire and
+/// re-check before populating (reusing a concurrently-cached engine rather
+/// than clobbering it). Holding `cache`'s lock across the native load would
+/// (a) poison the mutex for every later dictation and the warm thread if the
+/// load panicked, and (b) block a concurrent dictation/warm for the whole
+/// load. The trade-off is a rare, harmless transient double-load when a
+/// first-launch dictation and the background warm load the same preset at
+/// once — the loser's freshly built engine is simply dropped on the re-check,
+/// and the cache settles to a single engine.
 #[cfg(feature = "whisper")]
 fn build_stt(
     settings: &settings::Settings,
