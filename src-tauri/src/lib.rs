@@ -542,6 +542,12 @@ fn build_stt(
     let wanted = settings.model_preset;
     let mut guard = cache.lock().unwrap();
     if should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &wanted) {
+        // Perf instrumentation (issue #115 follow-up): a cache HIT means this
+        // dictation paid no model-load cost — the whole point of #115. Off
+        // unless BLA_PERF_LOG is set.
+        stt::perf_log(&format!(
+            "dictation: whisper cache HIT (preset={wanted:?}) — reused, no reload"
+        ));
         return Ok(Arc::clone(
             &guard
                 .as_ref()
@@ -550,6 +556,13 @@ fn build_stt(
         ));
     }
 
+    // Perf instrumentation: a cache MISS pays the model load inline on the
+    // dictation thread (WhisperStt::new logs the load ms) — expected only on
+    // the first dictation of a preset before the background warm lands, or
+    // right after a preset switch.
+    stt::perf_log(&format!(
+        "dictation: whisper cache MISS (preset={wanted:?}) — loading model now"
+    ));
     let spec = spec_for_preset(to_models_preset(wanted));
     let model_path = models::model_target_path(app_data_dir, &spec);
     let stt = Arc::new(stt::WhisperStt::new(&model_path).map_err(|e| e.to_string())?);
@@ -604,10 +617,20 @@ fn spawn_stt_cache_warm(
         {
             let guard = state.stt_cache.lock().unwrap();
             if should_reuse_cached_stt(guard.as_ref().map(|cached| &cached.preset), &preset) {
+                stt::perf_log(&format!(
+                    "background warm: skipped (preset={preset:?} already cached)"
+                ));
                 return;
             }
         }
 
+        // Perf instrumentation (issue #115 follow-up): mark the background
+        // warm so the one-time model load can be seen happening OFF the
+        // dictation path (WhisperStt::new logs the load ms). Off unless
+        // BLA_PERF_LOG is set.
+        stt::perf_log(&format!(
+            "background warm: loading whisper model (preset={preset:?})"
+        ));
         let spec = spec_for_preset(to_models_preset(preset));
         let model_path = models::model_target_path(&app_data_dir, &spec);
         match stt::WhisperStt::new(&model_path) {
@@ -622,6 +645,9 @@ fn spawn_stt_cache_warm(
                         preset,
                         stt: Arc::new(built),
                     });
+                    stt::perf_log(&format!(
+                        "background warm: cache populated (preset={preset:?}) — first dictation will be a HIT"
+                    ));
                 }
             }
             Err(err) => {

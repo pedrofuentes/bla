@@ -32,9 +32,10 @@ use std::path::Path;
 /// turns it on. Factored out as a pure function so the gating rule is
 /// unit-tested without touching real process env or stderr.
 pub fn perf_logging_enabled(env_value: Option<&str>) -> bool {
-    // STUB (test-first): real logic lands in the follow-up commit.
-    let _ = env_value;
-    false
+    match env_value {
+        None => false,
+        Some(value) => !value.is_empty() && value != "0",
+    }
 }
 
 /// Emits `msg` to stderr as a `bla[perf]` line, but only when
@@ -194,8 +195,16 @@ impl WhisperStt {
         // token-level timestamps, which this engine never requests).
         let mut params = whisper_rs::WhisperContextParameters::default();
         params.flash_attn(true);
+        // Perf instrumentation (issue #115 follow-up): time the ~574 MB
+        // context load so it can be confirmed to happen ONCE (at warm/first
+        // build) rather than per dictation. Off unless BLA_PERF_LOG is set.
+        let load_start = std::time::Instant::now();
         let context = whisper_rs::WhisperContext::new_with_params(model_path, params)
             .map_err(|e| SttError::ModelLoad(format!("{e} (path: {})", model_path.display())))?;
+        perf_log(&format!(
+            "whisper model context loaded in {} ms",
+            load_start.elapsed().as_millis()
+        ));
         Ok(Self { context })
     }
 }
@@ -223,6 +232,13 @@ impl Stt for WhisperStt {
     /// — is unit-tested above; this method itself is only covered by the
     /// `#[ignore]`d integration test below.
     fn transcribe(&self, samples: &[f32], opts: &TranscribeOpts) -> Result<String, SttError> {
+        // Perf instrumentation (issue #115 follow-up): time the whole
+        // per-call decode (state creation + full() + segment collection).
+        // This is the cost caching does NOT remove — the model load is
+        // shared, but every dictation still pays this — so it's the number
+        // to watch when judging whether a run "feels" slow. Off unless
+        // BLA_PERF_LOG is set; logs sample/duration counts only, never text.
+        let transcribe_start = std::time::Instant::now();
         let mut state = self
             .context
             .create_state()
@@ -261,6 +277,13 @@ impl Stt for WhisperStt {
                 text.push_str(s);
             }
         }
+        perf_log(&format!(
+            "transcribed {} samples (~{:.1}s audio) in {} ms on {} threads",
+            samples.len(),
+            samples.len() as f32 / 16_000.0,
+            transcribe_start.elapsed().as_millis(),
+            n_threads
+        ));
         Ok(text.trim().to_string())
     }
 }

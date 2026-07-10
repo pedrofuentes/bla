@@ -267,6 +267,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- **#115 follow-up** Opt-in perf instrumentation for the dictation hot path,
+  so the caching/decode-tuning win can be measured in milliseconds instead of
+  judged by feel. Set `BLA_PERF_LOG=1` (any non-`0`/non-empty value) before
+  `pnpm tauri:dev` and stderr gains `bla[perf]:` lines for: the one-time
+  ~574 MB model-load duration, each dictation's transcription time (sample
+  count, approx audio seconds, ms, thread count), and per-dictation cache
+  HIT/MISS plus background-warm markers — so a cache hit (no reload) is
+  visibly distinct from a cold load. Off by default (a normal run stays
+  silent); the env gate is a pure, unit-tested predicate
+  (`stt::perf_logging_enabled`), and every line is numbers/enum labels only —
+  never transcript, clipboard, or audio content (MISSION §7 no-log
+  invariant). The timing call sites (`WhisperStt::new`,
+  `WhisperStt::transcribe`, `build_stt`, `spawn_stt_cache_warm`) are native
+  glue, exercised by the cofounder's `BLA_PERF_LOG=1` run.
+
 - **#115** Cache the Whisper model across dictations instead of reloading it
   from disk on every one (the cofounder's smoke test found dictation working
   but slow: `WhisperContext::new_with_params` — a ~574 MB read for the
