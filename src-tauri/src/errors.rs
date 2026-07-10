@@ -175,12 +175,10 @@ mod tests {
     fn model_missing_and_mic_permission_denied_are_blocking() {
         assert!(ErrorKind::ModelMissing.is_blocking());
         assert!(ErrorKind::MicPermissionDenied.is_blocking());
-        assert!(
-            ErrorKind::Other {
-                message: "x".to_string()
-            }
-            .is_blocking()
-        );
+        assert!(ErrorKind::Other {
+            message: "x".to_string()
+        }
+        .is_blocking());
     }
 
     #[test]
@@ -241,8 +239,7 @@ mod tests {
         // confirm the serialized event payload never contains it — the
         // mapping must derive `message` purely from the ErrorKind variant,
         // never from the source error's own Display/text.
-        let fixture_transcript =
-            "the quick brown fox jumps over the lazy dog, this is what I said";
+        let fixture_transcript = "the quick brown fox jumps over the lazy dog, this is what I said";
         let err = PipelineError::Stt(SttError::Transcription(fixture_transcript.to_string()));
 
         let kind = error_kind_for_pipeline_error(&err);

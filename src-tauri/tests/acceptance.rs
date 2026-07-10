@@ -19,9 +19,10 @@ use std::time::Duration;
 use bla_lib::cleanup::{
     NoRealNetworkTransport, OllamaCleanup, RegexCleanup, StubTransport, Tone, TransportError,
 };
-use bla_lib::output::{Clipboard, Clock, FileConfig, OutputMode, PasteSynthesizer};
+use bla_lib::errors::{self, ErrorKind, PipelineErrorEvent};
+use bla_lib::output::{Clipboard, Clock, FileConfig, OutputMode, OutputOutcome, PasteSynthesizer};
 use bla_lib::pipeline::{Pipeline, PipelineOpts};
-use bla_lib::stt::{FakeStt, TranscribeOpts};
+use bla_lib::stt::{FakeStt, Stt, SttError, TranscribeOpts};
 
 // `StubTransport` (a preprogrammed-outcome `OllamaTransport` that never
 // touches a real socket) is imported from `bla_lib::cleanup` rather than
@@ -305,4 +306,129 @@ fn ac5_full_pipeline_run_makes_no_network_io_outside_allowlist() {
         .expect("AC-5: pipeline run should succeed with zero real network I/O");
 
     assert_eq!(outcome.cleaned_transcript, "Hello there.");
+}
+
+// -------------------------------------------------------------
+// Issue #126, M2 PR 2.4: typed pipeline-error events (bla_lib::errors)
+// -------------------------------------------------------------
+
+/// A fake `Stt` whose error message IS a fixture "transcript" — simulating
+/// the worst case where a native error happens to echo dictated content back
+/// (e.g. a transcription engine's error string). Only used by
+/// `pipeline_error_kind_mapping_never_leaks_transcript_text` below.
+struct FailingStt {
+    error_message: String,
+}
+
+impl Stt for FailingStt {
+    fn transcribe(&self, _samples: &[f32], _opts: &TranscribeOpts) -> Result<String, SttError> {
+        Err(SttError::Transcription(self.error_message.clone()))
+    }
+}
+
+#[test]
+fn pipeline_error_kind_mapping_never_leaks_transcript_text() {
+    // HARD RULE (issue #126, errors.rs module doc): the `pipeline-error`
+    // event payload must never carry transcript/clipboard/audio content,
+    // even if the underlying error's own message happens to embed it.
+    // FailingStt's error message IS the fixture transcript below, so this
+    // proves the mapping derives `message` purely from the ErrorKind
+    // variant, never from the source error's own text.
+    let fixture_transcript =
+        "the secret dictated sentence that must never reach a pipeline-error toast";
+    let stt = FailingStt {
+        error_message: fixture_transcript.to_string(),
+    };
+    let cleanup = RegexCleanup;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = Pipeline::new(
+        stt,
+        cleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
+
+    let opts = PipelineOpts {
+        transcribe: TranscribeOpts::default(),
+        tone: Tone::Neutral,
+        output_mode: file_output_mode(&dir),
+        clock: fixed_clock(),
+        restore_delay: Duration::from_millis(0),
+    };
+
+    let err = pipeline
+        .run(&[0.0_f32; 1_600], &opts)
+        .expect_err("FailingStt must surface a pipeline error");
+
+    let kind = errors::error_kind_for_pipeline_error(&err);
+    let event = PipelineErrorEvent::from(&kind);
+    let serialized = serde_json::to_string(&event).expect("event must serialize");
+
+    assert!(
+        !serialized.contains(fixture_transcript),
+        "pipeline-error payload leaked the wrapped error's text: {serialized}"
+    );
+    assert!(!event.message.contains(fixture_transcript));
+    assert!(kind.is_blocking(), "a transcription failure is blocking");
+}
+
+#[test]
+fn ac4b_ollama_unreachable_still_pastes_and_is_informational_not_blocking() {
+    // Extends ac4 (above) without touching its assertions: the AC-4
+    // Ollama-unreachable fallback is informational, not blocking —
+    // `lib.rs::run_pipeline_in_background` emits
+    // `ErrorKind::OllamaUnreachable` alongside `set_pipeline_state(.., Idle)`
+    // on this path, never `Error`, and the dictation still completes and
+    // pastes/writes fully.
+    let raw_transcript = "um, hello world";
+    let stt = FakeStt::new(raw_transcript);
+
+    let transport = StubTransport {
+        response: Err(TransportError::ConnectionFailed),
+    };
+    let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", transport);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = Pipeline::new(
+        stt,
+        cleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
+
+    let opts = PipelineOpts {
+        transcribe: TranscribeOpts::default(),
+        tone: Tone::Neutral,
+        output_mode: file_output_mode(&dir),
+        clock: fixed_clock(),
+        restore_delay: Duration::from_millis(0),
+    };
+
+    let outcome = pipeline
+        .run(&[0.0_f32; 1_600], &opts)
+        .expect("AC-4: no error must surface to the output path when Ollama is unreachable");
+
+    assert!(
+        outcome.cleanup_fell_back,
+        "AC-4: the fallback path must have fired"
+    );
+
+    // The dictation still completed fully — output was written (this
+    // suite's file-mode stand-in for "pasted"), not blocked by the
+    // informational kind lib.rs emits alongside this outcome.
+    match outcome.output {
+        OutputOutcome::AppendedTo(_) => {}
+        other => panic!("expected the file target to have been written, got {other:?}"),
+    }
+
+    let kind = ErrorKind::OllamaUnreachable;
+    assert!(
+        !kind.is_blocking(),
+        "AC-4: Ollama-unreachable must be informational, not blocking"
+    );
+    let event = PipelineErrorEvent::from(&kind);
+    assert_eq!(event.kind, "OllamaUnreachable");
 }
