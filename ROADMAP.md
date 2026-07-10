@@ -46,7 +46,7 @@ Phase 0/1 — harness bootstrapped; discovery (PRD) and board seeding for M1 in 
 |-----------|---------|--------|
 | M1 — MVP dictation pipeline | v0.1 | in-progress |
 | Windows runtime support | cross-cutting | in-progress (Increment A) |
-| M2 — UI shell | v0.2 | pending |
+| M2 — UI shell | v0.2 | in-progress |
 | M3 — Context features | v0.3 | pending |
 | M4 — Command mode & snippets | v0.4 | pending |
 | M5 — Polish & packaging | v1.0 | pending |
