@@ -759,4 +759,132 @@ mod tests {
         assert!(rb.is_empty());
         assert_eq!(rb.len(), 0);
     }
+
+    // -----------------------------------------------------------------
+    // Issue #126 (M2 PR 2.2): LevelThrottle — throttled `audio-level` event
+    // cadence. Pure and deterministic: every timestamp below is injected
+    // (`Duration`), never a real clock read, matching hotkeys::Timestamp's
+    // pattern (module doc).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn level_throttle_emits_the_very_first_observation_immediately() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.42),
+            Some(0.42)
+        );
+    }
+
+    #[test]
+    fn level_throttle_suppresses_a_second_observation_within_the_same_window() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.1),
+            Some(0.1)
+        );
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(10), 0.2),
+            None,
+            "an observation inside the same ~33ms window must be suppressed"
+        );
+    }
+
+    #[test]
+    fn level_throttle_emits_again_once_the_window_elapses() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.1),
+            Some(0.1)
+        );
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(33), 0.2),
+            Some(0.2),
+            "a full window (>=33ms) after the last emit must emit again"
+        );
+    }
+
+    #[test]
+    fn level_throttle_caps_emit_rate_to_at_most_30_per_second_under_a_burst() {
+        let mut throttle = LevelThrottle::new();
+        let mut emitted = 0usize;
+        // A burst of 1000 samples spaced 1ms apart -- far faster than any
+        // real cpal callback cadence -- covering exactly one second.
+        for ms in 0..1000u64 {
+            if throttle
+                .should_emit(std::time::Duration::from_millis(ms), 0.5)
+                .is_some()
+            {
+                emitted += 1;
+            }
+        }
+        assert!(
+            emitted <= 31,
+            "should emit at most ~30 times per second, got {emitted}"
+        );
+        assert!(
+            emitted >= 28,
+            "should still emit close to 30 times per second, got {emitted}"
+        );
+    }
+
+    #[test]
+    fn level_throttle_quiet_to_loud_transition_is_suppressed_then_emitted_unsmoothed() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.01),
+            Some(0.01)
+        );
+        // A much louder level lands inside the same window: cadence gating
+        // applies regardless of how much the level itself changed.
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(10), 0.95),
+            None
+        );
+        // Once the window elapses, the loud level is emitted exactly as
+        // observed -- no averaging/smoothing across the suppressed samples.
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(33), 0.95),
+            Some(0.95)
+        );
+    }
+
+    #[test]
+    fn level_throttle_default_uses_the_documented_30hz_cadence() {
+        let mut default_throttle = LevelThrottle::new();
+        let mut explicit_throttle =
+            LevelThrottle::with_min_interval(LevelThrottle::DEFAULT_MIN_INTERVAL);
+        for ms in [0u64, 10, 33, 40, 66] {
+            assert_eq!(
+                default_throttle.should_emit(std::time::Duration::from_millis(ms), 0.3),
+                explicit_throttle.should_emit(std::time::Duration::from_millis(ms), 0.3),
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #126 (M2 PR 2.2): LevelMeter — the RT-safe latest-level cell
+    // the capture callback (writer) records into and the level-event
+    // poller (reader, in lib.rs) samples. Lock-free (atomic), never a
+    // `Mutex`, so it can never block the real-time audio thread.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn level_meter_starts_at_zero() {
+        let meter = LevelMeter::new();
+        assert_eq!(meter.current(), 0.0);
+    }
+
+    #[test]
+    fn level_meter_reads_back_the_latest_recorded_level() {
+        let meter = LevelMeter::new();
+        meter.record(0.25);
+        assert_eq!(meter.current(), 0.25);
+        meter.record(0.75);
+        assert_eq!(
+            meter.current(),
+            0.75,
+            "current() must reflect the latest record(), not accumulate"
+        );
+    }
 }
