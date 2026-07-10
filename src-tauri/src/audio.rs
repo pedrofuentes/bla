@@ -222,10 +222,17 @@ fn hound_to_io_err(err: hound::Error) -> std::io::Error {
 /// counts the drop via `diagnostics` rather than stalling the real-time
 /// audio thread. Issue #59: a poisoned lock or a stream error is recorded
 /// into `diagnostics` (structured state the rest of the app can observe)
-/// instead of an invisible `eprintln!`.
+/// instead of an invisible `eprintln!`. Issue #126 (M2 PR 2.2): the RMS
+/// level of each resampled chunk (via [`rms_level`], the same pure fn the
+/// pill's meter has always used) is recorded into `level_meter` -- a
+/// lock-free write, so this never risks blocking the callback the way even
+/// a `try_lock` theoretically could contend. `lib.rs`'s thin glue polls
+/// `level_meter`, throttles via [`LevelThrottle`], and emits the
+/// `audio-level` Tauri event off this thread.
 pub fn start_capture(
     buffer: SharedRingBuffer,
     diagnostics: std::sync::Arc<CaptureDiagnostics>,
+    level_meter: std::sync::Arc<LevelMeter>,
 ) -> Result<cpal::Stream, CaptureError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -252,6 +259,7 @@ pub fn start_capture(
                 &mut mono_scratch,
                 &mut resampled_scratch,
             );
+            level_meter.record(rms_level(&resampled_scratch));
             match buffer.try_lock() {
                 Ok(mut buf) => buf.extend(&resampled_scratch),
                 Err(std::sync::TryLockError::WouldBlock) => {
@@ -296,23 +304,27 @@ impl CaptureSession {
     pub fn start(
         buffer: SharedRingBuffer,
         diagnostics: std::sync::Arc<CaptureDiagnostics>,
+        level_meter: std::sync::Arc<LevelMeter>,
     ) -> Result<Self, CaptureError> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), CaptureError>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
-        let handle = std::thread::spawn(move || match start_capture(buffer, diagnostics) {
-            Ok(stream) => {
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                // Block here, keeping `stream` alive, until told to stop.
-                let _ = stop_rx.recv();
-                drop(stream);
-            }
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-            }
-        });
+        let handle =
+            std::thread::spawn(
+                move || match start_capture(buffer, diagnostics, level_meter) {
+                    Ok(stream) => {
+                        if ready_tx.send(Ok(())).is_err() {
+                            return;
+                        }
+                        // Block here, keeping `stream` alive, until told to stop.
+                        let _ = stop_rx.recv();
+                        drop(stream);
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                    }
+                },
+            );
 
         // Sentinel 🟡 #4: bound the wait so a hung backend surfaces as
         // CaptureError::Timeout (which the caller's existing Err handling

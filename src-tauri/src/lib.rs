@@ -100,6 +100,16 @@ pub(crate) struct AppState {
     buffer: audio::SharedRingBuffer,
     diagnostics: Arc<audio::CaptureDiagnostics>,
     capture: Mutex<Option<audio::CaptureSession>>,
+    /// Issue #126 (M2 PR 2.2): the RT-safe latest-level cell the capture
+    /// callback records into; `react_to_transition`'s level-event poller
+    /// samples it and throttles via `audio::LevelThrottle` before emitting
+    /// the `audio-level` event.
+    level_meter: Arc<audio::LevelMeter>,
+    /// Stop signal for the currently-running level-event poller, if any
+    /// (issue #126). Set on `StartRecording`, taken and signaled on
+    /// `StopRecording`/`Cancelled` so exactly one poller is ever driving
+    /// `audio-level` events at a time.
+    level_poll_stop: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     settings: Mutex<settings::Settings>,
     output_switch: Mutex<tray::OutputModeSwitch>,
     pipeline_state: Mutex<tray::PipelineState>,
@@ -389,9 +399,20 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             // session (Sentinel 🟡 #3).
             state.buffer.lock().unwrap().drain();
             state.diagnostics.clear_error();
-            match audio::CaptureSession::start(state.buffer.clone(), state.diagnostics.clone()) {
+            match audio::CaptureSession::start(
+                state.buffer.clone(),
+                state.diagnostics.clone(),
+                state.level_meter.clone(),
+            ) {
                 Ok(session) => {
                     *state.capture.lock().unwrap() = Some(session);
+                    // Issue #126 (M2 PR 2.2): drive the throttled
+                    // `audio-level` event stream for exactly this session's
+                    // lifetime -- the poller exits on its own once
+                    // StopRecording/Cancelled signals `stop_rx` below.
+                    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                    *state.level_poll_stop.lock().unwrap() = Some(stop_tx);
+                    spawn_level_poller(app.clone(), state.level_meter.clone(), stop_rx);
                     set_pipeline_state(app, tray::PipelineState::Recording);
                 }
                 Err(err) => {
@@ -412,6 +433,7 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             if let Some(session) = session {
                 session.stop();
             }
+            stop_level_poller(&state);
 
             // Sentinel 🟡 #3: if a device/stream error was recorded mid-
             // recording (#59's CaptureDiagnostics), do NOT transcribe
@@ -434,12 +456,60 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             if let Some(session) = session {
                 session.stop();
             }
+            stop_level_poller(&state);
             state.buffer.lock().unwrap().drain();
             state.diagnostics.clear_error();
             set_pipeline_state(app, tray::PipelineState::Idle);
         }
         None => {}
     }
+}
+
+/// Signals the currently-running level-event poller (if any) to exit
+/// (issue #126, M2 PR 2.2) — best-effort, matching the rest of this
+/// module's `let _ =` treatment of non-critical signaling sends.
+fn stop_level_poller(state: &AppState) {
+    if let Some(tx) = state.level_poll_stop.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+}
+
+/// How often the level-event poller below samples [`audio::LevelMeter`]
+/// (issue #126, M2 PR 2.2) — well above the ~30Hz cadence
+/// [`audio::LevelThrottle`] caps emission at, so the throttle (not the
+/// poll rate) is what determines the actual `audio-level` event cadence.
+const LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// OS-integration glue (AGENTS.md §OS-integration exemption, issue #126):
+/// drives the throttled `audio-level` event stream for one capture
+/// session's lifetime on a dedicated thread — never the real-time `cpal`
+/// callback thread (`audio::start_capture`'s doc), matching the
+/// CaptureDiagnostics-style split between an RT-safe write (`LevelMeter`,
+/// written from the audio callback) and non-RT reads. Samples
+/// `level_meter` every [`LEVEL_POLL_INTERVAL`], pushes each sample through
+/// a fresh [`audio::LevelThrottle`], and emits `audio-level` (payload: the
+/// `f32` RMS level, `0.0..=1.0`) whenever the throttle allows it. Exits as
+/// soon as `stop_rx` is signaled (or its sender is dropped).
+fn spawn_level_poller(
+    app: tauri::AppHandle,
+    level_meter: Arc<audio::LevelMeter>,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+) {
+    std::thread::spawn(move || {
+        let origin = std::time::Instant::now();
+        let mut throttle = audio::LevelThrottle::new();
+        loop {
+            match stop_rx.recv_timeout(LEVEL_POLL_INTERVAL) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let level = level_meter.current();
+                    if let Some(level) = throttle.should_emit(origin.elapsed(), level) {
+                        let _ = app.emit("audio-level", level);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Loads the bundled placeholder tray-icon PNG for `state` (issue #110): a
@@ -975,6 +1045,8 @@ pub fn run() {
                 ))),
                 diagnostics: Arc::new(audio::CaptureDiagnostics::new()),
                 capture: Mutex::new(None),
+                level_meter: Arc::new(audio::LevelMeter::new()),
+                level_poll_stop: Mutex::new(None),
                 settings: Mutex::new(settings.clone()),
                 output_switch: Mutex::new(tray::OutputModeSwitch::new(initial_output_mode)),
                 pipeline_state: Mutex::new(tray::PipelineState::Idle),
