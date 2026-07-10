@@ -100,6 +100,20 @@ pub fn set_output_mode(
     Ok(())
 }
 
+/// Validates a candidate hotkey accelerator string without persisting
+/// anything (issue #126, M2 PR 2.5). Thin wrapper over the pure
+/// `hotkeys::validate_hotkey` — same parser `set_settings` and OS-glue
+/// registration use, so a value that validates here is exactly the value
+/// that will register. Lets the settings window's hotkey capture field show
+/// an inline error immediately after a chord is captured, before the user
+/// ever clicks Save (`set_settings` still re-validates independently per
+/// issue #91's validate-before-persist invariant — this command doesn't
+/// change that ordering, it just gives the UI an earlier signal).
+#[tauri::command]
+pub fn validate_hotkey(accelerator: String) -> Result<(), String> {
+    crate::hotkeys::validate_hotkey(&accelerator)
+}
+
 /// Kicks the first-run Whisper model downloader for the currently selected
 /// preset (issue #91 Part B minimal wiring; full onboarding UX is M5).
 /// Returns immediately with `"already-present"` if the model file already

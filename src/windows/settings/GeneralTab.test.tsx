@@ -75,7 +75,9 @@ describe("GeneralTab", () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
-    const input = mounted.container.querySelector<HTMLInputElement>('[data-testid="hotkey-input"]')!;
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
     focus(input);
     keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
@@ -85,24 +87,36 @@ describe("GeneralTab", () => {
     expect(mounted.container.querySelector('[data-testid="hotkey-error"]')).toBeNull();
   });
 
-  it("does not update the field on a bare modifier keydown while capturing", async () => {
+  it("keeps listening (doesn't validate or commit a chord) on a bare modifier keydown", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
-    const input = mounted.container.querySelector<HTMLInputElement>('[data-testid="hotkey-input"]')!;
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
     focus(input);
     keydown(input, "Control", { ctrlKey: true });
     await flush();
 
-    expect(input.value).toBe("Control+Shift+Space");
+    // Still capturing (shows the "press a key" prompt, not a committed
+    // value) and no validate_hotkey call yet — a bare modifier isn't a
+    // complete chord.
+    expect(input.value).toMatch(/press a key/i);
     expect(invoke).not.toHaveBeenCalledWith("validate_hotkey", expect.anything());
+
+    // Escaping out afterward reverts to the original, uncommitted hotkey.
+    keydown(input, "Escape");
+    await flush();
+    expect(input.value).toBe("Control+Shift+Space");
   });
 
   it("cancels capture on Escape without changing the field", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
-    const input = mounted.container.querySelector<HTMLInputElement>('[data-testid="hotkey-input"]')!;
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
     focus(input);
     keydown(input, "Escape");
     await flush();
@@ -123,7 +137,9 @@ describe("GeneralTab", () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
-    const input = mounted.container.querySelector<HTMLInputElement>('[data-testid="hotkey-input"]')!;
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
     focus(input);
     keydown(input, "Z", { ctrlKey: true });
     await flush();
@@ -132,7 +148,9 @@ describe("GeneralTab", () => {
       /bad accelerator/i,
     );
 
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>('[data-testid="save-button"]')!;
+    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="save-button"]',
+    )!;
     invoke.mockClear();
     click(saveButton);
     await flush();
@@ -144,12 +162,16 @@ describe("GeneralTab", () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
-    const input = mounted.container.querySelector<HTMLInputElement>('[data-testid="hotkey-input"]')!;
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
     focus(input);
     keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
 
-    const toggleRadio = mounted.container.querySelector<HTMLInputElement>('[data-testid="mode-toggle"]')!;
+    const toggleRadio = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="mode-toggle"]',
+    )!;
     click(toggleRadio);
 
     const modelSelect = mounted.container.querySelector<HTMLSelectElement>(
@@ -157,7 +179,9 @@ describe("GeneralTab", () => {
     )!;
     change(modelSelect, "Small");
 
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>('[data-testid="save-button"]')!;
+    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="save-button"]',
+    )!;
     invoke.mockClear();
     click(saveButton);
     await flush();

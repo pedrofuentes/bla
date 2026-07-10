@@ -64,7 +64,9 @@ describe("chordFromKeyboardEvent", () => {
   });
 
   it("returns null for Escape even while modifiers are held", () => {
-    expect(chordFromKeyboardEvent(keyEvent("Escape", { ctrlKey: true, shiftKey: true }))).toBeNull();
+    expect(
+      chordFromKeyboardEvent(keyEvent("Escape", { ctrlKey: true, shiftKey: true })),
+    ).toBeNull();
   });
 
   it("rejects a main key press with no modifiers held at all", () => {

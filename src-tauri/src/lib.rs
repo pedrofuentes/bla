@@ -890,6 +890,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::set_output_mode,
+            commands::validate_hotkey,
             commands::download_selected_model,
         ])
         .setup(|app| {

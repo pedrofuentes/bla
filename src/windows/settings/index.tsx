@@ -1,27 +1,62 @@
+import { useState } from "react";
+import { GeneralTab } from "./GeneralTab";
+import { TABS, type TabId } from "./tabs";
+
 /**
  * Settings window — tabbed settings UI (hotkey, model, output-target
  * configuration; see docs/ARCHITECTURE.md §Project Structure).
  *
- * Talks to the core only through `src/lib/ipc.ts`, so this window renders in
- * a plain browser (mocked IPC) for Playwright visual verification.
+ * Talks to the core only through `src/lib/ipc.ts` (via each tab's own
+ * component), so this window renders in a plain browser (mocked IPC) for
+ * Playwright visual verification.
  *
- * Placeholder shell (issue #126, M2 PR 2.1): the window's title-bar-free
- * shape with a General tab placeholder — no `get_settings`/`set_settings`
- * wiring or real tabs yet; the tray's "Settings…" item already shows +
- * focuses the real OS window around whatever this renders. Full tabbed
- * content is a later M2 increment.
+ * General tab lands in this increment (issue #126, M2 PR 2.5); the rest
+ * (History/Dictionary/Tone/Snippets) are later M2 increments — clicking one
+ * shows a placeholder rather than being disabled, so the tab bar's final
+ * shape (and switching between tabs) is exercised now without pulling
+ * forward content that doesn't exist yet.
  */
 export function SettingsWindow() {
+  const [active, setActive] = useState<TabId>("general");
+  const activeLabel = TABS.find((t) => t.id === active)?.label ?? active;
+
   return (
     <main className="flex h-screen w-screen bg-neutral-50 text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100">
-      <nav className="w-40 shrink-0 border-r border-neutral-200 p-4 text-sm dark:border-neutral-800">
-        <p className="font-medium text-neutral-500 dark:text-neutral-400">General</p>
+      <nav
+        role="tablist"
+        aria-label="Settings sections"
+        className="flex w-40 shrink-0 flex-col gap-0.5 border-r border-neutral-200 p-2 text-sm dark:border-neutral-800"
+      >
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            data-testid={`tab-${tab.id}`}
+            aria-selected={active === tab.id}
+            onClick={() => setActive(tab.id)}
+            className={`rounded-md px-3 py-1.5 text-left ${
+              active === tab.id
+                ? "bg-neutral-200 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100"
+                : "text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800/50"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
       </nav>
-      <section className="flex-1 p-6">
-        <h1 className="text-lg font-semibold">Settings</h1>
-        <p className="mt-2 text-sm text-neutral-500 dark:text-neutral-400">
-          Full settings coming in a later M2 increment.
-        </p>
+      <section role="tabpanel" className="flex-1 overflow-y-auto p-6">
+        <h1 className="mb-4 text-lg font-semibold">Settings</h1>
+        {active === "general" ? (
+          <GeneralTab />
+        ) : (
+          <p
+            data-testid="placeholder-panel"
+            className="text-sm text-neutral-500 dark:text-neutral-400"
+          >
+            {activeLabel} settings are coming in a later M2 increment.
+          </p>
+        )}
       </section>
     </main>
   );

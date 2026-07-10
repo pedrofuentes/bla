@@ -65,7 +65,9 @@ export function focus(el: HTMLElement): void {
 /** Dispatches a bubbling keydown, wrapped in `act`. */
 export function keydown(el: Element, key: string, mods: KeyboardEventInit = {}): void {
   act(() => {
-    el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...mods }));
+    el.dispatchEvent(
+      new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...mods }),
+    );
   });
 }
 
