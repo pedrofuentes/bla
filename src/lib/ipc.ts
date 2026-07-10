@@ -107,11 +107,12 @@ export interface Events {
    */
   "output-mode-changed": OutputModeSetting;
   /**
-   * The RMS level (`0.0..=1.0`) of the most recently captured audio chunk
-   * during an active dictation, throttled to ~30Hz server-side
-   * (`audio::LevelThrottle`, `lib.rs`'s level-event poller) so the pill's
-   * live meter isn't flooded with one event per audio callback. Only ever
-   * a scalar — raw audio samples never leave the core as an event.
+   * The RMS level (`0.0..=1.0`, clamped in the core poller) of the most
+   * recently captured audio chunk during an active dictation, throttled to
+   * ~30Hz in the core poller (`audio::LevelThrottle`, `lib.rs`'s
+   * level-event poller) so the pill's live meter isn't flooded with one
+   * event per audio callback. Only ever a scalar — raw audio samples never
+   * leave the core as an event.
    */
   "audio-level": number;
   /**

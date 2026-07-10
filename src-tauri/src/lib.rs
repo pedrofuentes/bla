@@ -703,7 +703,13 @@ fn spawn_level_poller(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let level = level_meter.current();
                     if let Some(level) = throttle.should_emit(origin.elapsed(), level) {
-                        let _ = app.emit("audio-level", level);
+                        // Issue #136 item 2: driver-clipped input can push
+                        // `rms_level` above 1.0; clamp the ceiling here so
+                        // the documented `0.0..=1.0` contract (ipc.ts) is
+                        // actually true on the wire. The 0.0 floor already
+                        // holds (`rms_level`/`LevelMeter::current` never go
+                        // negative), so only the top needs clamping.
+                        let _ = app.emit("audio-level", level.min(1.0));
                     }
                 }
             }
