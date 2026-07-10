@@ -484,6 +484,108 @@ impl CaptureDiagnostics {
     }
 }
 
+/// Throttles `audio-level` event emission (issue #126, M2 PR 2.2) so the
+/// pill's live meter isn't flooded with one event per captured audio chunk
+/// -- a cpal callback commonly fires far faster than any UI needs to
+/// repaint. Pure and deterministic (no clock): `now` is an injected,
+/// caller-supplied monotonic timestamp -- e.g. `Instant::now().elapsed()`
+/// in the real glue -- mirroring `hotkeys::Timestamp` (see that module's
+/// doc), so this is fully unit-testable without a real audio device or
+/// wall-clock timing.
+#[derive(Debug)]
+pub struct LevelThrottle {
+    min_interval: std::time::Duration,
+    last_emitted_at: Option<std::time::Duration>,
+}
+
+impl LevelThrottle {
+    /// ~30 Hz cadence: emits at most once per this interval.
+    pub const DEFAULT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+    /// A throttle using [`Self::DEFAULT_MIN_INTERVAL`] (~30 Hz).
+    pub fn new() -> Self {
+        Self::with_min_interval(Self::DEFAULT_MIN_INTERVAL)
+    }
+
+    /// A throttle using a caller-chosen minimum interval between emits
+    /// (tests use this to exercise the cadence logic without depending on
+    /// the production constant).
+    pub fn with_min_interval(min_interval: std::time::Duration) -> Self {
+        Self {
+            min_interval,
+            last_emitted_at: None,
+        }
+    }
+
+    /// Whether `rms_level` observed at `now` should be emitted now, given
+    /// everything observed so far. The very first observation always
+    /// emits (issue #126: the pill's meter should reflect the first
+    /// sample immediately rather than waiting out a full throttle window);
+    /// after that, at most one emit per [`Self::min_interval`] elapsed
+    /// since the previous emit. Gating is purely time-based -- the level
+    /// value itself never fast-tracks or delays an emit, and a suppressed
+    /// sample is dropped outright rather than averaged/smoothed into the
+    /// next emitted value.
+    pub fn should_emit(&mut self, now: std::time::Duration, rms_level: f32) -> Option<f32> {
+        let should_emit = match self.last_emitted_at {
+            Some(last) => now.saturating_sub(last) >= self.min_interval,
+            None => true,
+        };
+        if should_emit {
+            self.last_emitted_at = Some(now);
+            Some(rms_level)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for LevelThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RT-safe latest-level cell (issue #126, M2 PR 2.2): the capture callback
+/// (writer, on the real-time `cpal` thread) records the RMS level of each
+/// captured chunk here via a lock-free atomic store -- unlike
+/// [`SharedRingBuffer`]'s `Mutex` (which the callback only ever
+/// `try_lock`s), this can never block, even briefly. The `audio-level`
+/// event poller (reader, thin glue in `lib.rs`) samples it well below the
+/// callback's own rate and pushes each sample through [`LevelThrottle`]
+/// before emitting -- this cell only ever carries a scalar, never raw
+/// samples (MISSION.md §7: audio samples never leave `audio.rs` as
+/// events).
+///
+/// `f32` has no native stable atomic type, so the level is bit-cast into
+/// an `AtomicU32` ([`f32::to_bits`]/[`f32::from_bits`]) -- a standard,
+/// allocation-free encoding; `Relaxed` ordering is sufficient since this
+/// cell carries one independent scalar with no other memory it needs to
+/// stay synchronized with.
+#[derive(Debug, Default)]
+pub struct LevelMeter {
+    bits: std::sync::atomic::AtomicU32,
+}
+
+impl LevelMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the latest observed RMS level. Called from the real-time
+    /// capture callback -- must stay lock-free/allocation-free.
+    pub fn record(&self, level: f32) {
+        self.bits
+            .store(level.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most recently recorded level, or `0.0` if none has been
+    /// recorded yet (matching [`rms_level`]'s empty-window default).
+    pub fn current(&self) -> f32 {
+        f32::from_bits(self.bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
