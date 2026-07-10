@@ -15,6 +15,28 @@
         "title": "bla",
         "width": 800,
         "height": 600
+      },
+      {
+        "label": "pill",
+        "url": "pill.html",
+        "title": "bla",
+        "width": 280,
+        "height": 80,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "title": "bla — Settings",
+        "width": 720,
+        "height": 520,
+        "visible": false
       }
     ],
     "security": {

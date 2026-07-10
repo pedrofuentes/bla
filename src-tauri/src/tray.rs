@@ -88,6 +88,18 @@ impl OutputModeSwitch {
     }
 }
 
+/// Whether the recording pill window should be shown for `state` (issue
+/// #126, M2 PR 2.1): visible for every non-`Idle` pipeline state
+/// (`Recording`/`Transcribing`/`Error`) and hidden once the pipeline returns
+/// to `Idle`. Pure and total (exhaustive `matches!`) so
+/// `lib.rs::set_pipeline_state` (thin OS glue) can call this to decide
+/// whether to show/hide the real `pill` webview window without embedding the
+/// decision itself in Tauri glue. No debounce/delay here yet — the brief
+/// defers that to a later increment.
+pub fn pill_visibility_for(state: &PipelineState) -> bool {
+    !matches!(state, PipelineState::Idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

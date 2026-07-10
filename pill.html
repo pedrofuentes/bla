@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>bla — Pill</title>
+    <style>
+      /* The pill webview window is built transparent (tauri.conf.json), so
+         the page background must be transparent too or it paints an opaque
+         rectangle over the desktop instead of the pill's own rounded shape. */
+      html,
+      body {
+        margin: 0;
+        background: transparent;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/windows/pill/main.tsx"></script>
+  </body>
+</html>

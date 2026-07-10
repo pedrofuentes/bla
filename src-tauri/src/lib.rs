@@ -43,6 +43,17 @@ use tauri_plugin_store::StoreExt;
 /// [`tauri::Manager::tray_by_id`].
 const TRAY_ID: &str = "bla-tray";
 
+/// Label of the always-on-top recording pill window (issue #126, M2 PR 2.1;
+/// see `tauri.conf.json`'s `app.windows` and `src/windows/pill/index.tsx`).
+/// `set_pipeline_state` looks it up by this label to show/hide it per
+/// [`tray::pill_visibility_for`].
+const PILL_WINDOW_LABEL: &str = "pill";
+
+/// Label of the full tabbed settings window (issue #126, M2 PR 2.1; see
+/// `tauri.conf.json`'s `app.windows` and `src/windows/settings/index.tsx`).
+/// The tray's "Settings…" item looks it up by this label to show + focus it.
+const SETTINGS_WINDOW_LABEL: &str = "settings";
+
 pub mod audio;
 // `pub` (rather than private like their stub siblings): as of the pipeline
 // increment (issue #25), `cleanup`/`output`/`pipeline` are real, tested,
@@ -456,6 +467,12 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
     let icon_label = format!("{icon_state:?}");
     let _ = app.emit("pipeline-state-changed", icon_label.clone());
 
+    // Issue #126 (M2 PR 2.1): show the always-on-top recording pill window
+    // while the pipeline is Recording/Transcribing/Error, hide it once it
+    // returns to Idle. `tray::pill_visibility_for` is the pure decision;
+    // only the actual window show/hide call below is OS glue.
+    let show_pill = tray::pill_visibility_for(&new_state);
+
     // Issue #110: reflect the same derived state on the real tray icon + its
     // disabled current-state menu line. `set_pipeline_state` runs on the
     // spawned pipeline thread and the global-shortcut callback thread, but
@@ -465,15 +482,25 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
     // the (Send) handles and marshal the actual mutation onto the main
     // thread via `run_on_main_thread`. Best-effort throughout (`let _ =`): a
     // failure to repaint the tray must never take down the dictation
-    // pipeline itself.
+    // pipeline itself. The pill window is the same kind of AppKit-backed
+    // object, so its show/hide is marshaled alongside the tray/icon updates
+    // rather than called from whichever thread `set_pipeline_state` runs on.
     let tray_icon = app.tray_by_id(TRAY_ID);
     let state_item = state.tray_state_item.lock().unwrap().clone();
+    let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
     let _ = app.run_on_main_thread(move || {
         if let Some(tray_icon) = tray_icon {
             let _ = tray_icon.set_icon(Some(tray_icon_image(icon_state)));
         }
         if let Some(item) = state_item {
             let _ = item.set_text(&icon_label);
+        }
+        if let Some(window) = pill_window {
+            let _ = if show_pill {
+                window.show()
+            } else {
+                window.hide()
+            };
         }
     });
 }
@@ -492,6 +519,16 @@ fn handle_tray_menu_event(app: &tauri::AppHandle, id: &str) {
         "hide" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
+            }
+        }
+        "settings" => {
+            // Issue #126 (M2 PR 2.1): show + focus the `settings` webview
+            // window (built `visible: false` in `tauri.conf.json` so it
+            // never flashes on launch — this tray item is its only entry
+            // point until the settings UI itself lands in a later PR).
+            if let Some(window) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
+                let _ = window.show();
+                let _ = window.set_focus();
             }
         }
         "quit" => app.exit(0),
@@ -880,7 +917,8 @@ pub fn run() {
             // `set_pipeline_state`/`commands::set_output_mode` to relabel
             // later. Menu: a disabled current-state line, the Cursor/File
             // toggle (shares `commands::set_output_mode` with the status
-            // window), Show/Hide window, and Quit.
+            // window), Show/Hide window, Settings… (issue #126, M2 PR 2.1 —
+            // shows + focuses the `settings` webview window), and Quit.
             let initial_output_mode = to_tray_output_mode(settings.output_mode);
             let tray_state_item = MenuItem::with_id(
                 &handle,
@@ -900,6 +938,8 @@ pub fn run() {
                 MenuItem::with_id(&handle, "show", "Show Window", true, None::<&str>)?;
             let tray_hide_item =
                 MenuItem::with_id(&handle, "hide", "Hide Window", true, None::<&str>)?;
+            let tray_settings_item =
+                MenuItem::with_id(&handle, "settings", "Settings…", true, None::<&str>)?;
             let tray_quit_item = MenuItem::with_id(&handle, "quit", "Quit", true, None::<&str>)?;
             let tray_menu = Menu::with_items(
                 &handle,
@@ -910,6 +950,7 @@ pub fn run() {
                     &PredefinedMenuItem::separator(&handle)?,
                     &tray_show_item,
                     &tray_hide_item,
+                    &tray_settings_item,
                     &PredefinedMenuItem::separator(&handle)?,
                     &tray_quit_item,
                 ],
