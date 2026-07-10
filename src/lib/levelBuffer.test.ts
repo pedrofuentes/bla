@@ -17,8 +17,8 @@ describe("pushLevel", () => {
   });
 
   it("drops the oldest sample once capacity is exceeded (FIFO)", () => {
-    const buf = [1, 2, 3];
-    expect(pushLevel(buf, 4, 3)).toEqual([2, 3, 4]);
+    const buf = [0.1, 0.2, 0.3];
+    expect(pushLevel(buf, 0.4, 3)).toEqual([0.2, 0.3, 0.4]);
   });
 
   it("respects a custom capacity smaller than the default", () => {

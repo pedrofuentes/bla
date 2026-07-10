@@ -30,7 +30,11 @@ describe("pillReducer / pipeline-state", () => {
   });
 
   it("maps Unknown to idle", () => {
-    const next = pillReducer(initialPillState, { type: "pipeline-state", state: "Unknown", now: 0 });
+    const next = pillReducer(initialPillState, {
+      type: "pipeline-state",
+      state: "Unknown",
+      now: 0,
+    });
     expect(next).toEqual({ mode: "idle", doneAt: null });
   });
 
