@@ -63,6 +63,11 @@ pub mod audio;
 pub mod cleanup;
 mod commands;
 mod context;
+// `pub` (issue #126, M2 PR 2.4): the typed `pipeline-error` event vocabulary
+// and its pure mapping functions are exercised from `tests/acceptance.rs`
+// (the crate's cumulative headless suite) as well as this crate's own unit
+// tests.
+pub mod errors;
 mod hotkeys;
 // `pub` (issue #24, ADR-0004): the first-run model downloader's registry,
 // AC-12 network guard, and download orchestration are real, tested,
