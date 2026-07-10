@@ -10,8 +10,8 @@
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
-    output_mode_toggle_label, register_hotkey, save_settings_to_store, spec_for_preset,
-    to_models_preset, to_tray_output_mode, AppState,
+    apply_settings_to_state, output_mode_toggle_label, react_to_transition, register_hotkey,
+    save_settings_to_store, spec_for_preset, to_models_preset, to_tray_output_mode, AppState,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -22,9 +22,12 @@ pub fn get_settings(state: State<'_, AppState>) -> crate::settings::Settings {
 }
 
 /// Replace the persisted + in-memory settings wholesale. Re-registers the
-/// global hotkey if it changed and updates the live output-mode switch
-/// (AC-14: the switch only affects dictations completing from this point
-/// forward, never one already in flight).
+/// global hotkey if it changed, flips the live hotkeys state machine's
+/// recording mode (issue #126 / PR #134 Sentinel 🔴-3 — a saved Hold↔Toggle
+/// change takes effect immediately, not after a restart; a dictation in
+/// flight across the mode change is cancelled and discarded), and updates
+/// the live output-mode switch (AC-14: the switch only affects dictations
+/// completing from this point forward, never one already in flight).
 #[tauri::command]
 pub fn set_settings(
     app: AppHandle,
@@ -50,12 +53,12 @@ pub fn set_settings(
 
     save_settings_to_store(&app, &settings)?;
 
-    state
-        .output_switch
-        .lock()
-        .unwrap()
-        .set_mode(to_tray_output_mode(settings.output_mode));
-    *state.settings.lock().unwrap() = settings;
+    // Unit-tested in lib.rs::apply_settings_tests; a mode change that
+    // interrupts an in-flight session yields Cancelled, which
+    // react_to_transition turns into stop-capture + discard-audio (the same
+    // handling as the debounce/focus-loss cancel paths).
+    let transition = apply_settings_to_state(&state, settings);
+    react_to_transition(&app, transition);
     Ok(())
 }
 

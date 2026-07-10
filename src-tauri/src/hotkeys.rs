@@ -139,6 +139,32 @@ impl StateMachine {
         }
     }
 
+    /// The currently configured recording mode.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Switch the recording mode in place (issue #126 / PR #134 Sentinel
+    /// 🔴-3: `commands::set_settings` calls this — via
+    /// `apply_settings_to_state` in lib.rs — so a saved Hold↔Toggle change
+    /// takes effect on the LIVE machine rather than after a restart).
+    ///
+    /// Setting the current mode again is a no-op (`None`) — an unrelated
+    /// settings save must not disturb a dictation in flight. An actual mode
+    /// change [`reset`](Self::reset)s the machine: a session started under
+    /// the old mode's semantics can't be meaningfully continued under the
+    /// new ones, so any in-flight session is abnormally interrupted
+    /// ([`Transition::Cancelled`] — the caller discards its audio, same as
+    /// the debounce/focus-loss paths) and the held-key set is cleared so the
+    /// machine can't wedge.
+    pub fn set_mode(&mut self, mode: Mode) -> Option<Transition> {
+        if self.mode == mode {
+            return None;
+        }
+        self.mode = mode;
+        self.reset()
+    }
+
     fn chord_complete(&self) -> bool {
         !self.chord.is_empty() && self.chord.iter().all(|key| self.held.contains(key))
     }

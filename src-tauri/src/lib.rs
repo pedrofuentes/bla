@@ -149,6 +149,37 @@ fn to_tray_output_mode(mode: settings::OutputModeSetting) -> tray::OutputMode {
     }
 }
 
+/// Apply an already-validated (and persisted) `settings` value to the live
+/// in-memory [`AppState`]: flips the hotkeys state machine's recording mode
+/// (issue #126 / PR #134 Sentinel 🔴-3 — before this, the machine was built
+/// once at startup and a saved Hold↔Toggle change only took effect after a
+/// restart while the UI said "Saved"), updates the live output-mode switch
+/// (AC-14), and replaces the in-memory settings snapshot.
+///
+/// Returns the [`hotkeys::Transition`] the mode flip produced —
+/// `Some(Cancelled)` when it interrupted an in-flight session — for the
+/// caller (`commands::set_settings`) to hand to [`react_to_transition`],
+/// which stops capture and discards the buffered audio. Takes no
+/// `AppHandle`, so `set_settings`'s state-application step is unit-testable
+/// without a live Tauri app (see `apply_settings_tests`).
+pub(crate) fn apply_settings_to_state(
+    state: &AppState,
+    settings: settings::Settings,
+) -> Option<hotkeys::Transition> {
+    let transition = state
+        .hotkeys
+        .lock()
+        .unwrap()
+        .set_mode(to_hotkey_mode(settings.recording_mode));
+    state
+        .output_switch
+        .lock()
+        .unwrap()
+        .set_mode(to_tray_output_mode(settings.output_mode));
+    *state.settings.lock().unwrap() = settings;
+    transition
+}
+
 /// Translate the persisted [`settings::ModelPreset`] to the models
 /// downloader's registry [`models::ModelPreset`].
 fn to_models_preset(preset: settings::ModelPreset) -> models::ModelPreset {
