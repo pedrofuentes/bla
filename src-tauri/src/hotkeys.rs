@@ -528,6 +528,105 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Issue #126 / PR #134 Sentinel 🔴-3: a recording_mode change saved via
+    // set_settings must take effect on the LIVE machine, not after restart.
+    // set_mode is the pure mechanism: flips the mode in place, cancelling
+    // any in-flight session (a session started under the old mode's
+    // semantics can't be meaningfully continued under the new ones).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn mode_getter_exposes_the_configured_mode() {
+        let hold = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+        let toggle = StateMachine::new(Mode::Toggle, [1], Duration::from_millis(300));
+        assert_eq!(hold.mode(), Mode::Hold);
+        assert_eq!(toggle.mode(), Mode::Toggle);
+    }
+
+    #[test]
+    fn set_mode_to_the_same_mode_is_a_noop_that_preserves_an_in_flight_session() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        assert_eq!(start, Some(Transition::StartRecording));
+
+        // Re-applying the current mode (e.g. a settings save that changed
+        // only the model preset) must not cancel the dictation in flight.
+        assert_eq!(sm.set_mode(Mode::Hold), None);
+        assert_eq!(sm.mode(), Mode::Hold);
+
+        let stop = sm.handle(KeyEvent::KeyUp(1, ms(500)));
+        assert_eq!(stop, Some(Transition::StopRecording));
+    }
+
+    #[test]
+    fn set_mode_while_idle_switches_semantics_without_a_cancel_issue_126() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+
+        assert_eq!(
+            sm.set_mode(Mode::Toggle),
+            None,
+            "idle switch has nothing to cancel"
+        );
+        assert_eq!(sm.mode(), Mode::Toggle);
+
+        // Prove toggle semantics are actually live: release is ignored, the
+        // next press stops.
+        let start = sm.handle(KeyEvent::KeyDown(1, ms(0)));
+        let release_noop = sm.handle(KeyEvent::KeyUp(1, ms(50)));
+        let stop = sm.handle(KeyEvent::KeyDown(1, ms(1_000)));
+        assert_eq!(start, Some(Transition::StartRecording));
+        assert_eq!(release_noop, None);
+        assert_eq!(stop, Some(Transition::StopRecording));
+    }
+
+    #[test]
+    fn set_mode_cancels_an_in_flight_hold_session_issue_126() {
+        let mut sm = StateMachine::new(Mode::Hold, [1], Duration::from_millis(300));
+        assert_eq!(
+            sm.handle(KeyEvent::KeyDown(1, ms(0))),
+            Some(Transition::StartRecording)
+        );
+
+        // Mid-hold mode change: the session is cancelled (caller discards
+        // audio, same as the debounce/reset paths) and the machine is left
+        // unwedged under the new mode.
+        assert_eq!(sm.set_mode(Mode::Toggle), Some(Transition::Cancelled));
+        assert_eq!(sm.mode(), Mode::Toggle);
+
+        // The old session's dangling KeyUp is inert (held set was cleared)…
+        assert_eq!(sm.handle(KeyEvent::KeyUp(1, ms(100))), None);
+        // …and a fresh press starts a brand-new toggle session.
+        assert_eq!(
+            sm.handle(KeyEvent::KeyDown(1, ms(1_000))),
+            Some(Transition::StartRecording)
+        );
+    }
+
+    #[test]
+    fn set_mode_cancels_an_in_flight_toggle_session_issue_126() {
+        let mut sm = StateMachine::new(Mode::Toggle, [1], Duration::from_millis(300));
+        assert_eq!(
+            sm.handle(KeyEvent::KeyDown(1, ms(0))),
+            Some(Transition::StartRecording)
+        );
+        sm.handle(KeyEvent::KeyUp(1, ms(50))); // toggle ignores release
+
+        assert_eq!(sm.set_mode(Mode::Hold), Some(Transition::Cancelled));
+        assert_eq!(sm.mode(), Mode::Hold);
+
+        // Hold semantics are live: press + long hold + release is one
+        // dictation.
+        assert_eq!(
+            sm.handle(KeyEvent::KeyDown(1, ms(1_000))),
+            Some(Transition::StartRecording)
+        );
+        assert_eq!(
+            sm.handle(KeyEvent::KeyUp(1, ms(2_000))),
+            Some(Transition::StopRecording)
+        );
+    }
+
     // Keys outside the configured chord must be inert.
     #[test]
     fn unrelated_keys_are_ignored() {

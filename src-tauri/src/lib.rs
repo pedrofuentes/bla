@@ -203,6 +203,124 @@ fn should_reuse_cached_stt(
 }
 
 #[cfg(test)]
+mod apply_settings_tests {
+    //! Issue #126 / PR #134 Sentinel 🔴-3: `commands::set_settings` must
+    //! apply a changed `recording_mode` to the LIVE hotkeys state machine —
+    //! before this, the machine was built once at startup and a Hold↔Toggle
+    //! save only took effect after an app restart while the UI said "Saved".
+    //! `apply_settings_to_state` is the (AppHandle-free) function
+    //! `set_settings` delegates its in-memory state application to, so the
+    //! machine's post-save mode is assertable here without a live Tauri app.
+
+    use super::*;
+
+    /// An `AppState` for exercising `apply_settings_to_state` without a
+    /// Tauri app: no tray items, no capture session, a tiny ring buffer.
+    fn test_app_state(settings: settings::Settings) -> AppState {
+        AppState {
+            hotkeys: Mutex::new(hotkeys::StateMachine::new(
+                to_hotkey_mode(settings.recording_mode),
+                [0u32],
+                hotkeys::DEFAULT_DEBOUNCE,
+            )),
+            buffer: Arc::new(Mutex::new(audio::RingBuffer::new(16))),
+            diagnostics: Arc::new(audio::CaptureDiagnostics::new()),
+            capture: Mutex::new(None),
+            output_switch: Mutex::new(tray::OutputModeSwitch::new(to_tray_output_mode(
+                settings.output_mode,
+            ))),
+            pipeline_state: Mutex::new(tray::PipelineState::Idle),
+            tray_state_item: Mutex::new(None),
+            tray_output_toggle_item: Mutex::new(None),
+            settings: Mutex::new(settings),
+            #[cfg(feature = "whisper")]
+            stt_cache: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn apply_settings_flips_the_live_hotkey_machine_mode_issue_126() {
+        // Default settings are Hold.
+        let state = test_app_state(settings::Settings::default());
+        let new = settings::Settings {
+            recording_mode: settings::RecordingMode::Toggle,
+            ..settings::Settings::default()
+        };
+
+        let transition = apply_settings_to_state(&state, new.clone());
+
+        assert_eq!(transition, None, "idle machine: nothing to cancel");
+        assert_eq!(
+            state.hotkeys.lock().unwrap().mode(),
+            hotkeys::Mode::Toggle,
+            "the LIVE machine must run the just-saved mode, not wait for a restart"
+        );
+        assert_eq!(*state.settings.lock().unwrap(), new);
+    }
+
+    #[test]
+    fn apply_settings_cancels_an_in_flight_session_on_a_mode_change_issue_126() {
+        let state = test_app_state(settings::Settings::default());
+        // Drive the live machine into a hold-in-progress first.
+        let started = state
+            .hotkeys
+            .lock()
+            .unwrap()
+            .handle(hotkeys::KeyEvent::KeyDown(0, std::time::Duration::ZERO));
+        assert_eq!(started, Some(hotkeys::Transition::StartRecording));
+
+        let new = settings::Settings {
+            recording_mode: settings::RecordingMode::Toggle,
+            ..settings::Settings::default()
+        };
+        let transition = apply_settings_to_state(&state, new);
+
+        // The caller (set_settings) hands this to react_to_transition, which
+        // stops capture and discards the buffered audio.
+        assert_eq!(transition, Some(hotkeys::Transition::Cancelled));
+        assert_eq!(state.hotkeys.lock().unwrap().mode(), hotkeys::Mode::Toggle);
+    }
+
+    #[test]
+    fn apply_settings_with_an_unchanged_mode_leaves_a_session_in_flight() {
+        let state = test_app_state(settings::Settings::default());
+        let started = state
+            .hotkeys
+            .lock()
+            .unwrap()
+            .handle(hotkeys::KeyEvent::KeyDown(0, std::time::Duration::ZERO));
+        assert_eq!(started, Some(hotkeys::Transition::StartRecording));
+
+        // Same recording_mode, different model preset — a dictation in
+        // flight must NOT be cancelled by an unrelated settings save.
+        let new = settings::Settings {
+            model_preset: settings::ModelPreset::Small,
+            ..settings::Settings::default()
+        };
+        let transition = apply_settings_to_state(&state, new);
+
+        assert_eq!(transition, None);
+        assert_eq!(state.hotkeys.lock().unwrap().mode(), hotkeys::Mode::Hold);
+    }
+
+    #[test]
+    fn apply_settings_updates_the_live_output_switch() {
+        let state = test_app_state(settings::Settings::default()); // Cursor
+        let new = settings::Settings {
+            output_mode: settings::OutputModeSetting::File,
+            ..settings::Settings::default()
+        };
+
+        apply_settings_to_state(&state, new);
+
+        assert_eq!(
+            state.output_switch.lock().unwrap().route_target(),
+            tray::OutputMode::File
+        );
+    }
+}
+
+#[cfg(test)]
 mod mapping_tests {
     use super::*;
 
