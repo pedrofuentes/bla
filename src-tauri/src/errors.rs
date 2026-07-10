@@ -56,19 +56,35 @@ impl ErrorKind {
     /// all, as opposed to [`ErrorKind::OllamaUnreachable`] (purely
     /// informational — the AC-4 fallback still pastes).
     pub fn is_blocking(&self) -> bool {
-        unimplemented!("RED: ErrorKind::is_blocking not yet implemented")
+        !matches!(self, ErrorKind::OllamaUnreachable)
     }
 
     /// The static, kind-derived message safe to show the user / emit over
     /// IPC (HARD RULE: never derived from the wrapped error's own text).
     pub fn message(&self) -> String {
-        unimplemented!("RED: ErrorKind::message not yet implemented")
+        match self {
+            ErrorKind::ModelMissing => {
+                "The speech-to-text model is missing or failed to load.".to_string()
+            }
+            ErrorKind::OllamaUnreachable => {
+                "Local AI cleanup is unreachable; used basic cleanup instead.".to_string()
+            }
+            ErrorKind::MicPermissionDenied => {
+                "Microphone access is unavailable or was denied.".to_string()
+            }
+            ErrorKind::Other { message } => message.clone(),
+        }
     }
 
     /// The `kind` discriminant string used in the emitted event payload
     /// (`PipelineErrorEvent::kind`).
     pub fn as_str(&self) -> &'static str {
-        unimplemented!("RED: ErrorKind::as_str not yet implemented")
+        match self {
+            ErrorKind::ModelMissing => "ModelMissing",
+            ErrorKind::OllamaUnreachable => "OllamaUnreachable",
+            ErrorKind::MicPermissionDenied => "MicPermissionDenied",
+            ErrorKind::Other { .. } => "Other",
+        }
     }
 }
 
@@ -83,22 +99,47 @@ pub struct PipelineErrorEvent {
 }
 
 impl From<&ErrorKind> for PipelineErrorEvent {
-    fn from(_kind: &ErrorKind) -> Self {
-        unimplemented!("RED: PipelineErrorEvent::from(&ErrorKind) not yet implemented")
+    fn from(kind: &ErrorKind) -> Self {
+        Self {
+            kind: kind.as_str().to_string(),
+            message: kind.message(),
+        }
     }
 }
 
 /// Maps a [`crate::pipeline::PipelineError`] (transcription/output
 /// failures — never the AC-4 cleanup fallback, which isn't an error) to its
-/// [`ErrorKind`].
-pub fn error_kind_for_pipeline_error(_err: &PipelineError) -> ErrorKind {
-    unimplemented!("RED: error_kind_for_pipeline_error not yet implemented")
+/// [`ErrorKind`]. Never reads the wrapped error's own `Display`/text into the
+/// result (HARD RULE, module doc) — only ever branches on which variant
+/// fired.
+pub fn error_kind_for_pipeline_error(err: &PipelineError) -> ErrorKind {
+    match err {
+        PipelineError::Stt(SttError::ModelLoad(_)) => ErrorKind::ModelMissing,
+        PipelineError::Stt(SttError::Transcription(_)) => ErrorKind::Other {
+            message: "Transcription failed.".to_string(),
+        },
+        PipelineError::Output(_) => ErrorKind::Other {
+            message: "Failed to deliver the transcribed text.".to_string(),
+        },
+    }
 }
 
 /// Maps a [`crate::audio::CaptureError`] (capture-start failure) to its
-/// [`ErrorKind`].
-pub fn error_kind_for_capture_error(_err: &CaptureError) -> ErrorKind {
-    unimplemented!("RED: error_kind_for_capture_error not yet implemented")
+/// [`ErrorKind`]. `NoInputDevice` is treated as mic-permission-denied: on
+/// macOS, a TCC mic-permission denial makes device enumeration itself come
+/// back empty rather than surfacing a distinct permission error from `cpal`
+/// — so "no input device found" at capture-start is, in practice, almost
+/// always a permission problem rather than genuinely no hardware.
+pub fn error_kind_for_capture_error(err: &CaptureError) -> ErrorKind {
+    match err {
+        CaptureError::NoInputDevice => ErrorKind::MicPermissionDenied,
+        CaptureError::Cpal(_) => ErrorKind::Other {
+            message: "The microphone could not be opened.".to_string(),
+        },
+        CaptureError::Timeout => ErrorKind::Other {
+            message: "The microphone did not start in time.".to_string(),
+        },
+    }
 }
 
 /// Maps the `lib.rs::build_stt` model-missing `String` error surface (which
@@ -107,7 +148,7 @@ pub fn error_kind_for_capture_error(_err: &CaptureError) -> ErrorKind {
 /// means no STT engine is available to run this dictation. The message
 /// itself is intentionally ignored (HARD RULE).
 pub fn error_kind_for_build_stt_failure(_msg: &str) -> ErrorKind {
-    unimplemented!("RED: error_kind_for_build_stt_failure not yet implemented")
+    ErrorKind::ModelMissing
 }
 
 #[cfg(test)]

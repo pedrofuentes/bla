@@ -423,8 +423,13 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
                 Err(err) => {
                     // Issue #59: surfaced as structured pipeline state, not
                     // an invisible eprintln! — a packaged app's tray can
-                    // reflect this via `tray::tray_icon_state`.
+                    // reflect this via `tray::tray_icon_state`. Issue #126
+                    // (M2 PR 2.4): also a typed `pipeline-error` event so the
+                    // pill window can toast a specific, blocking reason
+                    // (most commonly mic-permission denial) rather than the
+                    // generic Error icon alone.
                     eprintln!("bla: failed to start audio capture: {err}");
+                    emit_pipeline_error(app, &errors::error_kind_for_capture_error(&err));
                     set_pipeline_state(app, tray::PipelineState::Error);
                 }
             }
@@ -578,6 +583,18 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
             };
         }
     });
+}
+
+/// Emits the `pipeline-error` event (issue #126, M2 PR 2.4) the pill
+/// window's toast listens for. `kind` is always mapped via one of
+/// `errors::error_kind_for_*` (never built ad hoc at a call site), so the
+/// HARD RULE in `errors.rs`'s module doc — the payload never carries
+/// transcript/clipboard/audio content — holds at every emit site. Best-
+/// effort like every other emit in this file (`let _ =`): a dropped toast
+/// must never take down the dictation pipeline itself.
+fn emit_pipeline_error(app: &tauri::AppHandle, kind: &errors::ErrorKind) {
+    let event = errors::PipelineErrorEvent::from(kind);
+    let _ = app.emit("pipeline-error", event);
 }
 
 /// Dispatches a click on one of the tray menu's items (issue #110), by the
@@ -882,15 +899,27 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                     std::thread::sleep,
                 );
                 match pipeline.run(&samples, &opts) {
-                    Ok(_outcome) => set_pipeline_state(&app, tray::PipelineState::Idle),
+                    Ok(outcome) => {
+                        // Issue #126 (M2 PR 2.4), AC-4/ADR-0005: the Ollama
+                        // fallback is informational, not a failure — the
+                        // dictation already completed and pasted/wrote
+                        // successfully above. Emit alongside the normal Idle
+                        // transition, never in place of it.
+                        if outcome.cleanup_fell_back {
+                            emit_pipeline_error(&app, &errors::ErrorKind::OllamaUnreachable);
+                        }
+                        set_pipeline_state(&app, tray::PipelineState::Idle);
+                    }
                     Err(err) => {
                         eprintln!("bla: pipeline run failed: {err}");
+                        emit_pipeline_error(&app, &errors::error_kind_for_pipeline_error(&err));
                         set_pipeline_state(&app, tray::PipelineState::Error);
                     }
                 }
             }
             Err(msg) => {
                 eprintln!("bla: {msg}");
+                emit_pipeline_error(&app, &errors::error_kind_for_build_stt_failure(&msg));
                 set_pipeline_state(&app, tray::PipelineState::Error);
             }
         }
