@@ -117,6 +117,49 @@ pub fn should_hide_pill_after_notice(state: &PipelineState) -> bool {
     matches!(state, PipelineState::Idle)
 }
 
+/// Whether a Busy → Idle transition should keep the pill visible for a
+/// "done" confirmation instead of hiding it in the same call (issue #151).
+/// True only when `previous` was actively dictating
+/// (`Recording`/`Transcribing`) — i.e. the pipeline just *completed* a
+/// dictation, as opposed to a hotkey cancel (which calls
+/// `set_pipeline_state(Idle)` directly, never routing through the settle
+/// path this guards) or an already-`Idle`/`Error` state. Distinct from
+/// [`pill_visibility_for`]`(&Idle)` (always `false`): callers that know a
+/// dictation just completed route through `apply_pipeline_state(Idle, true)`
+/// instead so the frontend's "done" state (`pillState.ts`) actually gets a
+/// visible pill to render onto before it auto-hides. Pure/total so the
+/// decision is unit-tested; the grace-window sleep + `window.hide()` stay
+/// thin OS glue in `lib.rs`.
+pub fn should_keep_pill_visible_for_done(previous: &PipelineState) -> bool {
+    matches!(
+        previous,
+        PipelineState::Recording | PipelineState::Transcribing
+    )
+}
+
+/// Race-safe guard for a delayed pill-hide started by a "keep the pill
+/// visible for a while, then maybe hide it" settle (issue #155; Sentinel 🔴
+/// on PR #137's re-review). `settle_idle_keeping_pill_for_notice` (AC-4
+/// informational toast) and its issue-#151 sibling for the "done"
+/// confirmation both bump a monotonic `AppState` "pill visibility epoch"
+/// when they start, then capture that epoch before sleeping. Two such
+/// settles can overlap within their windows (a notice and a done-settle, or
+/// two notices back to back); `should_hide_pill_after_notice` alone only
+/// checks that the pipeline is still `Idle`, which is also (coincidentally)
+/// true once a *second*, newer settle has itself already applied `Idle` —
+/// so the stale first settle would wrongly hide the pill out from under the
+/// newer one's still-live visible window. Hiding now requires BOTH that no
+/// newer settle has started since (`epoch_at_settle == current_epoch`) AND
+/// that `should_hide_pill_after_notice` still holds. Pure/total; the actual
+/// epoch bump/load and `window.hide()` stay thin OS glue in `lib.rs`.
+pub fn should_hide_pill_for_settle(
+    epoch_at_settle: u64,
+    current_epoch: u64,
+    state: &PipelineState,
+) -> bool {
+    epoch_at_settle == current_epoch && should_hide_pill_after_notice(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +185,63 @@ mod tests {
         assert!(!should_hide_pill_after_notice(&PipelineState::Recording));
         assert!(!should_hide_pill_after_notice(&PipelineState::Transcribing));
         assert!(!should_hide_pill_after_notice(&PipelineState::Error));
+    }
+
+    #[test]
+    fn should_keep_pill_visible_for_done_only_after_an_active_dictation_issue_151() {
+        // The completed-dictation transition (issue #151): the pipeline was
+        // actively Recording/Transcribing right before settling to Idle, so
+        // the "done" confirmation gets a visible pill to render onto.
+        assert!(should_keep_pill_visible_for_done(&PipelineState::Recording));
+        assert!(should_keep_pill_visible_for_done(
+            &PipelineState::Transcribing
+        ));
+        // Already-Idle or Error aren't a completed-dictation transition —
+        // no "done" confirmation is owed.
+        assert!(!should_keep_pill_visible_for_done(&PipelineState::Idle));
+        assert!(!should_keep_pill_visible_for_done(&PipelineState::Error));
+    }
+
+    #[test]
+    fn should_hide_pill_for_settle_hides_only_when_idle_and_epoch_unchanged_issue_155() {
+        // The normal case: the epoch captured at settle-start is still
+        // current (no newer settle has started) and the pipeline is still
+        // Idle by the time the delayed hide wakes up.
+        assert!(should_hide_pill_for_settle(1, 1, &PipelineState::Idle));
+    }
+
+    #[test]
+    fn should_hide_pill_for_settle_stands_down_when_a_newer_settle_started_issue_155() {
+        // Issue #155 (overlapping-notice epoch race): capture the epoch a
+        // settle started at (1), then simulate a second, newer settle
+        // bumping it (2) before the first settle's delayed hide wakes up.
+        // Even though the pipeline is (coincidentally) still/again Idle, the
+        // stale settle must stand down rather than hide the pill out from
+        // under the newer settle's own still-live visible window.
+        let epoch_at_settle = 1;
+        let current_epoch = 2;
+        assert!(!should_hide_pill_for_settle(
+            epoch_at_settle,
+            current_epoch,
+            &PipelineState::Idle
+        ));
+    }
+
+    #[test]
+    fn should_hide_pill_for_settle_never_hides_while_actively_dictating_issue_155() {
+        // Epoch-unchanged alone isn't sufficient — a new dictation started
+        // during the window must still preempt cleanly regardless of epoch.
+        assert!(!should_hide_pill_for_settle(
+            1,
+            1,
+            &PipelineState::Recording
+        ));
+        assert!(!should_hide_pill_for_settle(
+            1,
+            1,
+            &PipelineState::Transcribing
+        ));
+        assert!(!should_hide_pill_for_settle(1, 1, &PipelineState::Error));
     }
 
     #[test]

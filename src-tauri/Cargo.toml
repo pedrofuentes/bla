@@ -21,8 +21,12 @@ tauri-build = { version = "2", features = [] }
 # `tray-icon`: the real system-tray/menu-bar surface (issue #110), wired in
 # `lib.rs::run()`'s `setup()`. `image-png`: lets `tauri::image::Image::from_bytes`
 # decode the bundled placeholder PNGs under `icons/tray/` into the raw RGBA
-# `TrayIcon::set_icon` needs.
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# `TrayIcon::set_icon` needs. `macos-private-api`: required on macOS for
+# `tauri.conf.json`'s `app.macOSPrivateApi`/the pill window's `transparent:
+# true` to actually take effect in WKWebView (issue #129) -- see DECISIONS.md
+# for why the private API is accepted for this app's GitHub-Release-only
+# distribution.
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

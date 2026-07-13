@@ -17,6 +17,21 @@ import type { ModelPreset, OutputModeSetting, RecordingMode } from "./ipc";
  */
 export type PipelineState = "Idle" | "Active" | "Busy" | "Error" | "Unknown";
 
+/** The in-contract `pipeline-state-changed` payloads (excludes the client-only `"Unknown"`). */
+const PIPELINE_STATES: readonly PipelineState[] = ["Idle", "Active", "Busy", "Error"];
+
+/**
+ * Narrows a raw `pipeline-state-changed` payload (the Debug-formatted
+ * `tray::TrayIconState`) to a {@link PipelineState}, degrading anything
+ * out-of-contract to `"Unknown"` (which renders as idle) rather than letting
+ * an unchecked cast flow a bad string into a consumer's `switch` and read
+ * `undefined.mode`. Pure — the single guarded seam every event handler
+ * should route the raw payload through instead of `payload as PipelineState`.
+ */
+export function parsePipelineState(raw: string): PipelineState {
+  return (PIPELINE_STATES as readonly string[]).includes(raw) ? (raw as PipelineState) : "Unknown";
+}
+
 /** How the selected Whisper model's on-disk state is currently understood. */
 export type ModelStatus = "checking" | "ready" | "downloading" | "error";
 

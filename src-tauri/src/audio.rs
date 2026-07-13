@@ -186,6 +186,24 @@ pub fn peak_level(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()))
 }
 
+/// Clamp a level to the emitted `audio-level` contract's `0.0..=1.0` range
+/// (issue #136 item 2). Driver-clipped input can push [`rms_level`] above
+/// `1.0`, so the value must be capped before it goes out as an event.
+/// Unlike `f32::clamp`, this maps `NaN` to the `0.0` floor rather than
+/// propagating it -- mirroring the TS-side `clamp01` (`src/lib/levelBuffer.ts`)
+/// so a single broken sample can't poison the pill's meter. Pure and
+/// unit-tested, so the clamp isn't untested arithmetic buried in `lib.rs`
+/// glue.
+pub fn clamp_level(level: f32) -> f32 {
+    if level.is_nan() || level < 0.0 {
+        0.0
+    } else if level > 1.0 {
+        1.0
+    } else {
+        level
+    }
+}
+
 /// Write a captured window of 16 kHz mono `f32` samples out as a 16-bit PCM
 /// WAV file, so the pipeline and tests can round-trip a captured window
 /// (e.g. as an `stt` input fixture).
@@ -537,7 +555,10 @@ impl LevelThrottle {
     /// since the previous emit. Gating is purely time-based -- the level
     /// value itself never fast-tracks or delays an emit, and a suppressed
     /// sample is dropped outright rather than averaged/smoothed into the
-    /// next emitted value.
+    /// next emitted value. The value it returns is passed through
+    /// [`clamp_level`] (issue #136 item 2), so this single choke point
+    /// guarantees the emitted `audio-level` stays within the documented
+    /// `0.0..=1.0` range regardless of caller.
     pub fn should_emit(&mut self, now: std::time::Duration, rms_level: f32) -> Option<f32> {
         let should_emit = match self.last_emitted_at {
             Some(last) => now.saturating_sub(last) >= self.min_interval,
@@ -545,7 +566,7 @@ impl LevelThrottle {
         };
         if should_emit {
             self.last_emitted_at = Some(now);
-            Some(rms_level)
+            Some(clamp_level(rms_level))
         } else {
             None
         }
@@ -681,6 +702,46 @@ mod tests {
     #[test]
     fn peak_level_of_empty_window_is_zero() {
         assert_eq!(peak_level(&[]), 0.0);
+    }
+
+    #[test]
+    fn clamp_level_caps_driver_clipped_input_at_one() {
+        // Issue #136 item 2: driver-clipped input can push rms_level above
+        // 1.0; the emitted `audio-level` contract is 0.0..=1.0.
+        assert_eq!(clamp_level(1.4), 1.0);
+        assert_eq!(clamp_level(f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn clamp_level_holds_the_zero_floor() {
+        assert_eq!(clamp_level(-0.3), 0.0);
+        assert_eq!(clamp_level(f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn clamp_level_maps_nan_to_the_zero_floor() {
+        // `f32::clamp` would propagate NaN; mirror the TS-side clamp01 which
+        // treats NaN as 0.0 so a broken sample can't poison the meter.
+        assert_eq!(clamp_level(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn clamp_level_passes_in_range_values_through_unchanged() {
+        assert_eq!(clamp_level(0.0), 0.0);
+        assert_eq!(clamp_level(0.42), 0.42);
+        assert_eq!(clamp_level(1.0), 1.0);
+    }
+
+    #[test]
+    fn should_emit_clamps_the_value_it_returns_to_the_documented_range() {
+        // The throttle is the single choke point producing the emitted
+        // value, so clamping there guarantees the wire contract regardless
+        // of caller.
+        let mut throttle = LevelThrottle::new();
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 1.7),
+            Some(1.0)
+        );
     }
 
     #[test]
