@@ -8,6 +8,7 @@
 //! to call against as of this increment, issue #91).
 
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
     apply_settings_to_state, output_mode_toggle_label, react_to_transition, register_hotkey,
@@ -25,9 +26,11 @@ pub fn get_settings(state: State<'_, AppState>) -> crate::settings::Settings {
 /// global hotkey if it changed, flips the live hotkeys state machine's
 /// recording mode (issue #126 / PR #134 Sentinel 🔴-3 — a saved Hold↔Toggle
 /// change takes effect immediately, not after a restart; a dictation in
-/// flight across the mode change is cancelled and discarded), and updates
-/// the live output-mode switch (AC-14: the switch only affects dictations
-/// completing from this point forward, never one already in flight).
+/// flight across the mode change is cancelled and discarded), updates the
+/// live output-mode switch (AC-14: the switch only affects dictations
+/// completing from this point forward, never one already in flight), and
+/// enables/disables OS login autostart when `launch_at_login` flipped
+/// (issue #126, M2 PR 2.6).
 #[tauri::command]
 pub fn set_settings(
     app: AppHandle,
@@ -37,6 +40,17 @@ pub fn set_settings(
     let hotkey_changed = {
         let current = state.settings.lock().unwrap();
         current.hotkey != settings.hotkey
+    };
+    // Issue #126: the pure decision of whether/which direction this save's
+    // launch_at_login change should flip OS autostart registration —
+    // unit-tested in `settings::autostart_action_for_change`. `None` on the
+    // common case of a save that doesn't touch this field.
+    let autostart_action = {
+        let current = state.settings.lock().unwrap();
+        crate::settings::autostart_action_for_change(
+            current.launch_at_login,
+            settings.launch_at_login,
+        )
     };
 
     // Issue #91 (Sentinel 🔴): validate + register the new hotkey BEFORE
@@ -52,6 +66,31 @@ pub fn set_settings(
     }
 
     save_settings_to_store(&app, &settings)?;
+
+    // Issue #126: thin OS glue over `tauri-plugin-autostart`'s
+    // `AutoLaunchManager` — the decision of WHETHER to call this already
+    // happened above (`autostart_action_for_change`). Best-effort and
+    // non-fatal: settings are already persisted at this point, so a failure
+    // to flip the OS-level login-item registration (e.g. a sandboxed/dev
+    // environment without login-item permissions) must not fail the save
+    // the user just made or leave `settings.json` and the OS registration
+    // silently disagreeing about a value that DID persist.
+    //
+    // Dev-build note: in a `cargo tauri dev` / `cargo run` build this
+    // registers the dev binary's path (e.g. `target/debug/bla`), not a
+    // stable packaged-app path — expected and harmless for local
+    // development; only a `tauri build` binary's login-item entry is what
+    // ships to users.
+    if let Some(action) = autostart_action {
+        let manager = app.autolaunch();
+        let result = match action {
+            crate::settings::AutostartAction::Enable => manager.enable(),
+            crate::settings::AutostartAction::Disable => manager.disable(),
+        };
+        if let Err(err) = result {
+            eprintln!("bla: failed to update launch-at-login OS registration: {err}");
+        }
+    }
 
     // Unit-tested in lib.rs::apply_settings_tests; a mode change that
     // interrupts an in-flight session yields Cancelled, which

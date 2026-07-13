@@ -36,6 +36,8 @@ const BASE_SETTINGS: Settings = {
   model_preset: "LargeV3Turbo",
   output_mode: "Cursor",
   file_path_template: "{{date:YYYY-MM-DD}}.md",
+  launch_at_login: false,
+  sound_cues: true,
 };
 
 function setupInvoke(overrides: Partial<Record<string, (...args: unknown[]) => unknown>> = {}) {
@@ -345,6 +347,79 @@ describe("GeneralTab", () => {
     // concurrent change.
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, output_mode: "File" },
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Issue #126 (M2 PR 2.6): "Launch bla at login" and "Play sound cues"
+  // checkboxes, wired through get_settings/set_settings like every other
+  // control on this tab.
+  // -------------------------------------------------------------------
+
+  it("pre-fills the launch-at-login and sound-cues checkboxes from get_settings", async () => {
+    setupInvoke({
+      get_settings: () => ({ ...BASE_SETTINGS, launch_at_login: true, sound_cues: false }),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+
+    expect(launchCheckbox.checked).toBe(true);
+    expect(soundCheckbox.checked).toBe(false);
+  });
+
+  it("persists a toggled launch-at-login via set_settings with the right payload", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    expect(launchCheckbox.checked).toBe(false);
+    click(launchCheckbox);
+    await flush();
+    expect(launchCheckbox.checked).toBe(true);
+
+    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="save-button"]',
+    )!;
+    invoke.mockClear();
+    click(saveButton);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, launch_at_login: true },
+    });
+  });
+
+  it("persists a toggled sound-cues preference via set_settings with the right payload", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+    expect(soundCheckbox.checked).toBe(true);
+    click(soundCheckbox);
+    await flush();
+    expect(soundCheckbox.checked).toBe(false);
+
+    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="save-button"]',
+    )!;
+    invoke.mockClear();
+    click(saveButton);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, sound_cues: false },
     });
   });
 });

@@ -20,6 +20,8 @@ const BASE_SETTINGS: Settings = {
   model_preset: "LargeV3Turbo",
   output_mode: "Cursor",
   file_path_template: "{{date:YYYY-MM-DD}}.md",
+  launch_at_login: false,
+  sound_cues: true,
 };
 
 let mounted: Mounted | undefined;

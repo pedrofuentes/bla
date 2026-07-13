@@ -19,6 +19,13 @@ type SaveStatus = "idle" | "saving" | "saved";
  * and hold-vs-toggle recording mode. Talks to the core only through
  * `src/lib/ipc.ts`.
  *
+ * M2 PR 2.6 adds two plain persisted-preference checkboxes: "Launch bla at
+ * login" (`launch_at_login` — the backend flips OS autostart registration
+ * as a `set_settings` side-effect; see `commands::set_settings`) and "Play
+ * sound cues" (`sound_cues` — a pure preference in this PR; cue playback
+ * itself is PR 2.7). Both follow the same load-into-local-state /
+ * spread-into-`next`-on-save pattern as every other control here.
+ *
  * Hotkey save ordering mirrors the backend's validate-before-persist
  * invariant (issue #91 Sentinel 🔴, `settings::persist_validated`): a
  * captured chord is validated via the new `validate_hotkey` command
@@ -48,6 +55,8 @@ export function GeneralTab() {
   const [capturing, setCapturing] = useState(false);
   const [recordingMode, setRecordingMode] = useState<RecordingMode>("Hold");
   const [modelPreset, setModelPreset] = useState<ModelPreset>("LargeV3Turbo");
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [soundCues, setSoundCues] = useState(true);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [downloadPercent, setDownloadPercent] = useState<number | undefined>(undefined);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
@@ -64,6 +73,8 @@ export function GeneralTab() {
         setHotkeyInput(loaded.hotkey);
         setRecordingMode(loaded.recording_mode);
         setModelPreset(loaded.model_preset);
+        setLaunchAtLogin(loaded.launch_at_login);
+        setSoundCues(loaded.sound_cues);
       })
       .catch((err) => {
         if (!cancelled) setSaveError(String(err));
@@ -175,6 +186,8 @@ export function GeneralTab() {
       hotkey: hotkeyInput,
       recording_mode: recordingMode,
       model_preset: modelPreset,
+      launch_at_login: launchAtLogin,
+      sound_cues: soundCues,
     };
 
     try {
@@ -194,7 +207,7 @@ export function GeneralTab() {
       setSaveStatus("idle");
       setSaveError(String(err));
     }
-  }, [settings, hotkeyInput, hotkeyError, recordingMode, modelPreset]);
+  }, [settings, hotkeyInput, hotkeyError, recordingMode, modelPreset, launchAtLogin, soundCues]);
 
   if (!settings) {
     return <p className="text-sm text-neutral-500 dark:text-neutral-400">Loading…</p>;
@@ -270,6 +283,27 @@ export function GeneralTab() {
         <p data-testid="model-status" className="text-xs text-neutral-500 dark:text-neutral-400">
           {modelStatusLabel(modelStatus, downloadPercent)}
         </p>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            data-testid="launch-at-login-checkbox"
+            checked={launchAtLogin}
+            onChange={(e) => setLaunchAtLogin(e.target.checked)}
+          />
+          Launch bla at login
+        </label>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            data-testid="sound-cues-checkbox"
+            checked={soundCues}
+            onChange={(e) => setSoundCues(e.target.checked)}
+          />
+          Play sound cues
+        </label>
       </div>
 
       {eventsError && (

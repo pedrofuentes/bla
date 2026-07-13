@@ -27,6 +27,14 @@ export interface Settings {
   model_preset: ModelPreset;
   output_mode: OutputModeSetting;
   file_path_template: string;
+  /** Issue #126, M2 PR 2.6: opt-in OS login autostart. Defaults to `false`. */
+  launch_at_login: boolean;
+  /**
+   * Issue #126, M2 PR 2.6: play short audio cues on recording start/stop.
+   * Defaults to `true`. Pure persisted preference in this PR — cue
+   * playback itself lands in PR 2.7, which reads this flag.
+   */
+  sound_cues: boolean;
 }
 
 /** Mirrors `models::DownloadProgress` (src-tauri/src/models.rs). */
