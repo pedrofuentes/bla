@@ -1,0 +1,1 @@
+- Throttled audio-level event stream (issue #126): the core now emits an `audio-level` event (~30Hz, RMS `0.0..=1.0`) while a dictation is being captured, so the recording pill's live meter (a later M2 PR) has a real signal to draw — computed off the real-time audio thread, never emitting raw samples.

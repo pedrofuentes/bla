@@ -222,10 +222,17 @@ fn hound_to_io_err(err: hound::Error) -> std::io::Error {
 /// counts the drop via `diagnostics` rather than stalling the real-time
 /// audio thread. Issue #59: a poisoned lock or a stream error is recorded
 /// into `diagnostics` (structured state the rest of the app can observe)
-/// instead of an invisible `eprintln!`.
+/// instead of an invisible `eprintln!`. Issue #126 (M2 PR 2.2): the RMS
+/// level of each resampled chunk (via [`rms_level`], the same pure fn the
+/// pill's meter has always used) is recorded into `level_meter` -- a
+/// lock-free write, so this never risks blocking the callback the way even
+/// a `try_lock` theoretically could contend. `lib.rs`'s thin glue polls
+/// `level_meter`, throttles via [`LevelThrottle`], and emits the
+/// `audio-level` Tauri event off this thread.
 pub fn start_capture(
     buffer: SharedRingBuffer,
     diagnostics: std::sync::Arc<CaptureDiagnostics>,
+    level_meter: std::sync::Arc<LevelMeter>,
 ) -> Result<cpal::Stream, CaptureError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -252,6 +259,7 @@ pub fn start_capture(
                 &mut mono_scratch,
                 &mut resampled_scratch,
             );
+            level_meter.record(rms_level(&resampled_scratch));
             match buffer.try_lock() {
                 Ok(mut buf) => buf.extend(&resampled_scratch),
                 Err(std::sync::TryLockError::WouldBlock) => {
@@ -296,23 +304,27 @@ impl CaptureSession {
     pub fn start(
         buffer: SharedRingBuffer,
         diagnostics: std::sync::Arc<CaptureDiagnostics>,
+        level_meter: std::sync::Arc<LevelMeter>,
     ) -> Result<Self, CaptureError> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), CaptureError>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
-        let handle = std::thread::spawn(move || match start_capture(buffer, diagnostics) {
-            Ok(stream) => {
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                // Block here, keeping `stream` alive, until told to stop.
-                let _ = stop_rx.recv();
-                drop(stream);
-            }
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-            }
-        });
+        let handle =
+            std::thread::spawn(
+                move || match start_capture(buffer, diagnostics, level_meter) {
+                    Ok(stream) => {
+                        if ready_tx.send(Ok(())).is_err() {
+                            return;
+                        }
+                        // Block here, keeping `stream` alive, until told to stop.
+                        let _ = stop_rx.recv();
+                        drop(stream);
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                    }
+                },
+            );
 
         // Sentinel 🟡 #4: bound the wait so a hung backend surfaces as
         // CaptureError::Timeout (which the caller's existing Err handling
@@ -481,6 +493,108 @@ impl CaptureDiagnostics {
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = None;
         }
+    }
+}
+
+/// Throttles `audio-level` event emission (issue #126, M2 PR 2.2) so the
+/// pill's live meter isn't flooded with one event per captured audio chunk
+/// -- a cpal callback commonly fires far faster than any UI needs to
+/// repaint. Pure and deterministic (no clock): `now` is an injected,
+/// caller-supplied monotonic timestamp -- e.g. `Instant::now().elapsed()`
+/// in the real glue -- mirroring `hotkeys::Timestamp` (see that module's
+/// doc), so this is fully unit-testable without a real audio device or
+/// wall-clock timing.
+#[derive(Debug)]
+pub struct LevelThrottle {
+    min_interval: std::time::Duration,
+    last_emitted_at: Option<std::time::Duration>,
+}
+
+impl LevelThrottle {
+    /// ~30 Hz cadence: emits at most once per this interval.
+    pub const DEFAULT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+    /// A throttle using [`Self::DEFAULT_MIN_INTERVAL`] (~30 Hz).
+    pub fn new() -> Self {
+        Self::with_min_interval(Self::DEFAULT_MIN_INTERVAL)
+    }
+
+    /// A throttle using a caller-chosen minimum interval between emits
+    /// (tests use this to exercise the cadence logic without depending on
+    /// the production constant).
+    pub fn with_min_interval(min_interval: std::time::Duration) -> Self {
+        Self {
+            min_interval,
+            last_emitted_at: None,
+        }
+    }
+
+    /// Whether `rms_level` observed at `now` should be emitted now, given
+    /// everything observed so far. The very first observation always
+    /// emits (issue #126: the pill's meter should reflect the first
+    /// sample immediately rather than waiting out a full throttle window);
+    /// after that, at most one emit per [`Self::min_interval`] elapsed
+    /// since the previous emit. Gating is purely time-based -- the level
+    /// value itself never fast-tracks or delays an emit, and a suppressed
+    /// sample is dropped outright rather than averaged/smoothed into the
+    /// next emitted value.
+    pub fn should_emit(&mut self, now: std::time::Duration, rms_level: f32) -> Option<f32> {
+        let should_emit = match self.last_emitted_at {
+            Some(last) => now.saturating_sub(last) >= self.min_interval,
+            None => true,
+        };
+        if should_emit {
+            self.last_emitted_at = Some(now);
+            Some(rms_level)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for LevelThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RT-safe latest-level cell (issue #126, M2 PR 2.2): the capture callback
+/// (writer, on the real-time `cpal` thread) records the RMS level of each
+/// captured chunk here via a lock-free atomic store -- unlike
+/// [`SharedRingBuffer`]'s `Mutex` (which the callback only ever
+/// `try_lock`s), this can never block, even briefly. The `audio-level`
+/// event poller (reader, thin glue in `lib.rs`) samples it well below the
+/// callback's own rate and pushes each sample through [`LevelThrottle`]
+/// before emitting -- this cell only ever carries a scalar, never raw
+/// samples (MISSION.md §7: audio samples never leave `audio.rs` as
+/// events).
+///
+/// `f32` has no native stable atomic type, so the level is bit-cast into
+/// an `AtomicU32` ([`f32::to_bits`]/[`f32::from_bits`]) -- a standard,
+/// allocation-free encoding; `Relaxed` ordering is sufficient since this
+/// cell carries one independent scalar with no other memory it needs to
+/// stay synchronized with.
+#[derive(Debug, Default)]
+pub struct LevelMeter {
+    bits: std::sync::atomic::AtomicU32,
+}
+
+impl LevelMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the latest observed RMS level. Called from the real-time
+    /// capture callback -- must stay lock-free/allocation-free.
+    pub fn record(&self, level: f32) {
+        self.bits
+            .store(level.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most recently recorded level, or `0.0` if none has been
+    /// recorded yet (matching [`rms_level`]'s empty-window default).
+    pub fn current(&self) -> f32 {
+        f32::from_bits(self.bits.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -758,5 +872,133 @@ mod tests {
         assert_eq!(drained, vec![1.0, 2.0, 3.0]);
         assert!(rb.is_empty());
         assert_eq!(rb.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #126 (M2 PR 2.2): LevelThrottle — throttled `audio-level` event
+    // cadence. Pure and deterministic: every timestamp below is injected
+    // (`Duration`), never a real clock read, matching hotkeys::Timestamp's
+    // pattern (module doc).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn level_throttle_emits_the_very_first_observation_immediately() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.42),
+            Some(0.42)
+        );
+    }
+
+    #[test]
+    fn level_throttle_suppresses_a_second_observation_within_the_same_window() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.1),
+            Some(0.1)
+        );
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(10), 0.2),
+            None,
+            "an observation inside the same ~33ms window must be suppressed"
+        );
+    }
+
+    #[test]
+    fn level_throttle_emits_again_once_the_window_elapses() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.1),
+            Some(0.1)
+        );
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(33), 0.2),
+            Some(0.2),
+            "a full window (>=33ms) after the last emit must emit again"
+        );
+    }
+
+    #[test]
+    fn level_throttle_caps_emit_rate_to_at_most_30_per_second_under_a_burst() {
+        let mut throttle = LevelThrottle::new();
+        let mut emitted = 0usize;
+        // A burst of 1000 samples spaced 1ms apart -- far faster than any
+        // real cpal callback cadence -- covering exactly one second.
+        for ms in 0..1000u64 {
+            if throttle
+                .should_emit(std::time::Duration::from_millis(ms), 0.5)
+                .is_some()
+            {
+                emitted += 1;
+            }
+        }
+        assert!(
+            emitted <= 31,
+            "should emit at most ~30 times per second, got {emitted}"
+        );
+        assert!(
+            emitted >= 28,
+            "should still emit close to 30 times per second, got {emitted}"
+        );
+    }
+
+    #[test]
+    fn level_throttle_quiet_to_loud_transition_is_suppressed_then_emitted_unsmoothed() {
+        let mut throttle = LevelThrottle::with_min_interval(std::time::Duration::from_millis(33));
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 0.01),
+            Some(0.01)
+        );
+        // A much louder level lands inside the same window: cadence gating
+        // applies regardless of how much the level itself changed.
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(10), 0.95),
+            None
+        );
+        // Once the window elapses, the loud level is emitted exactly as
+        // observed -- no averaging/smoothing across the suppressed samples.
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(33), 0.95),
+            Some(0.95)
+        );
+    }
+
+    #[test]
+    fn level_throttle_default_uses_the_documented_30hz_cadence() {
+        let mut default_throttle = LevelThrottle::new();
+        let mut explicit_throttle =
+            LevelThrottle::with_min_interval(LevelThrottle::DEFAULT_MIN_INTERVAL);
+        for ms in [0u64, 10, 33, 40, 66] {
+            assert_eq!(
+                default_throttle.should_emit(std::time::Duration::from_millis(ms), 0.3),
+                explicit_throttle.should_emit(std::time::Duration::from_millis(ms), 0.3),
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #126 (M2 PR 2.2): LevelMeter — the RT-safe latest-level cell
+    // the capture callback (writer) records into and the level-event
+    // poller (reader, in lib.rs) samples. Lock-free (atomic), never a
+    // `Mutex`, so it can never block the real-time audio thread.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn level_meter_starts_at_zero() {
+        let meter = LevelMeter::new();
+        assert_eq!(meter.current(), 0.0);
+    }
+
+    #[test]
+    fn level_meter_reads_back_the_latest_recorded_level() {
+        let meter = LevelMeter::new();
+        meter.record(0.25);
+        assert_eq!(meter.current(), 0.25);
+        meter.record(0.75);
+        assert_eq!(
+            meter.current(),
+            0.75,
+            "current() must reflect the latest record(), not accumulate"
+        );
     }
 }
