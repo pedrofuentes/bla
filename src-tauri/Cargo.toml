@@ -49,6 +49,7 @@ sha2 = "0.10"
 url = "2.5"
 tauri-plugin-store = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
 # `store.rs`'s history/dictionary/tone-rules/snippets persistence (MISSION
 # §5: local SQLite under the OS app-data dir, nothing leaves the device).
 # `bundled` compiles SQLite from source via `cc` rather than linking the

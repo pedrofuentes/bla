@@ -1237,6 +1237,21 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // Issue #126 (M2 PR 2.6): registers/unregisters bla as an OS login
+        // item, driven by `commands::set_settings`'s `launch_at_login`
+        // side-effect (via `tauri_plugin_autostart::ManagerExt::autolaunch`)
+        // — no command from this plugin's own `invoke_handler` is exposed
+        // to the frontend, so no new `capabilities/` grant is needed.
+        // `MacosLauncher::LaunchAgent` is the plugin's documented default
+        // (a launch agent plist rather than an AppleScript login item).
+        // Dev-build note: this registers the CURRENT binary's path, so in a
+        // `cargo tauri dev`/`cargo run` build enabling autostart points at
+        // the dev binary (`target/debug/bla`), not a stable packaged-app
+        // path — expected and harmless for local development.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::set_settings,

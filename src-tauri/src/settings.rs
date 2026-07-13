@@ -319,10 +319,7 @@ mod tests {
             partial.file_path_template,
             Settings::default().file_path_template
         );
-        assert_eq!(
-            partial.launch_at_login,
-            Settings::default().launch_at_login
-        );
+        assert_eq!(partial.launch_at_login, Settings::default().launch_at_login);
         assert_eq!(partial.sound_cues, Settings::default().sound_cues);
     }
 
