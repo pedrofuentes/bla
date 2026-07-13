@@ -180,6 +180,48 @@ mod tests {
     }
 
     #[test]
+    fn should_hide_pill_for_settle_hides_only_when_idle_and_epoch_unchanged_issue_155() {
+        // The normal case: the epoch captured at settle-start is still
+        // current (no newer settle has started) and the pipeline is still
+        // Idle by the time the delayed hide wakes up.
+        assert!(should_hide_pill_for_settle(1, 1, &PipelineState::Idle));
+    }
+
+    #[test]
+    fn should_hide_pill_for_settle_stands_down_when_a_newer_settle_started_issue_155() {
+        // Issue #155 (overlapping-notice epoch race): capture the epoch a
+        // settle started at (1), then simulate a second, newer settle
+        // bumping it (2) before the first settle's delayed hide wakes up.
+        // Even though the pipeline is (coincidentally) still/again Idle, the
+        // stale settle must stand down rather than hide the pill out from
+        // under the newer settle's own still-live visible window.
+        let epoch_at_settle = 1;
+        let current_epoch = 2;
+        assert!(!should_hide_pill_for_settle(
+            epoch_at_settle,
+            current_epoch,
+            &PipelineState::Idle
+        ));
+    }
+
+    #[test]
+    fn should_hide_pill_for_settle_never_hides_while_actively_dictating_issue_155() {
+        // Epoch-unchanged alone isn't sufficient — a new dictation started
+        // during the window must still preempt cleanly regardless of epoch.
+        assert!(!should_hide_pill_for_settle(
+            1,
+            1,
+            &PipelineState::Recording
+        ));
+        assert!(!should_hide_pill_for_settle(
+            1,
+            1,
+            &PipelineState::Transcribing
+        ));
+        assert!(!should_hide_pill_for_settle(1, 1, &PipelineState::Error));
+    }
+
+    #[test]
     fn tray_icon_state_maps_every_pipeline_state_ac14() {
         assert_eq!(tray_icon_state(&PipelineState::Idle), TrayIconState::Idle);
         assert_eq!(
