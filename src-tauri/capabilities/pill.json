@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pill-window",
+  "description": "Recording pill overlay (Sentinel 🔴, PR #137): the default capability covers only the main window, so this window's event subscriptions (pipeline-state-changed, audio-level) were ACL-rejected on every mount and the whole waveform/state UI never wired up. Grants exactly what the pill uses — event listen/unlisten — deliberately NOT core:event:default (which also adds allow-emit/allow-emit-to; the pill never emits) and NOT core:default (menu/tray/window CRUD, far too broad for a passive overlay).",
+  "windows": ["pill"],
+  "webviews": ["pill"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}
