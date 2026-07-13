@@ -145,6 +145,21 @@ mod tests {
     }
 
     #[test]
+    fn should_keep_pill_visible_for_done_only_after_an_active_dictation_issue_151() {
+        // The completed-dictation transition (issue #151): the pipeline was
+        // actively Recording/Transcribing right before settling to Idle, so
+        // the "done" confirmation gets a visible pill to render onto.
+        assert!(should_keep_pill_visible_for_done(&PipelineState::Recording));
+        assert!(should_keep_pill_visible_for_done(
+            &PipelineState::Transcribing
+        ));
+        // Already-Idle or Error aren't a completed-dictation transition —
+        // no "done" confirmation is owed.
+        assert!(!should_keep_pill_visible_for_done(&PipelineState::Idle));
+        assert!(!should_keep_pill_visible_for_done(&PipelineState::Error));
+    }
+
+    #[test]
     fn tray_icon_state_maps_every_pipeline_state_ac14() {
         assert_eq!(tray_icon_state(&PipelineState::Idle), TrayIconState::Idle);
         assert_eq!(
