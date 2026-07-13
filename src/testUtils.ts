@@ -3,8 +3,8 @@
  * `@testing-library/react` (not a project dependency — see
  * `docs/DEVELOPMENT-WORKFLOW.md`/AGENTS.md "ASK FIRST: adding dependencies").
  * Drives real DOM nodes with `react-dom/client` + React's `act`, which is
- * enough for the settings window's plain-element markup (no portals/refs
- * beyond what `act` already flushes).
+ * enough for the pill/settings windows' plain-element markup (no
+ * portals/refs beyond what `act` already flushes).
  */
 import { act } from "react";
 import type { ReactElement } from "react";
