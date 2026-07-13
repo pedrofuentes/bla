@@ -60,6 +60,11 @@ function applyPipelineState(
         : { mode: "idle", doneAt: null };
     case "Unknown":
       return { mode: "idle", doneAt: null };
+    default:
+      // Fail-safe (defense in depth): callers guard with
+      // parsePipelineState, but never return undefined for an unexpected
+      // value -- the next state.mode read would crash the render tree.
+      return { mode: "idle", doneAt: null };
   }
 }
 

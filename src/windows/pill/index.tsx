@@ -2,7 +2,7 @@ import { useEffect, useReducer, useState } from "react";
 import { onEvent } from "../../lib/ipc";
 import { pushLevel } from "../../lib/levelBuffer";
 import { initialPillState, pillLabel, pillReducer, type PillMode } from "../../lib/pillState";
-import type { PipelineState } from "../../lib/status";
+import { parsePipelineState } from "../../lib/status";
 import { toastForError, type Toast as ToastSpec } from "../../lib/toast";
 import { barsFromLevels } from "../../lib/waveform";
 import { PillWaveform } from "./PillWaveform";
@@ -57,7 +57,7 @@ export function PillWindow() {
     const unlisten = Promise.all([
       onEvent("pipeline-state-changed", (payload) => {
         if (cancelled) return;
-        const pipelineState = payload as PipelineState;
+        const pipelineState = parsePipelineState(payload);
         // Fresh bars for the next recording rather than a stale tail from
         // the previous one.
         if (pipelineState === "Active") setLevels([]);
