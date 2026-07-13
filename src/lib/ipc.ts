@@ -63,6 +63,8 @@ export interface Commands {
   get_settings: { result: Settings };
   set_settings: { args: { settings: Settings }; result: void };
   set_output_mode: { args: { mode: OutputModeSetting }; result: void };
+  /** Mirrors `commands::validate_hotkey` — thin wrapper over `hotkeys::validate_hotkey`. */
+  validate_hotkey: { args: { accelerator: string }; result: void };
   download_selected_model: { result: DownloadStartResult };
 }
 

@@ -164,6 +164,71 @@ fn to_tray_output_mode(mode: settings::OutputModeSetting) -> tray::OutputMode {
     }
 }
 
+/// Apply an already-validated (and persisted) `settings` value to the live
+/// in-memory recording-mode / output-mode / settings-snapshot state: flips
+/// the hotkeys state machine's recording mode (issue #126 / PR #134
+/// Sentinel 🔴-3 — before this, the machine was built once at startup and a
+/// saved Hold↔Toggle change only took effect after a restart while the UI
+/// said "Saved"), updates the live output-mode switch (AC-14), and replaces
+/// the in-memory settings snapshot.
+///
+/// Takes the three `Mutex`es it actually reads/writes rather than the whole
+/// [`AppState`] (see [`apply_settings_to_state`], the thin `AppState`
+/// wrapper `commands::set_settings` calls) — issue #165: a `#[cfg(test)]`
+/// helper that built a full `AppState` struct literal (to exercise this
+/// logic without a live Tauri app) reproducibly crashed the Windows lib
+/// test binary at process startup with `STATUS_ENTRYPOINT_NOT_FOUND` before
+/// any test ran, even though none of `AppState`'s Tauri-runtime-typed
+/// fields (`Mutex<Option<MenuItem<tauri::Wry>>>`,
+/// `Mutex<Option<audio::CaptureSession>>`) were ever populated or read by
+/// this function — bisected on PR #134's own branch: identical Cargo.lock,
+/// only this function + its `AppState`-constructing test added, ~30 minutes
+/// apart, flipped Windows `cargo test --all-features` from green to that
+/// crash. Narrowing the signature to exactly the state this function
+/// touches keeps every assertion the removed test made, without ever
+/// constructing an `AppState` (or any native-runtime-typed field) from test
+/// code.
+///
+/// Returns the [`hotkeys::Transition`] the mode flip produced —
+/// `Some(Cancelled)` when it interrupted an in-flight session — for the
+/// caller to hand to [`react_to_transition`], which stops capture and
+/// discards the buffered audio.
+fn apply_settings(
+    hotkeys: &Mutex<hotkeys::StateMachine>,
+    output_switch: &Mutex<tray::OutputModeSwitch>,
+    settings_slot: &Mutex<settings::Settings>,
+    settings: settings::Settings,
+) -> Option<hotkeys::Transition> {
+    let transition = hotkeys
+        .lock()
+        .unwrap()
+        .set_mode(to_hotkey_mode(settings.recording_mode));
+    output_switch
+        .lock()
+        .unwrap()
+        .set_mode(to_tray_output_mode(settings.output_mode));
+    *settings_slot.lock().unwrap() = settings;
+    transition
+}
+
+/// `AppState`-shaped wrapper over [`apply_settings`] — the entry point
+/// `commands::set_settings` calls. Takes no `AppHandle`, so this whole
+/// state-application step is unit-testable without a live Tauri app; the
+/// pure logic itself is unit-tested directly against bare `Mutex`es (no
+/// `AppState` involved at all — see `apply_settings`'s doc comment and
+/// `apply_settings_tests`, issue #165).
+pub(crate) fn apply_settings_to_state(
+    state: &AppState,
+    settings: settings::Settings,
+) -> Option<hotkeys::Transition> {
+    apply_settings(
+        &state.hotkeys,
+        &state.output_switch,
+        &state.settings,
+        settings,
+    )
+}
+
 /// Translate the persisted [`settings::ModelPreset`] to the models
 /// downloader's registry [`models::ModelPreset`].
 fn to_models_preset(preset: settings::ModelPreset) -> models::ModelPreset {
@@ -215,6 +280,130 @@ fn should_reuse_cached_stt(
     wanted: &settings::ModelPreset,
 ) -> bool {
     cached == Some(wanted)
+}
+
+#[cfg(test)]
+mod apply_settings_tests {
+    //! Issue #126 / PR #134 Sentinel 🔴-3: `commands::set_settings` must
+    //! apply a changed `recording_mode` to the LIVE hotkeys state machine —
+    //! before this, the machine was built once at startup and a Hold↔Toggle
+    //! save only took effect after an app restart while the UI said "Saved".
+    //! `apply_settings` is the (AppHandle- and AppState-free) function
+    //! `apply_settings_to_state` delegates to, so the machine's post-save
+    //! mode is assertable here without a live Tauri app.
+    //!
+    //! Issue #165: these tests exercise `apply_settings` directly against
+    //! three bare `Mutex`es rather than building a full `AppState` — doing
+    //! the latter reproducibly crashed the Windows lib test binary at
+    //! process startup (`STATUS_ENTRYPOINT_NOT_FOUND`, before any test ran)
+    //! despite never populating or reading any of `AppState`'s
+    //! Tauri-runtime-typed fields. See `apply_settings`'s doc comment for
+    //! the bisection that pinned it to this test module's `AppState`
+    //! construction.
+
+    use super::*;
+
+    /// The three `Mutex`es `apply_settings` reads/writes, seeded from
+    /// `settings` (mirrors how `AppState`'s equivalent fields are seeded at
+    /// startup) — no `AppState`, tray item, or capture session involved.
+    fn test_slots(
+        settings: &settings::Settings,
+    ) -> (
+        Mutex<hotkeys::StateMachine>,
+        Mutex<tray::OutputModeSwitch>,
+        Mutex<settings::Settings>,
+    ) {
+        (
+            Mutex::new(hotkeys::StateMachine::new(
+                to_hotkey_mode(settings.recording_mode),
+                [0u32],
+                hotkeys::DEFAULT_DEBOUNCE,
+            )),
+            Mutex::new(tray::OutputModeSwitch::new(to_tray_output_mode(
+                settings.output_mode,
+            ))),
+            Mutex::new(settings.clone()),
+        )
+    }
+
+    #[test]
+    fn apply_settings_flips_the_live_hotkey_machine_mode_issue_126() {
+        // Default settings are Hold.
+        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default());
+        let new = settings::Settings {
+            recording_mode: settings::RecordingMode::Toggle,
+            ..settings::Settings::default()
+        };
+
+        let transition = apply_settings(&hotkeys, &output_switch, &settings_slot, new.clone());
+
+        assert_eq!(transition, None, "idle machine: nothing to cancel");
+        assert_eq!(
+            hotkeys.lock().unwrap().mode(),
+            hotkeys::Mode::Toggle,
+            "the LIVE machine must run the just-saved mode, not wait for a restart"
+        );
+        assert_eq!(*settings_slot.lock().unwrap(), new);
+    }
+
+    #[test]
+    fn apply_settings_cancels_an_in_flight_session_on_a_mode_change_issue_126() {
+        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default());
+        // Drive the live machine into a hold-in-progress first.
+        let started = hotkeys
+            .lock()
+            .unwrap()
+            .handle(hotkeys::KeyEvent::KeyDown(0, std::time::Duration::ZERO));
+        assert_eq!(started, Some(hotkeys::Transition::StartRecording));
+
+        let new = settings::Settings {
+            recording_mode: settings::RecordingMode::Toggle,
+            ..settings::Settings::default()
+        };
+        let transition = apply_settings(&hotkeys, &output_switch, &settings_slot, new);
+
+        // The caller (set_settings) hands this to react_to_transition, which
+        // stops capture and discards the buffered audio.
+        assert_eq!(transition, Some(hotkeys::Transition::Cancelled));
+        assert_eq!(hotkeys.lock().unwrap().mode(), hotkeys::Mode::Toggle);
+    }
+
+    #[test]
+    fn apply_settings_with_an_unchanged_mode_leaves_a_session_in_flight() {
+        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default());
+        let started = hotkeys
+            .lock()
+            .unwrap()
+            .handle(hotkeys::KeyEvent::KeyDown(0, std::time::Duration::ZERO));
+        assert_eq!(started, Some(hotkeys::Transition::StartRecording));
+
+        // Same recording_mode, different model preset — a dictation in
+        // flight must NOT be cancelled by an unrelated settings save.
+        let new = settings::Settings {
+            model_preset: settings::ModelPreset::Small,
+            ..settings::Settings::default()
+        };
+        let transition = apply_settings(&hotkeys, &output_switch, &settings_slot, new);
+
+        assert_eq!(transition, None);
+        assert_eq!(hotkeys.lock().unwrap().mode(), hotkeys::Mode::Hold);
+    }
+
+    #[test]
+    fn apply_settings_updates_the_live_output_switch() {
+        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default()); // Cursor
+        let new = settings::Settings {
+            output_mode: settings::OutputModeSetting::File,
+            ..settings::Settings::default()
+        };
+
+        apply_settings(&hotkeys, &output_switch, &settings_slot, new);
+
+        assert_eq!(
+            output_switch.lock().unwrap().route_target(),
+            tray::OutputMode::File
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1052,6 +1241,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::set_output_mode,
+            commands::validate_hotkey,
             commands::download_selected_model,
         ])
         .setup(|app| {

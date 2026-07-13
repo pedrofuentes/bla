@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings-window",
+  "description": "Settings window (PR #134 Sentinel 🔴-1): the default capability covers only the main window, so this window's event subscriptions (model-download-progress/complete/error, output-mode-changed) were ACL-rejected on every mount. Grants exactly what the window uses — event listen/unlisten (app-defined #[tauri::command]s aren't capability-gated) — deliberately narrower than main's core:default.",
+  "windows": ["settings"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}
