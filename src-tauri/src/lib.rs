@@ -29,6 +29,7 @@
 //! `cargo build --features whisper` compile and this file never has a
 //! feature-gated call site — only `build_stt`'s two bodies differ.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::image::Image;
@@ -129,6 +130,17 @@ pub(crate) struct AppState {
     /// so tray- and window-triggered switches never disagree about which
     /// mode is live.
     tray_output_toggle_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// Monotonic "pill visibility epoch" (issue #155; Sentinel 🔴 on PR
+    /// #137's re-review): bumped by [`settle_idle_keeping_pill_visible`]
+    /// every time a "keep the pill visible for a while, then maybe hide it"
+    /// settle starts (the AC-4 notice path or the issue-#151 "done"
+    /// confirmation path). Each settle's delayed-hide thread captures the
+    /// post-bump value and only proceeds to hide if it's still current when
+    /// it wakes ([`tray::should_hide_pill_for_settle`]) — so a second,
+    /// overlapping settle starting first makes the first one stand down
+    /// instead of hiding the pill out from under the second one's own still-
+    /// live visible window.
+    pill_visibility_epoch: AtomicU64,
     /// Issue #115: the cached Whisper engine, so it's loaded from disk (a
     /// ~574 MB read for the default preset) at most once per selected
     /// preset rather than on every dictation. `None` until the first build
@@ -814,30 +826,51 @@ const PILL_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_mill
 /// from under a still-rendering "done" state.
 const DONE_PILL_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// Settles the pipeline to `Idle` for the AC-4 informational-notice path
-/// (Sentinel 🔴-2 on PR #135) while keeping the pill **visible** for the
-/// toast's lifetime, then hiding it once the notice window elapses.
+/// Bumps the "pill visibility epoch" (issue #155) and returns the new
+/// value. Called once at the start of every [`settle_idle_keeping_pill_visible`]
+/// call — see that field's doc on [`AppState::pill_visibility_epoch`] for why.
+fn bump_pill_visibility_epoch(state: &AppState) -> u64 {
+    state.pill_visibility_epoch.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Settles the pipeline to `Idle` while keeping the pill **visible** for
+/// `duration`, then hiding it once that window elapses — unless a newer
+/// overlapping settle or a new dictation says otherwise. Shared by both
+/// "keep the pill visible past Idle" paths:
+/// [`settle_idle_keeping_pill_for_notice`] (AC-4 informational toast,
+/// Sentinel 🔴-2 on PR #135) and [`settle_idle_keeping_pill_for_done`]
+/// (issue #151, the completed-dictation "done" confirmation).
 ///
 /// The plain `set_pipeline_state(Idle)` would hide the pill immediately
-/// (`pill_visibility_for(Idle) == false`), leaving the just-emitted
-/// `OllamaUnreachable` toast on a hidden window. So this applies `Idle`
-/// (tray icon → Idle) with the pill forced shown, then — on a spawned,
-/// non-realtime thread mirroring `spawn_stt_cache_warm`'s pattern — waits
-/// [`PILL_NOTICE_DURATION`] and hides the pill **only if the pipeline is
-/// still `Idle`** ([`tray::should_hide_pill_after_notice`], the unit-tested
-/// pure decision). A dictation started during the notice moves the state off
-/// `Idle`, so its own `set_pipeline_state` owns the pill and this elapsed
-/// notice leaves it alone — the new dictation preempts cleanly. The window
-/// `hide()` is marshaled to the main thread like every other pill mutation.
-fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
+/// (`pill_visibility_for(Idle) == false`), leaving whatever's currently
+/// rendered on the pill (a toast, or the "done" dot/label) on a hidden
+/// window. So this applies `Idle` (tray icon → Idle) with the pill forced
+/// shown, bumps [`AppState::pill_visibility_epoch`] and captures the new
+/// value, then — on a spawned, non-realtime thread mirroring
+/// `spawn_stt_cache_warm`'s pattern — waits `duration` and hides the pill
+/// **only if** [`tray::should_hide_pill_for_settle`] says so: the pipeline
+/// must still be `Idle` (a dictation started during the window moves the
+/// state off `Idle`, and that transition's own `set_pipeline_state` already
+/// owns the pill) AND no *newer* settle must have started meanwhile (issue
+/// #155's overlapping-notice epoch race — a notice and a done-settle, or two
+/// notices, can overlap within their windows; without the epoch check the
+/// older settle's delayed hide could fire after the newer settle already
+/// re-applied `Idle`+visible, incorrectly hiding it). The window `hide()` is
+/// marshaled to the main thread like every other pill mutation.
+fn settle_idle_keeping_pill_visible(app: &tauri::AppHandle, duration: std::time::Duration) {
+    let epoch = {
+        let state = app.state::<AppState>();
+        bump_pill_visibility_epoch(&state)
+    };
     apply_pipeline_state(app, tray::PipelineState::Idle, true);
 
     let app = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(PILL_NOTICE_DURATION);
+        std::thread::sleep(duration);
         let state = app.state::<AppState>();
+        let current_epoch = state.pill_visibility_epoch.load(Ordering::SeqCst);
         let current_state = *state.pipeline_state.lock().unwrap();
-        if tray::should_hide_pill_after_notice(&current_state) {
+        if tray::should_hide_pill_for_settle(epoch, current_epoch, &current_state) {
             let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
             let _ = app.run_on_main_thread(move || {
                 if let Some(window) = pill_window {
@@ -848,19 +881,18 @@ fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
     });
 }
 
+/// Settles the pipeline to `Idle` for the AC-4 informational-notice path
+/// (Sentinel 🔴-2 on PR #135) — see [`settle_idle_keeping_pill_visible`].
+fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
+    settle_idle_keeping_pill_visible(app, PILL_NOTICE_DURATION);
+}
+
 /// Settles the pipeline to `Idle` for a completed-dictation "done"
 /// confirmation (issue #151: previously `set_pipeline_state(Idle)` hid the
 /// pill in the very call that entered the frontend's `"done"` mode, so the
-/// ~1.5s confirmation never had a visible window to render onto). Mirrors
-/// [`settle_idle_keeping_pill_for_notice`]'s grace-window mechanism onto the
-/// completed-dictation transition instead: applies `Idle` with the pill
-/// forced shown, then — on a spawned, non-realtime thread — waits
-/// [`DONE_PILL_DURATION`] and hides the pill only if the pipeline is still
-/// `Idle` ([`tray::should_hide_pill_after_notice`]), so a dictation started
-/// during the window preempts cleanly, same as the notice path.
-///
-/// Only takes the visible-settle path when `previous` confirms this really
-/// is a completed-dictation transition
+/// ~1.5s confirmation never had a visible window to render onto). Only
+/// takes the visible-settle path when `previous` confirms this really is a
+/// completed-dictation transition
 /// ([`tray::should_keep_pill_visible_for_done`]) — defense in depth in case
 /// this is ever called from somewhere other than its one intended call site
 /// (the non-fallback success arm of `run_pipeline_in_background`), falling
@@ -871,23 +903,7 @@ fn settle_idle_keeping_pill_for_done(app: &tauri::AppHandle, previous: tray::Pip
         set_pipeline_state(app, tray::PipelineState::Idle);
         return;
     }
-
-    apply_pipeline_state(app, tray::PipelineState::Idle, true);
-
-    let app = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(DONE_PILL_DURATION);
-        let state = app.state::<AppState>();
-        let current_state = *state.pipeline_state.lock().unwrap();
-        if tray::should_hide_pill_after_notice(&current_state) {
-            let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
-            let _ = app.run_on_main_thread(move || {
-                if let Some(window) = pill_window {
-                    let _ = window.hide();
-                }
-            });
-        }
-    });
+    settle_idle_keeping_pill_visible(app, DONE_PILL_DURATION);
 }
 
 /// Dispatches a click on one of the tray menu's items (issue #110), by the
@@ -1399,6 +1415,7 @@ pub fn run() {
                 pipeline_state: Mutex::new(tray::PipelineState::Idle),
                 tray_state_item: Mutex::new(Some(tray_state_item)),
                 tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
+                pill_visibility_epoch: AtomicU64::new(0),
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
             };

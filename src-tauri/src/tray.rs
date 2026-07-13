@@ -137,6 +137,29 @@ pub fn should_keep_pill_visible_for_done(previous: &PipelineState) -> bool {
     )
 }
 
+/// Race-safe guard for a delayed pill-hide started by a "keep the pill
+/// visible for a while, then maybe hide it" settle (issue #155; Sentinel 🔴
+/// on PR #137's re-review). `settle_idle_keeping_pill_for_notice` (AC-4
+/// informational toast) and its issue-#151 sibling for the "done"
+/// confirmation both bump a monotonic `AppState` "pill visibility epoch"
+/// when they start, then capture that epoch before sleeping. Two such
+/// settles can overlap within their windows (a notice and a done-settle, or
+/// two notices back to back); `should_hide_pill_after_notice` alone only
+/// checks that the pipeline is still `Idle`, which is also (coincidentally)
+/// true once a *second*, newer settle has itself already applied `Idle` —
+/// so the stale first settle would wrongly hide the pill out from under the
+/// newer one's still-live visible window. Hiding now requires BOTH that no
+/// newer settle has started since (`epoch_at_settle == current_epoch`) AND
+/// that `should_hide_pill_after_notice` still holds. Pure/total; the actual
+/// epoch bump/load and `window.hide()` stay thin OS glue in `lib.rs`.
+pub fn should_hide_pill_for_settle(
+    epoch_at_settle: u64,
+    current_epoch: u64,
+    state: &PipelineState,
+) -> bool {
+    epoch_at_settle == current_epoch && should_hide_pill_after_notice(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
