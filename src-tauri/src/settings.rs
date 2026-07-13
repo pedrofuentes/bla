@@ -230,6 +230,8 @@ mod tests {
             model_preset: ModelPreset::Small,
             output_mode: OutputModeSetting::File,
             file_path_template: "journal/{{date:YYYY-MM-DD}}.md".to_string(),
+            launch_at_login: true,
+            sound_cues: false,
         }
     }
 
@@ -257,6 +259,8 @@ mod tests {
         assert_ne!(default.model_preset, non_default.model_preset);
         assert_ne!(default.output_mode, non_default.output_mode);
         assert_ne!(default.file_path_template, non_default.file_path_template);
+        assert_ne!(default.launch_at_login, non_default.launch_at_login);
+        assert_ne!(default.sound_cues, non_default.sound_cues);
     }
 
     #[test]
@@ -276,6 +280,89 @@ mod tests {
         assert_eq!(
             partial.file_path_template,
             Settings::default().file_path_template
+        );
+        assert_eq!(
+            partial.launch_at_login,
+            Settings::default().launch_at_login
+        );
+        assert_eq!(partial.sound_cues, Settings::default().sound_cues);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #126 (M2 PR 2.6): `launch_at_login` and `sound_cues` must
+    // default (false / true respectively) rather than fail to deserialize
+    // when loading a settings.json persisted by a build from BEFORE this
+    // PR — the same back-compat guarantee `#[serde(default)]` already gives
+    // every other field (AC-13).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn pre_126_settings_json_without_launch_or_sound_fields_still_deserializes_with_defaults() {
+        // Mirrors a real settings.json written by a pre-#126 build: every
+        // field earlier M2 PRs introduced, but neither `launch_at_login`
+        // nor `sound_cues`.
+        let old_json = r#"{
+            "hotkey": "Control+Shift+D",
+            "recording_mode": "Toggle",
+            "model_preset": "Small",
+            "output_mode": "File",
+            "file_path_template": "journal/{{date:YYYY-MM-DD}}.md"
+        }"#;
+
+        let restored = from_json(old_json).unwrap();
+
+        // The pre-existing fields still parse as written...
+        assert_eq!(restored.hotkey, "Control+Shift+D");
+        assert_eq!(restored.recording_mode, RecordingMode::Toggle);
+        assert_eq!(restored.model_preset, ModelPreset::Small);
+        assert_eq!(restored.output_mode, OutputModeSetting::File);
+        assert_eq!(
+            restored.file_path_template,
+            "journal/{{date:YYYY-MM-DD}}.md"
+        );
+        // ...and the two new fields fall back to their defaults instead of
+        // the whole blob failing to parse.
+        assert_eq!(
+            restored.launch_at_login,
+            Settings::default().launch_at_login
+        );
+        assert_eq!(restored.sound_cues, Settings::default().sound_cues);
+    }
+
+    #[test]
+    fn launch_at_login_defaults_to_false_and_sound_cues_defaults_to_true() {
+        let default = Settings::default();
+        assert!(!default.launch_at_login);
+        assert!(default.sound_cues);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #126 (M2 PR 2.6): the pure decision of whether (and which
+    // direction) a `launch_at_login` change needs to flip OS autostart
+    // registration. The actual `tauri-plugin-autostart` call is thin OS
+    // glue in `commands::set_settings`; this is what's unit-tested without
+    // a live Tauri app.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn autostart_action_is_none_when_launch_at_login_is_unchanged() {
+        assert_eq!(autostart_action_for_change(false, false), None);
+        assert_eq!(autostart_action_for_change(true, true), None);
+    }
+
+    #[test]
+    fn autostart_action_is_enable_when_launch_at_login_flips_on() {
+        assert_eq!(
+            autostart_action_for_change(false, true),
+            Some(AutostartAction::Enable)
+        );
+    }
+
+    #[test]
+    fn autostart_action_is_disable_when_launch_at_login_flips_off() {
+        assert_eq!(
+            autostart_action_for_change(true, false),
+            Some(AutostartAction::Disable)
         );
     }
 
