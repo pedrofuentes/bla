@@ -60,7 +60,7 @@ pub mod models;
 pub mod output;
 pub mod pipeline;
 pub mod settings;
-mod store;
+pub mod store;
 pub mod stt;
 pub mod tray;
 
