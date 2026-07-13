@@ -1,0 +1,1 @@
+- Launch-at-login + sound-cue preference (issue #126): a new "Launch bla at login" checkbox in the settings window's General tab enables/disables OS login autostart immediately on save (via `tauri-plugin-autostart`), and a new "Play sound cues" checkbox persists the preference cue playback will read starting in the next M2 increment.
