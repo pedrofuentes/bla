@@ -6,6 +6,7 @@ import {
   modelPresetLabel,
   modelStatusLabel,
   otherMode,
+  parsePipelineState,
   statusLabel,
 } from "./status";
 
@@ -59,6 +60,25 @@ describe("statusLabel", () => {
     expect(statusLabel("Busy")).toBe("Transcribing…");
     expect(statusLabel("Error")).toBe("Something went wrong");
     expect(statusLabel("Unknown")).toBe("Connecting…");
+  });
+});
+
+describe("parsePipelineState", () => {
+  it("passes each in-contract state string through unchanged", () => {
+    expect(parsePipelineState("Idle")).toBe("Idle");
+    expect(parsePipelineState("Active")).toBe("Active");
+    expect(parsePipelineState("Busy")).toBe("Busy");
+    expect(parsePipelineState("Error")).toBe("Error");
+    expect(parsePipelineState("Unknown")).toBe("Unknown");
+  });
+
+  it("maps an out-of-contract string to the safe Unknown fallback", () => {
+    // A garbage/renamed event payload must not flow into the pill reducer
+    // as an unhandled value (which would read `undefined.mode` and crash
+    // the render tree) -- it degrades to Unknown, which renders as idle.
+    expect(parsePipelineState("Recording")).toBe("Unknown");
+    expect(parsePipelineState("")).toBe("Unknown");
+    expect(parsePipelineState("idle")).toBe("Unknown");
   });
 });
 

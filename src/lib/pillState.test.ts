@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PipelineState } from "./status";
 import {
   DONE_AUTO_HIDE_MS,
   initialPillState,
@@ -67,6 +68,18 @@ describe("pillReducer / pipeline-state", () => {
     const done: PillState = { mode: "done", doneAt: 100 };
     const next = pillReducer(done, { type: "pipeline-state", state: "Error", now: 150 });
     expect(next).toEqual({ mode: "error", doneAt: null });
+  });
+
+  it("fails safe to idle for an out-of-contract pipeline state (defense in depth)", () => {
+    // Callers guard with parsePipelineState, but the reducer's switch must
+    // still not return undefined (which the next state.mode read would
+    // crash on) if an unexpected value ever reaches it.
+    const next = pillReducer(initialPillState, {
+      type: "pipeline-state",
+      state: "Bogus" as PipelineState,
+      now: 10,
+    });
+    expect(next).toEqual({ mode: "idle", doneAt: null });
   });
 });
 
