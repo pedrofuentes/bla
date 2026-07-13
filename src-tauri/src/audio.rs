@@ -186,6 +186,24 @@ pub fn peak_level(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()))
 }
 
+/// Clamp a level to the emitted `audio-level` contract's `0.0..=1.0` range
+/// (issue #136 item 2). Driver-clipped input can push [`rms_level`] above
+/// `1.0`, so the value must be capped before it goes out as an event.
+/// Unlike `f32::clamp`, this maps `NaN` to the `0.0` floor rather than
+/// propagating it -- mirroring the TS-side `clamp01` (`src/lib/levelBuffer.ts`)
+/// so a single broken sample can't poison the pill's meter. Pure and
+/// unit-tested, so the clamp isn't untested arithmetic buried in `lib.rs`
+/// glue.
+pub fn clamp_level(level: f32) -> f32 {
+    if level.is_nan() || level < 0.0 {
+        0.0
+    } else if level > 1.0 {
+        1.0
+    } else {
+        level
+    }
+}
+
 /// Write a captured window of 16 kHz mono `f32` samples out as a 16-bit PCM
 /// WAV file, so the pipeline and tests can round-trip a captured window
 /// (e.g. as an `stt` input fixture).
@@ -537,7 +555,10 @@ impl LevelThrottle {
     /// since the previous emit. Gating is purely time-based -- the level
     /// value itself never fast-tracks or delays an emit, and a suppressed
     /// sample is dropped outright rather than averaged/smoothed into the
-    /// next emitted value.
+    /// next emitted value. The value it returns is passed through
+    /// [`clamp_level`] (issue #136 item 2), so this single choke point
+    /// guarantees the emitted `audio-level` stays within the documented
+    /// `0.0..=1.0` range regardless of caller.
     pub fn should_emit(&mut self, now: std::time::Duration, rms_level: f32) -> Option<f32> {
         let should_emit = match self.last_emitted_at {
             Some(last) => now.saturating_sub(last) >= self.min_interval,
@@ -545,7 +566,7 @@ impl LevelThrottle {
         };
         if should_emit {
             self.last_emitted_at = Some(now);
-            Some(rms_level)
+            Some(clamp_level(rms_level))
         } else {
             None
         }
