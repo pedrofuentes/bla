@@ -100,6 +100,23 @@ pub fn pill_visibility_for(state: &PipelineState) -> bool {
     !matches!(state, PipelineState::Idle)
 }
 
+/// Whether an *elapsed* informational-notice period should now hide the pill
+/// (issue #126, M2 PR 2.4; Sentinel 🔴-2 on PR #135). The AC-4
+/// Ollama-unreachable toast is informational — the dictation still pasted —
+/// so the pill is kept visible for the toast's lifetime even though the
+/// pipeline has already settled to `Idle` (where [`pill_visibility_for`]
+/// alone would hide it immediately, leaving the toast on a hidden window).
+/// Once the notice window elapses, hide the pill **only if the pipeline is
+/// still `Idle`**: a dictation started during the notice moves the state to
+/// `Recording`/`Transcribing` (or `Error`), and that transition's own
+/// `set_pipeline_state` already keeps the pill shown — so the elapsed notice
+/// must not hide it, letting the new dictation preempt cleanly. Pure/total
+/// so the decision is unit-tested; the sleep + `window.hide()` around it stay
+/// thin OS glue in `lib.rs`.
+pub fn should_hide_pill_after_notice(state: &PipelineState) -> bool {
+    matches!(state, PipelineState::Idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +127,21 @@ mod tests {
         assert!(pill_visibility_for(&PipelineState::Recording));
         assert!(pill_visibility_for(&PipelineState::Transcribing));
         assert!(pill_visibility_for(&PipelineState::Error));
+    }
+
+    #[test]
+    fn should_hide_pill_after_notice_only_when_still_idle_issue_126() {
+        // Sentinel 🔴-2 (PR #135): the AC-4 informational OllamaUnreachable
+        // toast is shown while the pipeline settles to Idle; the pill must
+        // stay visible for the notice window and only hide afterward IFF the
+        // pipeline is *still* Idle. A new dictation started during the notice
+        // moves the state off Idle (Recording/Transcribing) — its own
+        // `set_pipeline_state` keeps the pill shown, so the elapsed notice
+        // must NOT hide it (the new dictation preempts cleanly).
+        assert!(should_hide_pill_after_notice(&PipelineState::Idle));
+        assert!(!should_hide_pill_after_notice(&PipelineState::Recording));
+        assert!(!should_hide_pill_after_notice(&PipelineState::Transcribing));
+        assert!(!should_hide_pill_after_notice(&PipelineState::Error));
     }
 
     #[test]

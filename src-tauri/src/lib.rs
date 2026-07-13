@@ -63,6 +63,11 @@ pub mod audio;
 pub mod cleanup;
 mod commands;
 mod context;
+// `pub` (issue #126, M2 PR 2.4): the typed `pipeline-error` event vocabulary
+// and its pure mapping functions are exercised from `tests/acceptance.rs`
+// (the crate's cumulative headless suite) as well as this crate's own unit
+// tests.
+pub mod errors;
 mod hotkeys;
 // `pub` (issue #24, ADR-0004): the first-run model downloader's registry,
 // AC-12 network guard, and download orchestration are real, tested,
@@ -418,8 +423,13 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
                 Err(err) => {
                     // Issue #59: surfaced as structured pipeline state, not
                     // an invisible eprintln! — a packaged app's tray can
-                    // reflect this via `tray::tray_icon_state`.
+                    // reflect this via `tray::tray_icon_state`. Issue #126
+                    // (M2 PR 2.4): also a typed `pipeline-error` event so the
+                    // pill window can toast a specific, blocking reason
+                    // (most commonly mic-permission denial) rather than the
+                    // generic Error icon alone.
                     eprintln!("bla: failed to start audio capture: {err}");
+                    emit_pipeline_error(app, &errors::error_kind_for_capture_error(&err));
                     set_pipeline_state(app, tray::PipelineState::Error);
                 }
             }
@@ -531,17 +541,27 @@ fn tray_icon_image(state: tray::TrayIconState) -> Image<'static> {
 }
 
 fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
+    // Normal path: pill visibility follows the pure `pill_visibility_for`
+    // decision for `new_state`. The `show_pill` override exists only for the
+    // informational-notice path (see `settle_idle_keeping_pill_for_notice`).
+    let show_pill = tray::pill_visibility_for(&new_state);
+    apply_pipeline_state(app, new_state, show_pill);
+}
+
+/// Applies `new_state` to the shared state, the emitted event, the tray
+/// icon/menu, and the pill window — with `show_pill` deciding the pill's
+/// visibility explicitly rather than always deriving it from `new_state`.
+/// `set_pipeline_state` passes `tray::pill_visibility_for(&new_state)` (the
+/// normal rule); the AC-4 informational-notice path
+/// (`settle_idle_keeping_pill_for_notice`, Sentinel 🔴-2 on PR #135) passes
+/// `true` so the transient toast is shown on a *visible* pill even as the
+/// pipeline settles to `Idle`.
+fn apply_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState, show_pill: bool) {
     let state = app.state::<AppState>();
     *state.pipeline_state.lock().unwrap() = new_state;
     let icon_state = tray::tray_icon_state(&new_state);
     let icon_label = format!("{icon_state:?}");
     let _ = app.emit("pipeline-state-changed", icon_label.clone());
-
-    // Issue #126 (M2 PR 2.1): show the always-on-top recording pill window
-    // while the pipeline is Recording/Transcribing/Error, hide it once it
-    // returns to Idle. `tray::pill_visibility_for` is the pure decision;
-    // only the actual window show/hide call below is OS glue.
-    let show_pill = tray::pill_visibility_for(&new_state);
 
     // Issue #110: reflect the same derived state on the real tray icon + its
     // disabled current-state menu line. `set_pipeline_state` runs on the
@@ -571,6 +591,58 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
             } else {
                 window.hide()
             };
+        }
+    });
+}
+
+/// Emits the `pipeline-error` event (issue #126, M2 PR 2.4) the pill
+/// window's toast listens for. `kind` is always mapped via one of
+/// `errors::error_kind_for_*` (never built ad hoc at a call site), so the
+/// HARD RULE in `errors.rs`'s module doc — the payload never carries
+/// transcript/clipboard/audio content — holds at every emit site. Best-
+/// effort like every other emit in this file (`let _ =`): a dropped toast
+/// must never take down the dictation pipeline itself.
+fn emit_pipeline_error(app: &tauri::AppHandle, kind: &errors::ErrorKind) {
+    let event = errors::PipelineErrorEvent::from(kind);
+    let _ = app.emit("pipeline-error", event);
+}
+
+/// How long the pill stays visible to carry an informational notice toast
+/// (Sentinel 🔴-2 on PR #135). Matches the frontend toast's auto-dismiss
+/// window (`TOAST_AUTO_DISMISS_MS` in `src/windows/pill/Toast.tsx`, 5s) so
+/// the pill hides right about when the toast fades, not before.
+const PILL_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
+
+/// Settles the pipeline to `Idle` for the AC-4 informational-notice path
+/// (Sentinel 🔴-2 on PR #135) while keeping the pill **visible** for the
+/// toast's lifetime, then hiding it once the notice window elapses.
+///
+/// The plain `set_pipeline_state(Idle)` would hide the pill immediately
+/// (`pill_visibility_for(Idle) == false`), leaving the just-emitted
+/// `OllamaUnreachable` toast on a hidden window. So this applies `Idle`
+/// (tray icon → Idle) with the pill forced shown, then — on a spawned,
+/// non-realtime thread mirroring `spawn_stt_cache_warm`'s pattern — waits
+/// [`PILL_NOTICE_DURATION`] and hides the pill **only if the pipeline is
+/// still `Idle`** ([`tray::should_hide_pill_after_notice`], the unit-tested
+/// pure decision). A dictation started during the notice moves the state off
+/// `Idle`, so its own `set_pipeline_state` owns the pill and this elapsed
+/// notice leaves it alone — the new dictation preempts cleanly. The window
+/// `hide()` is marshaled to the main thread like every other pill mutation.
+fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
+    apply_pipeline_state(app, tray::PipelineState::Idle, true);
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PILL_NOTICE_DURATION);
+        let state = app.state::<AppState>();
+        let current_state = *state.pipeline_state.lock().unwrap();
+        if tray::should_hide_pill_after_notice(&current_state) {
+            let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
+            let _ = app.run_on_main_thread(move || {
+                if let Some(window) = pill_window {
+                    let _ = window.hide();
+                }
+            });
         }
     });
 }
@@ -877,15 +949,35 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                     std::thread::sleep,
                 );
                 match pipeline.run(&samples, &opts) {
-                    Ok(_outcome) => set_pipeline_state(&app, tray::PipelineState::Idle),
+                    Ok(outcome) => {
+                        // Issue #126 (M2 PR 2.4), AC-4/ADR-0005: the Ollama
+                        // fallback is informational, not a failure — the
+                        // dictation already completed and pasted/wrote
+                        // successfully above. Emit alongside the Idle
+                        // transition, never in place of it.
+                        if outcome.cleanup_fell_back {
+                            emit_pipeline_error(&app, &errors::ErrorKind::OllamaUnreachable);
+                            // Sentinel 🔴-2 (PR #135): a plain Idle transition
+                            // would hide the pill immediately, leaving this
+                            // informational toast on a hidden window. Keep the
+                            // pill visible for the toast's lifetime, then
+                            // settle to hidden/Idle (unless a new dictation
+                            // preempts).
+                            settle_idle_keeping_pill_for_notice(&app);
+                        } else {
+                            set_pipeline_state(&app, tray::PipelineState::Idle);
+                        }
+                    }
                     Err(err) => {
                         eprintln!("bla: pipeline run failed: {err}");
+                        emit_pipeline_error(&app, &errors::error_kind_for_pipeline_error(&err));
                         set_pipeline_state(&app, tray::PipelineState::Error);
                     }
                 }
             }
             Err(msg) => {
                 eprintln!("bla: {msg}");
+                emit_pipeline_error(&app, &errors::error_kind_for_build_stt_failure(&msg));
                 set_pipeline_state(&app, tray::PipelineState::Error);
             }
         }

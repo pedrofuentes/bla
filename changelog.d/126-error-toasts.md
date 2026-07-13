@@ -1,0 +1,1 @@
+- Typed pipeline-error toasts (issue #126): the pill window now shows a small, auto-dismissing toast when the mic fails to start, the Whisper model is missing, or the local Ollama cleanup backend is unreachable (informational — dictation still pastes via the regex fallback) — styled distinctly for informational vs blocking notices, and never carrying dictated text.
