@@ -806,6 +806,14 @@ fn emit_pipeline_error(app: &tauri::AppHandle, kind: &errors::ErrorKind) {
 /// the pill hides right about when the toast fades, not before.
 const PILL_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
 
+/// How long the pill stays visible to carry the "done" confirmation on a
+/// completed dictation (issue #151). Matches the frontend reducer's
+/// auto-hide window (`DONE_AUTO_HIDE_MS` in `src/lib/pillState.ts`, 1.5s) so
+/// the pill hides right about when the "done" state itself reverts to
+/// idle, not before — otherwise the backend would hide the OS window out
+/// from under a still-rendering "done" state.
+const DONE_PILL_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Settles the pipeline to `Idle` for the AC-4 informational-notice path
 /// (Sentinel 🔴-2 on PR #135) while keeping the pill **visible** for the
 /// toast's lifetime, then hiding it once the notice window elapses.
@@ -827,6 +835,48 @@ fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(PILL_NOTICE_DURATION);
+        let state = app.state::<AppState>();
+        let current_state = *state.pipeline_state.lock().unwrap();
+        if tray::should_hide_pill_after_notice(&current_state) {
+            let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
+            let _ = app.run_on_main_thread(move || {
+                if let Some(window) = pill_window {
+                    let _ = window.hide();
+                }
+            });
+        }
+    });
+}
+
+/// Settles the pipeline to `Idle` for a completed-dictation "done"
+/// confirmation (issue #151: previously `set_pipeline_state(Idle)` hid the
+/// pill in the very call that entered the frontend's `"done"` mode, so the
+/// ~1.5s confirmation never had a visible window to render onto). Mirrors
+/// [`settle_idle_keeping_pill_for_notice`]'s grace-window mechanism onto the
+/// completed-dictation transition instead: applies `Idle` with the pill
+/// forced shown, then — on a spawned, non-realtime thread — waits
+/// [`DONE_PILL_DURATION`] and hides the pill only if the pipeline is still
+/// `Idle` ([`tray::should_hide_pill_after_notice`]), so a dictation started
+/// during the window preempts cleanly, same as the notice path.
+///
+/// Only takes the visible-settle path when `previous` confirms this really
+/// is a completed-dictation transition
+/// ([`tray::should_keep_pill_visible_for_done`]) — defense in depth in case
+/// this is ever called from somewhere other than its one intended call site
+/// (the non-fallback success arm of `run_pipeline_in_background`), falling
+/// back to the plain settle otherwise so an unrelated transition never grows
+/// a spurious "done" pill.
+fn settle_idle_keeping_pill_for_done(app: &tauri::AppHandle, previous: tray::PipelineState) {
+    if !tray::should_keep_pill_visible_for_done(&previous) {
+        set_pipeline_state(app, tray::PipelineState::Idle);
+        return;
+    }
+
+    apply_pipeline_state(app, tray::PipelineState::Idle, true);
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(DONE_PILL_DURATION);
         let state = app.state::<AppState>();
         let current_state = *state.pipeline_state.lock().unwrap();
         if tray::should_hide_pill_after_notice(&current_state) {
@@ -1158,7 +1208,18 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                             // preempts).
                             settle_idle_keeping_pill_for_notice(&app);
                         } else {
-                            set_pipeline_state(&app, tray::PipelineState::Idle);
+                            // Issue #151: a plain Idle transition hid the
+                            // pill in the same call that entered the
+                            // frontend's "done" state, so the ~1.5s "done"
+                            // confirmation never had a visible window to
+                            // render onto. `previous` is read before the
+                            // transition (it's `Transcribing`, set when this
+                            // dictation started) so the settle can confirm
+                            // via the pure `should_keep_pill_visible_for_done`
+                            // that this really is a completed-dictation
+                            // transition before keeping the pill visible.
+                            let previous = *app.state::<AppState>().pipeline_state.lock().unwrap();
+                            settle_idle_keeping_pill_for_done(&app, previous);
                         }
                     }
                     Err(err) => {

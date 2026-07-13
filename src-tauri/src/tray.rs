@@ -117,6 +117,26 @@ pub fn should_hide_pill_after_notice(state: &PipelineState) -> bool {
     matches!(state, PipelineState::Idle)
 }
 
+/// Whether a Busy → Idle transition should keep the pill visible for a
+/// "done" confirmation instead of hiding it in the same call (issue #151).
+/// True only when `previous` was actively dictating
+/// (`Recording`/`Transcribing`) — i.e. the pipeline just *completed* a
+/// dictation, as opposed to a hotkey cancel (which calls
+/// `set_pipeline_state(Idle)` directly, never routing through the settle
+/// path this guards) or an already-`Idle`/`Error` state. Distinct from
+/// [`pill_visibility_for`]`(&Idle)` (always `false`): callers that know a
+/// dictation just completed route through `apply_pipeline_state(Idle, true)`
+/// instead so the frontend's "done" state (`pillState.ts`) actually gets a
+/// visible pill to render onto before it auto-hides. Pure/total so the
+/// decision is unit-tested; the grace-window sleep + `window.hide()` stay
+/// thin OS glue in `lib.rs`.
+pub fn should_keep_pill_visible_for_done(previous: &PipelineState) -> bool {
+    matches!(
+        previous,
+        PipelineState::Recording | PipelineState::Transcribing
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
