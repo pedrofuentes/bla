@@ -541,17 +541,27 @@ fn tray_icon_image(state: tray::TrayIconState) -> Image<'static> {
 }
 
 fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
+    // Normal path: pill visibility follows the pure `pill_visibility_for`
+    // decision for `new_state`. The `show_pill` override exists only for the
+    // informational-notice path (see `settle_idle_keeping_pill_for_notice`).
+    let show_pill = tray::pill_visibility_for(&new_state);
+    apply_pipeline_state(app, new_state, show_pill);
+}
+
+/// Applies `new_state` to the shared state, the emitted event, the tray
+/// icon/menu, and the pill window — with `show_pill` deciding the pill's
+/// visibility explicitly rather than always deriving it from `new_state`.
+/// `set_pipeline_state` passes `tray::pill_visibility_for(&new_state)` (the
+/// normal rule); the AC-4 informational-notice path
+/// (`settle_idle_keeping_pill_for_notice`, Sentinel 🔴-2 on PR #135) passes
+/// `true` so the transient toast is shown on a *visible* pill even as the
+/// pipeline settles to `Idle`.
+fn apply_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState, show_pill: bool) {
     let state = app.state::<AppState>();
     *state.pipeline_state.lock().unwrap() = new_state;
     let icon_state = tray::tray_icon_state(&new_state);
     let icon_label = format!("{icon_state:?}");
     let _ = app.emit("pipeline-state-changed", icon_label.clone());
-
-    // Issue #126 (M2 PR 2.1): show the always-on-top recording pill window
-    // while the pipeline is Recording/Transcribing/Error, hide it once it
-    // returns to Idle. `tray::pill_visibility_for` is the pure decision;
-    // only the actual window show/hide call below is OS glue.
-    let show_pill = tray::pill_visibility_for(&new_state);
 
     // Issue #110: reflect the same derived state on the real tray icon + its
     // disabled current-state menu line. `set_pipeline_state` runs on the
@@ -595,6 +605,46 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
 fn emit_pipeline_error(app: &tauri::AppHandle, kind: &errors::ErrorKind) {
     let event = errors::PipelineErrorEvent::from(kind);
     let _ = app.emit("pipeline-error", event);
+}
+
+/// How long the pill stays visible to carry an informational notice toast
+/// (Sentinel 🔴-2 on PR #135). Matches the frontend toast's auto-dismiss
+/// window (`TOAST_AUTO_DISMISS_MS` in `src/windows/pill/Toast.tsx`, 5s) so
+/// the pill hides right about when the toast fades, not before.
+const PILL_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
+
+/// Settles the pipeline to `Idle` for the AC-4 informational-notice path
+/// (Sentinel 🔴-2 on PR #135) while keeping the pill **visible** for the
+/// toast's lifetime, then hiding it once the notice window elapses.
+///
+/// The plain `set_pipeline_state(Idle)` would hide the pill immediately
+/// (`pill_visibility_for(Idle) == false`), leaving the just-emitted
+/// `OllamaUnreachable` toast on a hidden window. So this applies `Idle`
+/// (tray icon → Idle) with the pill forced shown, then — on a spawned,
+/// non-realtime thread mirroring `spawn_stt_cache_warm`'s pattern — waits
+/// [`PILL_NOTICE_DURATION`] and hides the pill **only if the pipeline is
+/// still `Idle`** ([`tray::should_hide_pill_after_notice`], the unit-tested
+/// pure decision). A dictation started during the notice moves the state off
+/// `Idle`, so its own `set_pipeline_state` owns the pill and this elapsed
+/// notice leaves it alone — the new dictation preempts cleanly. The window
+/// `hide()` is marshaled to the main thread like every other pill mutation.
+fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
+    apply_pipeline_state(app, tray::PipelineState::Idle, true);
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PILL_NOTICE_DURATION);
+        let state = app.state::<AppState>();
+        let current_state = *state.pipeline_state.lock().unwrap();
+        if tray::should_hide_pill_after_notice(&current_state) {
+            let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
+            let _ = app.run_on_main_thread(move || {
+                if let Some(window) = pill_window {
+                    let _ = window.hide();
+                }
+            });
+        }
+    });
 }
 
 /// Dispatches a click on one of the tray menu's items (issue #110), by the
@@ -903,12 +953,20 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                         // Issue #126 (M2 PR 2.4), AC-4/ADR-0005: the Ollama
                         // fallback is informational, not a failure — the
                         // dictation already completed and pasted/wrote
-                        // successfully above. Emit alongside the normal Idle
+                        // successfully above. Emit alongside the Idle
                         // transition, never in place of it.
                         if outcome.cleanup_fell_back {
                             emit_pipeline_error(&app, &errors::ErrorKind::OllamaUnreachable);
+                            // Sentinel 🔴-2 (PR #135): a plain Idle transition
+                            // would hide the pill immediately, leaving this
+                            // informational toast on a hidden window. Keep the
+                            // pill visible for the toast's lifetime, then
+                            // settle to hidden/Idle (unless a new dictation
+                            // preempts).
+                            settle_idle_keeping_pill_for_notice(&app);
+                        } else {
+                            set_pipeline_state(&app, tray::PipelineState::Idle);
                         }
-                        set_pipeline_state(&app, tray::PipelineState::Idle);
                     }
                     Err(err) => {
                         eprintln!("bla: pipeline run failed: {err}");

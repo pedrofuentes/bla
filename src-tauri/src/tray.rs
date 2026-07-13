@@ -100,6 +100,23 @@ pub fn pill_visibility_for(state: &PipelineState) -> bool {
     !matches!(state, PipelineState::Idle)
 }
 
+/// Whether an *elapsed* informational-notice period should now hide the pill
+/// (issue #126, M2 PR 2.4; Sentinel 🔴-2 on PR #135). The AC-4
+/// Ollama-unreachable toast is informational — the dictation still pasted —
+/// so the pill is kept visible for the toast's lifetime even though the
+/// pipeline has already settled to `Idle` (where [`pill_visibility_for`]
+/// alone would hide it immediately, leaving the toast on a hidden window).
+/// Once the notice window elapses, hide the pill **only if the pipeline is
+/// still `Idle`**: a dictation started during the notice moves the state to
+/// `Recording`/`Transcribing` (or `Error`), and that transition's own
+/// `set_pipeline_state` already keeps the pill shown — so the elapsed notice
+/// must not hide it, letting the new dictation preempt cleanly. Pure/total
+/// so the decision is unit-tested; the sleep + `window.hide()` around it stay
+/// thin OS glue in `lib.rs`.
+pub fn should_hide_pill_after_notice(state: &PipelineState) -> bool {
+    matches!(state, PipelineState::Idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
