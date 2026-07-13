@@ -49,6 +49,17 @@ sha2 = "0.10"
 url = "2.5"
 tauri-plugin-store = "2"
 tauri-plugin-global-shortcut = "2"
+# `store.rs`'s history/dictionary/tone-rules/snippets persistence (MISSION
+# §5: local SQLite under the OS app-data dir, nothing leaves the device).
+# `bundled` compiles SQLite from source via `cc` rather than linking the
+# system library, so behavior can't skew across macOS/Windows CI images or
+# user machines with an old/missing system SQLite — the standard choice for
+# a portable desktop app. `default-features = false` drops rusqlite's
+# unrelated defaults (notably the new WASM FFI shim) that a native bundled
+# build has no use for; `bundled` is the only feature this crate needs.
+rusqlite = { version = "0.40.1", default-features = false, features = [
+  "bundled",
+] }
 
 [dev-dependencies]
 static_assertions = "1.1.0"
