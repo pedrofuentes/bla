@@ -684,6 +684,46 @@ mod tests {
     }
 
     #[test]
+    fn clamp_level_caps_driver_clipped_input_at_one() {
+        // Issue #136 item 2: driver-clipped input can push rms_level above
+        // 1.0; the emitted `audio-level` contract is 0.0..=1.0.
+        assert_eq!(clamp_level(1.4), 1.0);
+        assert_eq!(clamp_level(f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn clamp_level_holds_the_zero_floor() {
+        assert_eq!(clamp_level(-0.3), 0.0);
+        assert_eq!(clamp_level(f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn clamp_level_maps_nan_to_the_zero_floor() {
+        // `f32::clamp` would propagate NaN; mirror the TS-side clamp01 which
+        // treats NaN as 0.0 so a broken sample can't poison the meter.
+        assert_eq!(clamp_level(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn clamp_level_passes_in_range_values_through_unchanged() {
+        assert_eq!(clamp_level(0.0), 0.0);
+        assert_eq!(clamp_level(0.42), 0.42);
+        assert_eq!(clamp_level(1.0), 1.0);
+    }
+
+    #[test]
+    fn should_emit_clamps_the_value_it_returns_to_the_documented_range() {
+        // The throttle is the single choke point producing the emitted
+        // value, so clamping there guarantees the wire contract regardless
+        // of caller.
+        let mut throttle = LevelThrottle::new();
+        assert_eq!(
+            throttle.should_emit(std::time::Duration::from_millis(0), 1.7),
+            Some(1.0)
+        );
+    }
+
+    #[test]
     fn wav_export_round_trips_header_and_sample_count() {
         let samples = sine_wave(440.0, TARGET_SAMPLE_RATE, 1_600, 0.8);
         let path = std::env::temp_dir().join(format!(
