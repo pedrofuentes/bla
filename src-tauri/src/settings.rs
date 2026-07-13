@@ -60,6 +60,18 @@ pub struct Settings {
     pub model_preset: ModelPreset,
     pub output_mode: OutputModeSetting,
     pub file_path_template: String,
+    /// Whether bla should register itself to launch at OS login (issue
+    /// #126, M2 PR 2.6). Defaults to `false` — autostart is opt-in, never
+    /// silently enabled for a user who never asked for it. The actual OS
+    /// registration is thin glue in `commands::set_settings` over
+    /// `tauri-plugin-autostart`'s `AutoLaunchManager`; this field is only
+    /// the durable preference.
+    pub launch_at_login: bool,
+    /// Whether to play short audio cues on recording start/stop (issue
+    /// #126, M2 PR 2.6). Defaults to `true`. Purely a persisted preference
+    /// in this PR — actual cue playback is wired up in PR 2.7, which reads
+    /// this flag.
+    pub sound_cues: bool,
 }
 
 impl Default for Settings {
@@ -81,6 +93,8 @@ impl Default for Settings {
             model_preset: ModelPreset::LargeV3Turbo,
             output_mode: OutputModeSetting::Cursor,
             file_path_template: "{{date:YYYY-MM-DD}}.md".to_string(),
+            launch_at_login: false,
+            sound_cues: true,
         }
     }
 }
@@ -217,6 +231,30 @@ pub fn persist_validated<S: SettingsStore>(
 ) -> Result<(), String> {
     validate(&new.hotkey)?;
     store.save(new)
+}
+
+/// Which direction (if any) a `launch_at_login` change needs to flip OS
+/// autostart registration (issue #126, M2 PR 2.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartAction {
+    Enable,
+    Disable,
+}
+
+/// Pure decision: does changing `launch_at_login` from `old` to `new`
+/// require an OS autostart registration change, and in which direction?
+/// `None` when unchanged — the common case on every settings save that
+/// doesn't touch this field, where `commands::set_settings` must NOT call
+/// into `tauri-plugin-autostart` at all. Kept separate from the actual
+/// `AutoLaunchManager::enable`/`disable` call (thin OS glue in
+/// `commands::set_settings`) so this decision is unit-testable without a
+/// live Tauri app.
+pub fn autostart_action_for_change(old: bool, new: bool) -> Option<AutostartAction> {
+    match (old, new) {
+        (false, true) => Some(AutostartAction::Enable),
+        (true, false) => Some(AutostartAction::Disable),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
