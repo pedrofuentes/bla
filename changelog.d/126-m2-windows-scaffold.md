@@ -1,0 +1,1 @@
+- M2 windows scaffold (issue #126): added the always-on-top recording pill and full settings windows as hidden-by-default app windows, wired a tray "Settings…" item to show them, and made the pill window show/hide automatically while dictating — placeholder UI for now, real content lands in later M2 PRs.
