@@ -113,6 +113,21 @@ mod tests {
     }
 
     #[test]
+    fn should_hide_pill_after_notice_only_when_still_idle_issue_126() {
+        // Sentinel 🔴-2 (PR #135): the AC-4 informational OllamaUnreachable
+        // toast is shown while the pipeline settles to Idle; the pill must
+        // stay visible for the notice window and only hide afterward IFF the
+        // pipeline is *still* Idle. A new dictation started during the notice
+        // moves the state off Idle (Recording/Transcribing) — its own
+        // `set_pipeline_state` keeps the pill shown, so the elapsed notice
+        // must NOT hide it (the new dictation preempts cleanly).
+        assert!(should_hide_pill_after_notice(&PipelineState::Idle));
+        assert!(!should_hide_pill_after_notice(&PipelineState::Recording));
+        assert!(!should_hide_pill_after_notice(&PipelineState::Transcribing));
+        assert!(!should_hide_pill_after_notice(&PipelineState::Error));
+    }
+
+    #[test]
     fn tray_icon_state_maps_every_pipeline_state_ac14() {
         assert_eq!(tray_icon_state(&PipelineState::Idle), TrayIconState::Idle);
         assert_eq!(
