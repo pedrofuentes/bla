@@ -65,6 +65,13 @@ pub fn set_settings(
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
         register_hotkey(&app, &settings.hotkey).map_err(|e| e.to_string())?;
+        // PR #185 Sentinel delta 🟡-2: this register supersedes any
+        // outstanding hotkey-capture suspend (a committed-changed chord ends
+        // capture), so clear the suspend generation — its doc contract is
+        // "0 when not suspended". Otherwise `force_resume_hotkey` on a later
+        // settings-window close would see gen != 0 and do a redundant
+        // unregister_all()+register.
+        *state.hotkey_suspend_gen.lock().unwrap() = 0;
     }
 
     save_settings_to_store(&app, &settings)?;

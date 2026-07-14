@@ -1660,6 +1660,11 @@ pub fn run() {
                         // shortcut, restore it here or it stays dead until
                         // app restart.
                         force_resume_hotkey(&close_handle);
+                        // PR #185 Sentinel delta 🟡-3: tell the (still-alive)
+                        // settings webview to leave capture mode, so a field
+                        // that was mid-capture at close isn't stuck swallowing
+                        // keys when the window is reopened.
+                        let _ = close_handle.emit("hotkey-capture-reset", ());
                         if let Some(window) = close_handle.get_webview_window(SETTINGS_WINDOW_LABEL)
                         {
                             let _ = window.hide();
