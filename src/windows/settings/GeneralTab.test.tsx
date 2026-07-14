@@ -411,12 +411,87 @@ describe("GeneralTab", () => {
     await flush();
   });
 
+  it("gates a refocus during the commit→validate round-trip, before the apply is enqueued", async () => {
+    // PR #185 cycle-4 🟡-4: committing a changed chord sets the in-flight
+    // signal SYNCHRONOUSLY (at setCapturing(false) time), before the
+    // validate_hotkey round-trip — so a refocus during that gap can't slip
+    // past the gate and mint a second suspend. This test deliberately does
+    // NOT flush past the pending validate.
+    let resolveValidate: (() => void) | undefined;
+    setupInvoke({
+      validate_hotkey: () => new Promise<void>((resolve) => (resolveValidate = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input); // suspend gen1
+    await flush();
+
+    // Commit a chord — validate is now pending (not yet resolved).
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
+
+    invoke.mockClear();
+    // Refocus during the validate gap.
+    blur(input);
+    focus(input);
+    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
+
+    resolveValidate!(); // let the commit flow complete
+    await flush();
+  });
+
+  it("times out a hung set_settings and reverts, releasing the capture gate", async () => {
+    // PR #185 cycle-4 🟡-3: a set_settings that never resolves must not wedge
+    // applyInFlightRef>0 forever (which would silently disable hotkey capture
+    // for the session). A timeout rejects into the revert path.
+    vi.useFakeTimers();
+    try {
+      setupInvoke({
+        set_settings: () => new Promise<void>(() => {}), // hangs forever
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="sound-cues-checkbox"]',
+      )!;
+      click(soundCheckbox); // apply starts, set_settings hangs, gate held
+      await flush();
+
+      await vi.advanceTimersByTimeAsync(20_000); // fire the timeout
+      await flush();
+
+      expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
+        /tim(e|ed) ?out/i,
+      );
+
+      // Gate released: focusing the hotkey field now starts capture again.
+      invoke.mockClear();
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="hotkey-input"]',
+      )!;
+      focus(input);
+      await flush();
+      expect(invoke).toHaveBeenCalledWith(
+        "suspend_hotkey",
+        expect.objectContaining({ generation: expect.any(Number) }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps the hotkey registered across a commit→refocus interleave (TOCTOU)", async () => {
-    // PR #185 cycle-3: committing a changed chord enqueues an apply whose
-    // resume re-registers the new binding (single owner). Refocusing the
-    // field while that apply is in flight must NOT mint a second suspend that
-    // clobbers the generation — the gate blocks it — and the original
-    // suspend's generation is what resume eventually restores.
+    // PR #185 cycle-4: committing a changed chord enqueues an apply; its
+    // set_settings is the sole registrar of the new binding (no resume
+    // double-register). Refocusing the field while that apply is in flight
+    // must NOT mint a second suspend that clobbers the generation — the gate
+    // blocks it — and the persist still lands.
     let resolveSet: (() => void) | undefined;
     setupInvoke({
       set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
@@ -431,28 +506,27 @@ describe("GeneralTab", () => {
     invoke.mockClear();
     focus(input);
     await flush();
-    const suspendCall = invoke.mock.calls.find((c) => c[0] === "suspend_hotkey");
-    const gen1 = (suspendCall![1] as { generation: number }).generation;
 
     keydown(input, "D", { ctrlKey: true, shiftKey: true }); // commit changed → apply in flight
     await flush();
 
-    invoke.mockClear();
     // Try to re-enter capture while the commit's apply is still saving.
     blur(input);
     await flush();
     focus(input);
     await flush();
-    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
 
-    resolveSet!(); // apply completes → resume registers the new chord
+    resolveSet!(); // apply completes
     await flush();
 
-    // Resume uses the ORIGINAL suspend generation — never clobbered.
-    expect(invoke).toHaveBeenCalledWith(
-      "resume_hotkey",
-      expect.objectContaining({ generation: gen1 }),
-    );
+    // Exactly ONE suspend across the whole interleave (the initial focus) —
+    // the refocus was gated, so the generation was never clobbered.
+    const suspendCalls = invoke.mock.calls.filter((c) => c[0] === "suspend_hotkey");
+    expect(suspendCalls).toHaveLength(1);
+    // set_settings persisted the new chord (its register-gate binds it).
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
   });
 
   it("resets a stuck capture when the backend signals the window was hidden mid-capture", async () => {
@@ -622,11 +696,12 @@ describe("GeneralTab", () => {
     );
   });
 
-  it("persists then resumes (single-owner re-register) for a committed chord that CHANGED", async () => {
-    // PR #185 cycle-3 single-owner model: set_settings no longer registers
-    // the hotkey. A committed changed chord persists via set_settings, then
-    // resume — the sole shortcut owner — re-registers the newly-persisted
-    // binding, guarded by the original suspend's generation.
+  it("persists a committed changed chord via set_settings, which is the sole registrar (no resume)", async () => {
+    // PR #185 cycle-4 🔴-1 (#91 register-before-persist restored): for a
+    // CHANGED chord, set_settings does the real OS registration as its
+    // persist-gate — so a chord that can't bind is never persisted. resume
+    // must NOT ALSO re-register (no double-register): the committed-changed
+    // success path hands registration entirely to set_settings.
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -641,14 +716,8 @@ describe("GeneralTab", () => {
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
     });
-    expect(invoke).toHaveBeenCalledWith(
-      "resume_hotkey",
-      expect.objectContaining({ generation: expect.any(Number) }),
-    );
-    // Order: the resume runs AFTER the save (it registers the persisted chord).
-    const setIdx = invoke.mock.calls.findIndex((c) => c[0] === "set_settings");
-    const resumeIdx = invoke.mock.calls.findIndex((c) => c[0] === "resume_hotkey");
-    expect(resumeIdx).toBeGreaterThan(setIdx);
+    // set_settings is the single registration point — no resume double-register.
+    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey", expect.anything());
   });
 
   it("resumes (and does NOT re-persist) when the committed chord equals the current hotkey", async () => {
@@ -888,6 +957,48 @@ describe("GeneralTab", () => {
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, output_mode: "File", sound_cues: false },
     });
+  });
+
+  it("does not clobber a concurrent output-mode change when an apply is REVERTED on failure", async () => {
+    // PR #185 cycle-4 🔴-2: the output-mode-changed handler mutates
+    // settingsRef out of band (outside the serial queue). If an apply
+    // captured base=(output Cursor), the tray switches to File mid-flight,
+    // then the apply rejects — a blind revert-to-base would drop File, and a
+    // later apply would re-persist Cursor. The rollback must restore only the
+    // patched field, preserving the concurrent File.
+    let rejectSet: (() => void) | undefined;
+    setupInvoke({
+      set_settings: () => new Promise<void>((_res, rej) => (rejectSet = () => rej(new Error("boom")))),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+    click(soundCheckbox); // apply captures base (output Cursor), set_settings pending
+    await flush();
+
+    fire("output-mode-changed", "File"); // out-of-band write while apply in flight
+    await flush();
+
+    rejectSet!(); // apply fails → revert
+    await flush();
+
+    // A later unrelated apply must carry output_mode File (not clobbered to Cursor).
+    setupInvoke(); // restore the default (resolving) set_settings
+    invoke.mockClear();
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    click(launchCheckbox);
+    await flush();
+
+    const setCalls = invoke.mock.calls.filter((c) => c[0] === "set_settings");
+    expect((setCalls[setCalls.length - 1][1] as { settings: Settings }).settings.output_mode).toBe(
+      "File",
+    );
   });
 
   // -------------------------------------------------------------------
