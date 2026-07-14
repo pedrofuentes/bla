@@ -55,25 +55,29 @@ pub fn set_settings(
         )
     };
 
-    // Issue #91 (Sentinel 🔴): validate the new hotkey BEFORE persisting
-    // anything. A malformed/unparseable hotkey is rejected at the IPC
-    // boundary (returns Err) and NEVER written to settings.json — a persisted
-    // bad hotkey would brick the next launch. `validate_hotkey` uses the same
-    // parser `register_hotkey` does, so a value that validates is a value
-    // that registers.
+    // Issue #91 (Sentinel 🔴) — register-before-persist. A changed hotkey is
+    // validated AND actually bound to the OS BEFORE anything is persisted: a
+    // chord that parses but the OS refuses to register (already claimed by
+    // another app, or OS-reserved — a real failure mode on Windows;
+    // macOS's registrar returns Ok) is rejected here and NEVER written to
+    // settings.json, so it can't brick dictation across the next launch.
     //
-    // PR #185 cycle-3 (single-owner refactor): `set_settings` does NOT
-    // register the hotkey or touch `hotkey_suspend_gen`. The global shortcut
-    // has exactly one owner — the `suspend_hotkey`/`resume_hotkey` pair
-    // (guarded by the generation token) — so a committed hotkey change is
-    // re-registered by the settings window's `resume_hotkey` AFTER this save
-    // persists it, never by two independent writers racing the OS
-    // registration + generation (the TOCTOU that bricked the hotkey across
-    // earlier fix cycles). Startup registration (`run()`'s setup) and the
-    // close-time `force_resume_hotkey` net remain the only other registrars,
-    // and are mutually exclusive in time with an active capture.
+    // PR #185 cycle-4: `set_settings` owns the registration of the *committed
+    // chord* (this persist-gate), while `suspend_hotkey`/`resume_hotkey` own
+    // only the capture-window suspend/restore of the shortcut. These are
+    // temporally disjoint — `beginCapture` is gated on the frontend's
+    // in-flight signal, so no `suspend_hotkey` runs concurrently with an
+    // apply — so `set_settings` doing the OS bind here does NOT reintroduce
+    // the two-writer generation TOCTOU that earlier cycles fought. After a
+    // successful bind we clear `hotkey_suspend_gen` (the committed chord ends
+    // the capture): the frontend does NOT resume for a committed-changed
+    // chord, so this is the single registration point (no double-register).
+    // On a bind failure this returns `Err` before persisting; the settings
+    // window then reverts the field and `resume_hotkey`s the prior binding.
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
+        register_hotkey(&app, &settings.hotkey).map_err(|e| e.to_string())?;
+        *state.hotkey_suspend_gen.lock().unwrap() = 0;
     }
 
     save_settings_to_store(&app, &settings)?;
