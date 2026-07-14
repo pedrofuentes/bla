@@ -1,6 +1,6 @@
 [package]
 name = "bla"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first, system-wide voice dictation: hold a hotkey, speak, and cleaned text lands at the cursor or in a file — fully on-device."
 authors = ["Pedro Fuentes"]
 edition = "2021"

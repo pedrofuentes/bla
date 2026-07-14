@@ -1,1 +1,0 @@
-- Settings window General tab (issue #126): hotkey capture (press a key combination, validated live via a new `validate_hotkey` command before it's ever saved), Whisper model preset selection with download progress, and hold-vs-toggle recording mode — the tab bar's full shape (History/Dictionary/Tone/Snippets) is in place, with the rest of the tabs landing in later M2 increments.
