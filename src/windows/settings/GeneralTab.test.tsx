@@ -1,7 +1,7 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { change, click, flush, focus, keydown, mount, type Mounted } from "../../testUtils";
-import type { Settings } from "../../lib/ipc";
+import { blur, change, click, flush, focus, keydown, mount, type Mounted } from "../../testUtils";
+import type { ModelRegistryEntry, Settings } from "../../lib/ipc";
 import { GeneralTab } from "./GeneralTab";
 
 const invoke = vi.fn();
@@ -40,6 +40,11 @@ const BASE_SETTINGS: Settings = {
   sound_cues: true,
 };
 
+const MODEL_REGISTRY: ModelRegistryEntry[] = [
+  { preset: "LargeV3Turbo", size_bytes: 574_041_195 },
+  { preset: "Small", size_bytes: 487_601_967 },
+];
+
 function setupInvoke(overrides: Partial<Record<string, (...args: unknown[]) => unknown>> = {}) {
   invoke.mockImplementation((command: string, args?: unknown) => {
     if (overrides[command]) return Promise.resolve(overrides[command]!(args));
@@ -51,6 +56,12 @@ function setupInvoke(overrides: Partial<Record<string, (...args: unknown[]) => u
       case "validate_hotkey":
         return Promise.resolve(undefined);
       case "set_settings":
+        return Promise.resolve(undefined);
+      case "model_registry":
+        return Promise.resolve(MODEL_REGISTRY);
+      case "suspend_hotkey":
+        return Promise.resolve(undefined);
+      case "resume_hotkey":
         return Promise.resolve(undefined);
       default:
         return Promise.reject(new Error(`unmocked command ${command}`));
@@ -96,7 +107,88 @@ describe("GeneralTab", () => {
     expect(invoke).toHaveBeenCalledWith("download_selected_model");
   });
 
-  it("captures a key chord into the hotkey field and validates it", async () => {
+  it("has no Save button — every control auto-applies on change (issue #183)", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="save-button"]')).toBeNull();
+  });
+
+  // -------------------------------------------------------------------
+  // Issue #183: auto-apply on change — each control calls set_settings
+  // immediately, with a brief "Saved" confirmation, rather than requiring a
+  // separate Save click the cofounder never found in the AC-7 smoke test.
+  // -------------------------------------------------------------------
+
+  it("auto-applies a recording-mode change immediately via set_settings", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const toggleRadio = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="mode-toggle"]',
+    )!;
+    invoke.mockClear();
+    click(toggleRadio);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, recording_mode: "Toggle" },
+    });
+    expect(mounted.container.querySelector('[data-testid="save-status"]')?.textContent).toMatch(
+      /saved/i,
+    );
+  });
+
+  it("auto-applies a model-preset change immediately and re-checks download status", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const modelSelect = mounted.container.querySelector<HTMLSelectElement>(
+      '[data-testid="model-preset-select"]',
+    )!;
+    invoke.mockClear();
+    change(modelSelect, "Small");
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, model_preset: "Small" },
+    });
+    expect(invoke).toHaveBeenCalledWith("download_selected_model");
+  });
+
+  it("auto-applies a toggled launch-at-login immediately via set_settings", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    invoke.mockClear();
+    click(launchCheckbox);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, launch_at_login: true },
+    });
+  });
+
+  it("auto-applies a toggled sound-cues preference immediately via set_settings", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+    invoke.mockClear();
+    click(soundCheckbox);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, sound_cues: false },
+    });
+  });
+
+  it("auto-applies a validated captured hotkey immediately via set_settings", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -104,15 +196,60 @@ describe("GeneralTab", () => {
       '[data-testid="hotkey-input"]',
     )!;
     focus(input);
+    invoke.mockClear();
     keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
 
     expect(invoke).toHaveBeenCalledWith("validate_hotkey", { accelerator: "Control+Shift+D" });
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
     expect(input.value).toBe("Control+Shift+D");
     expect(mounted.container.querySelector('[data-testid="hotkey-error"]')).toBeNull();
   });
 
-  it("keeps listening (doesn't validate or commit a chord) on a bare modifier keydown", async () => {
+  it("blocks auto-apply and shows an inline error when the captured chord is invalid", async () => {
+    setupInvoke({
+      validate_hotkey: () => Promise.reject(new Error("bad accelerator")),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    invoke.mockClear();
+    keydown(input, "Z", { ctrlKey: true });
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')?.textContent).toMatch(
+      /bad accelerator/i,
+    );
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+  });
+
+  it("shows a save-error and does not update settings when set_settings rejects", async () => {
+    setupInvoke({
+      set_settings: () => Promise.reject(new Error("disk full")),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+    click(soundCheckbox);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
+      /disk full/i,
+    );
+  });
+
+  it("keeps listening (doesn't validate or auto-apply a chord) on a bare modifier keydown", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -135,7 +272,7 @@ describe("GeneralTab", () => {
     expect(input.value).toBe("Control+Shift+Space");
   });
 
-  it("cancels capture on Escape without changing the field", async () => {
+  it("cancels capture on Escape without changing the field or calling set_settings", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -148,42 +285,31 @@ describe("GeneralTab", () => {
 
     expect(input.value).toBe("Control+Shift+Space");
     expect(invoke).not.toHaveBeenCalledWith("validate_hotkey", expect.anything());
-  });
-
-  it("shows an inline error and blocks save when the captured chord is invalid", async () => {
-    invoke.mockImplementation((command: string) => {
-      if (command === "validate_hotkey") return Promise.reject(new Error("bad accelerator"));
-      if (command === "get_settings") return Promise.resolve(BASE_SETTINGS);
-      if (command === "download_selected_model") return Promise.resolve("already-present");
-      if (command === "set_settings") return Promise.resolve(undefined);
-      return Promise.reject(new Error(`unmocked command ${command}`));
-    });
-
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const input = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="hotkey-input"]',
-    )!;
-    focus(input);
-    keydown(input, "Z", { ctrlKey: true });
-    await flush();
-
-    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')?.textContent).toMatch(
-      /bad accelerator/i,
-    );
-
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
-      '[data-testid="save-button"]',
-    )!;
-    invoke.mockClear();
-    click(saveButton);
-    await flush();
-
     expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
   });
 
-  it("saves the validated hotkey, recording mode, and model preset via set_settings", async () => {
+  // -------------------------------------------------------------------
+  // Issue #181: the global dictation hotkey must be suspended while the
+  // capture field is active, so keypresses reach the field instead of also
+  // starting a dictation via the still-live shortcut — and restored on
+  // every way capture can end.
+  // -------------------------------------------------------------------
+
+  it("suspends the global hotkey the moment the capture field is focused", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    invoke.mockClear();
+    focus(input);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("suspend_hotkey");
+  });
+
+  it("resumes the global hotkey when capture is cancelled via Escape", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -191,34 +317,98 @@ describe("GeneralTab", () => {
       '[data-testid="hotkey-input"]',
     )!;
     focus(input);
+    invoke.mockClear();
+    keydown(input, "Escape");
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("resume_hotkey");
+  });
+
+  it("resumes the global hotkey when the field loses focus mid-capture", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    invoke.mockClear();
+    blur(input);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("resume_hotkey");
+  });
+
+  it("resumes the global hotkey when the captured chord fails validation", async () => {
+    setupInvoke({
+      validate_hotkey: () => Promise.reject(new Error("bad accelerator")),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    invoke.mockClear();
+    keydown(input, "Z", { ctrlKey: true });
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("resume_hotkey");
+  });
+
+  it("does not call resume_hotkey for a successfully committed, auto-applied chord", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    invoke.mockClear();
     keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
 
-    const toggleRadio = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="mode-toggle"]',
-    )!;
-    click(toggleRadio);
+    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey");
+  });
 
-    const modelSelect = mounted.container.querySelector<HTMLSelectElement>(
-      '[data-testid="model-preset-select"]',
-    )!;
-    change(modelSelect, "Small");
+  // -------------------------------------------------------------------
+  // Issue #184: the model picker surfaces each preset's download size.
+  // -------------------------------------------------------------------
 
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
-      '[data-testid="save-button"]',
-    )!;
-    invoke.mockClear();
-    click(saveButton);
+  it("fetches the model registry on mount and shows each preset's size in the picker", async () => {
+    mounted = mount(<GeneralTab />);
     await flush();
 
-    expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: {
-        ...BASE_SETTINGS,
-        hotkey: "Control+Shift+D",
-        recording_mode: "Toggle",
-        model_preset: "Small",
-      },
+    expect(invoke).toHaveBeenCalledWith("model_registry");
+    const options = Array.from(
+      mounted.container.querySelectorAll<HTMLOptionElement>(
+        '[data-testid="model-preset-select"] option',
+      ),
+    );
+    const largeOption = options.find((o) => o.value === "LargeV3Turbo")!;
+    const smallOption = options.find((o) => o.value === "Small")!;
+    expect(largeOption.textContent).toContain("574 MB");
+    expect(smallOption.textContent).toContain("488 MB");
+  });
+
+  it("still shows the plain preset label when the model registry hasn't loaded yet", async () => {
+    setupInvoke({
+      model_registry: () => new Promise(() => {}), // never resolves
     });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const options = Array.from(
+      mounted.container.querySelectorAll<HTMLOptionElement>(
+        '[data-testid="model-preset-select"] option',
+      ),
+    );
+    const largeOption = options.find((o) => o.value === "LargeV3Turbo")!;
+    expect(largeOption.textContent).toContain("Whisper large-v3-turbo (quantized)");
+    expect(largeOption.textContent).not.toContain("MB");
   });
 
   // -------------------------------------------------------------------
@@ -321,13 +511,13 @@ describe("GeneralTab", () => {
   });
 
   // -------------------------------------------------------------------
-  // PR #134 Sentinel 🔴-2: Save must not clobber a concurrent settings
-  // change made elsewhere (tray menu / status window's output-mode toggle)
-  // while this window is open — the snapshot Save spreads must track
-  // `output-mode-changed`, mirroring App.tsx.
+  // PR #134 Sentinel 🔴-2: a concurrent settings change made elsewhere
+  // (tray menu / status window's output-mode toggle) while this window is
+  // open must not be clobbered by a later auto-apply from any control here
+  // — mirrors App.tsx's own output-mode-changed subscription.
   // -------------------------------------------------------------------
 
-  it("does not clobber a concurrent output-mode change when saving", async () => {
+  it("does not clobber a concurrent output-mode change on the next auto-apply", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -335,18 +525,18 @@ describe("GeneralTab", () => {
     fire("output-mode-changed", "File");
     await flush();
 
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
-      '[data-testid="save-button"]',
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
     )!;
     invoke.mockClear();
-    click(saveButton);
+    click(soundCheckbox);
     await flush();
 
-    // Before the fix, the mount-time snapshot (output_mode: "Cursor") was
-    // spread into the payload, silently reverting + re-persisting the
-    // concurrent change.
+    // Before the fix, a mount-time snapshot (output_mode: "Cursor") would
+    // have been spread into the payload, silently reverting + re-persisting
+    // the concurrent change.
     expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: { ...BASE_SETTINGS, output_mode: "File" },
+      settings: { ...BASE_SETTINGS, output_mode: "File", sound_cues: false },
     });
   });
 
@@ -373,53 +563,5 @@ describe("GeneralTab", () => {
 
     expect(launchCheckbox.checked).toBe(true);
     expect(soundCheckbox.checked).toBe(false);
-  });
-
-  it("persists a toggled launch-at-login via set_settings with the right payload", async () => {
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="launch-at-login-checkbox"]',
-    )!;
-    expect(launchCheckbox.checked).toBe(false);
-    click(launchCheckbox);
-    await flush();
-    expect(launchCheckbox.checked).toBe(true);
-
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
-      '[data-testid="save-button"]',
-    )!;
-    invoke.mockClear();
-    click(saveButton);
-    await flush();
-
-    expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: { ...BASE_SETTINGS, launch_at_login: true },
-    });
-  });
-
-  it("persists a toggled sound-cues preference via set_settings with the right payload", async () => {
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="sound-cues-checkbox"]',
-    )!;
-    expect(soundCheckbox.checked).toBe(true);
-    click(soundCheckbox);
-    await flush();
-    expect(soundCheckbox.checked).toBe(false);
-
-    const saveButton = mounted.container.querySelector<HTMLButtonElement>(
-      '[data-testid="save-button"]',
-    )!;
-    invoke.mockClear();
-    click(saveButton);
-    await flush();
-
-    expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: { ...BASE_SETTINGS, sound_cues: false },
-    });
   });
 });

@@ -49,6 +49,17 @@ export interface DownloadProgress {
 export type DownloadStartResult = "already-present" | "downloading";
 
 /**
+ * Mirrors `ModelRegistryEntry` (src-tauri/src/lib.rs) — one entry of
+ * `commands::model_registry`'s per-preset size data (issue #184), used by
+ * the settings model picker to render e.g. "Small — 488 MB" via
+ * `formatBytes`.
+ */
+export interface ModelRegistryEntry {
+  preset: ModelPreset;
+  size_bytes: number;
+}
+
+/**
  * Mirrors `errors::PipelineErrorEvent` (src-tauri/src/errors.rs) — the
  * `pipeline-error` event payload. `kind` is one of `errors::ErrorKind`'s
  * discriminants (`"ModelMissing" | "OllamaUnreachable" |
@@ -74,6 +85,12 @@ export interface Commands {
   /** Mirrors `commands::validate_hotkey` — thin wrapper over `hotkeys::validate_hotkey`. */
   validate_hotkey: { args: { accelerator: string }; result: void };
   download_selected_model: { result: DownloadStartResult };
+  /** Mirrors `commands::model_registry` (issue #184). */
+  model_registry: { result: ModelRegistryEntry[] };
+  /** Mirrors `commands::suspend_hotkey` (issue #181) — see `src/lib/hotkeyCapture.ts`. */
+  suspend_hotkey: { result: void };
+  /** Mirrors `commands::resume_hotkey` (issue #181) — see `src/lib/hotkeyCapture.ts`. */
+  resume_hotkey: { result: void };
 }
 
 /**
