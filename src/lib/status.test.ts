@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatBytes,
   formatHotkey,
   hotkeyInstruction,
   modeLabel,
@@ -98,6 +99,28 @@ describe("modelPresetLabel", () => {
   it("maps each ModelPreset to its exact label", () => {
     expect(modelPresetLabel("LargeV3Turbo")).toBe("Whisper large-v3-turbo (quantized)");
     expect(modelPresetLabel("Small")).toBe("Whisper small");
+  });
+});
+
+describe("formatBytes", () => {
+  // Issue #184: exact sizes from `models::ModelSpec.size_bytes` for the two
+  // supported presets — pins the rounding convention (decimal MB, no
+  // decimals) against the numbers cited in the issue.
+  it("formats the large-v3-turbo-q5 size as whole megabytes", () => {
+    expect(formatBytes(574_041_195)).toBe("574 MB");
+  });
+
+  it("formats the small model size as whole megabytes", () => {
+    expect(formatBytes(487_601_967)).toBe("488 MB");
+  });
+
+  it("rounds to the nearest whole megabyte rather than truncating", () => {
+    expect(formatBytes(1_500_000)).toBe("2 MB");
+    expect(formatBytes(1_499_000)).toBe("1 MB");
+  });
+
+  it("formats zero bytes", () => {
+    expect(formatBytes(0)).toBe("0 MB");
   });
 });
 
