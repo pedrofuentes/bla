@@ -188,11 +188,11 @@ describe("GeneralTab", () => {
     });
   });
 
-  it("does not lose an earlier field when two auto-applies overlap in flight", async () => {
-    // PR #185 Sentinel 🔴-2 (lost-update race): toggling two controls in
-    // quick succession before the first set_settings resolves must have the
-    // SECOND write build on the first's change, not on a stale snapshot —
-    // otherwise the later write silently reverts the earlier field.
+  it("serializes auto-applies: one set_settings in flight at a time, each built on the last", async () => {
+    // PR #185 cycle-3 holistic model: auto-applies run through a single
+    // serial queue — never two set_settings overlapping. Toggling two
+    // controls in quick succession runs #1 to completion before #2 starts,
+    // and #2 builds on #1's persisted result (no lost update by construction).
     const resolvers: Array<() => void> = [];
     setupInvoke({
       set_settings: () => new Promise<void>((resolve) => resolvers.push(() => resolve())),
@@ -209,17 +209,22 @@ describe("GeneralTab", () => {
     )!;
 
     invoke.mockClear();
-    click(launchCheckbox); // set_settings #1 in flight (launch_at_login: true)
-    click(soundCheckbox); // set_settings #2 in flight — must build on #1
+    click(launchCheckbox); // enqueue #1 (launch_at_login: true)
+    click(soundCheckbox); // enqueue #2 (sound_cues: false) — must wait for #1
     await flush();
 
-    // Let both in-flight writes resolve.
-    act(() => resolvers.forEach((r) => r()));
+    // Serialized: only ONE set_settings is in flight; #2 hasn't started.
+    expect(resolvers).toHaveLength(1);
+    resolvers[0](); // resolve #1
+    await flush();
+
+    // Now #2 runs, built on #1's result.
+    expect(resolvers).toHaveLength(2);
+    resolvers[1]();
     await flush();
 
     const setCalls = invoke.mock.calls.filter((c) => c[0] === "set_settings");
     expect(setCalls).toHaveLength(2);
-    // The second write carries BOTH changes — the first field is not lost.
     expect(setCalls[1][1]).toEqual({
       settings: { ...BASE_SETTINGS, launch_at_login: true, sound_cues: false },
     });
@@ -374,56 +379,80 @@ describe("GeneralTab", () => {
     );
   });
 
-  it("resyncs from the backend rather than clobbering a newer apply when an earlier one fails", async () => {
-    // PR #185 delta 🔴: when a later auto-apply already built on the failed
-    // one's optimistic value, the rollback must NOT blind-revert to the
-    // failed apply's stale base — it resyncs from get_settings (truth).
-    let getCall = 0;
-    let rejectFirst: (() => void) | undefined;
-    let setCall = 0;
+  it("does not start hotkey capture while a settings apply is in flight (apply-during-async-window)", async () => {
+    // PR #185 cycle-3: the capture-during-save interleave is prevented by
+    // construction — beginCapture is gated on the serial queue's "apply in
+    // flight" signal, so no suspend_hotkey races a concurrent settings write.
+    let resolveSet: (() => void) | undefined;
     setupInvoke({
-      get_settings: () => {
-        getCall += 1;
-        // Mount reads the base; the resync read reflects what actually
-        // persisted (the newer apply's launch-at-login + sound-cues).
-        return getCall === 1
-          ? BASE_SETTINGS
-          : { ...BASE_SETTINGS, launch_at_login: true, sound_cues: false };
-      },
-      set_settings: () => {
-        setCall += 1;
-        if (setCall === 1) {
-          return new Promise<void>((_resolve, reject) => {
-            rejectFirst = () => reject(new Error("boom"));
-          });
-        }
-        return Promise.resolve(undefined);
-      },
+      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
     });
 
     mounted = mount(<GeneralTab />);
     await flush();
 
-    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="launch-at-login-checkbox"]',
-    )!;
     const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
       '[data-testid="sound-cues-checkbox"]',
     )!;
-
-    click(launchCheckbox); // apply #1 (launch true) — pending
-    click(soundCheckbox); // apply #2 (sound false) built on #1 — resolves
+    click(soundCheckbox); // apply in flight (set_settings pending)
     await flush();
 
     invoke.mockClear();
-    rejectFirst!(); // now #1 rejects, after #2 already built on it
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input); // must be gated — no capture, no suspend
     await flush();
 
-    // Must resync from truth, not blind-revert to #1's base.
-    expect(invoke).toHaveBeenCalledWith("get_settings");
-    // The newer change survives (truth has launch true + sound false).
-    expect(launchCheckbox.checked).toBe(true);
-    expect(soundCheckbox.checked).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
+    expect(input.value).not.toMatch(/press a key/i);
+
+    resolveSet!(); // let the apply finish
+    await flush();
+  });
+
+  it("keeps the hotkey registered across a commit→refocus interleave (TOCTOU)", async () => {
+    // PR #185 cycle-3: committing a changed chord enqueues an apply whose
+    // resume re-registers the new binding (single owner). Refocusing the
+    // field while that apply is in flight must NOT mint a second suspend that
+    // clobbers the generation — the gate blocks it — and the original
+    // suspend's generation is what resume eventually restores.
+    let resolveSet: (() => void) | undefined;
+    setupInvoke({
+      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    invoke.mockClear();
+    focus(input);
+    await flush();
+    const suspendCall = invoke.mock.calls.find((c) => c[0] === "suspend_hotkey");
+    const gen1 = (suspendCall![1] as { generation: number }).generation;
+
+    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // commit changed → apply in flight
+    await flush();
+
+    invoke.mockClear();
+    // Try to re-enter capture while the commit's apply is still saving.
+    blur(input);
+    await flush();
+    focus(input);
+    await flush();
+    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
+
+    resolveSet!(); // apply completes → resume registers the new chord
+    await flush();
+
+    // Resume uses the ORIGINAL suspend generation — never clobbered.
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: gen1 }),
+    );
   });
 
   it("resets a stuck capture when the backend signals the window was hidden mid-capture", async () => {
@@ -593,10 +622,11 @@ describe("GeneralTab", () => {
     );
   });
 
-  it("does not call resume_hotkey for a committed chord that CHANGED the hotkey", async () => {
-    // A changed chord is re-registered by its own set_settings, so no
-    // explicit resume — Control+Shift+D differs from the current
-    // Control+Shift+Space.
+  it("persists then resumes (single-owner re-register) for a committed chord that CHANGED", async () => {
+    // PR #185 cycle-3 single-owner model: set_settings no longer registers
+    // the hotkey. A committed changed chord persists via set_settings, then
+    // resume — the sole shortcut owner — re-registers the newly-persisted
+    // binding, guarded by the original suspend's generation.
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -611,7 +641,14 @@ describe("GeneralTab", () => {
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
     });
-    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey", expect.anything());
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+    // Order: the resume runs AFTER the save (it registers the persisted chord).
+    const setIdx = invoke.mock.calls.findIndex((c) => c[0] === "set_settings");
+    const resumeIdx = invoke.mock.calls.findIndex((c) => c[0] === "resume_hotkey");
+    expect(resumeIdx).toBeGreaterThan(setIdx);
   });
 
   it("resumes (and does NOT re-persist) when the committed chord equals the current hotkey", async () => {
