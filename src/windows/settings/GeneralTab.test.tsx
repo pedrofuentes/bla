@@ -230,7 +230,17 @@ describe("GeneralTab", () => {
     });
   });
 
-  it("auto-applies a validated captured hotkey immediately via set_settings", async () => {
+  // -------------------------------------------------------------------
+  // Issue #181 / #187 (cofounder DECISION): the hotkey field uses an explicit
+  // Apply button, NOT auto-apply. Focusing enters capture and suspends the
+  // global dictation shortcut so keystrokes are grabbed; a captured chord is
+  // shown PENDING and only validated/registered/persisted when the user
+  // clicks Apply, through the same serial queue as the other controls.
+  // Capture fully ENDS (resumes the OLD, still-current hotkey) before Apply
+  // runs, dissolving the capture-vs-apply concurrency.
+  // -------------------------------------------------------------------
+
+  it("shows a captured chord as PENDING and does NOT persist it", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -242,15 +252,90 @@ describe("GeneralTab", () => {
     keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
 
-    expect(invoke).toHaveBeenCalledWith("validate_hotkey", { accelerator: "Control+Shift+D" });
+    // Displayed as pending, but nothing is persisted on capture.
+    expect(input.value).toBe("Control+Shift+D");
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+    expect(mounted.container.querySelector('[data-testid="hotkey-pending"]')).not.toBeNull();
+  });
+
+  it("resumes the OLD hotkey when a chord is captured (capture ends, nothing registered)", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    invoke.mockClear();
+    focus(input); // suspend
+    await flush();
+    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // capture ends → resume old
+    await flush();
+
+    const suspendCall = invoke.mock.calls.find((c) => c[0] === "suspend_hotkey");
+    const resumeCall = invoke.mock.calls.find((c) => c[0] === "resume_hotkey");
+    expect(suspendCall).toBeDefined();
+    expect(resumeCall).toBeDefined();
+    // Resume echoes the matching suspend's generation.
+    expect((resumeCall![1] as { generation: number }).generation).toBe(
+      (suspendCall![1] as { generation: number }).generation,
+    );
+  });
+
+  it("registers + persists the pending chord only when Apply is clicked", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
+    await flush();
+
+    invoke.mockClear();
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    click(applyButton);
+    await flush();
+
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
     });
+    // Applied → the pending indicator is gone and the field shows the new value.
+    expect(mounted.container.querySelector('[data-testid="hotkey-pending"]')).toBeNull();
     expect(input.value).toBe("Control+Shift+D");
-    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')).toBeNull();
   });
 
-  it("blocks auto-apply and shows an inline error when the captured chord is invalid", async () => {
+  it("disables Apply until a valid pending chord differs from the current hotkey", async () => {
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+
+    // No pending change yet.
+    expect(applyButton.disabled).toBe(true);
+
+    // Capturing the CURRENT chord leaves nothing to apply.
+    focus(input);
+    keydown(input, "Space", { ctrlKey: true, shiftKey: true }); // == current
+    await flush();
+    expect(applyButton.disabled).toBe(true);
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
+    // A different valid chord enables Apply.
+    focus(input);
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
+    await flush();
+    expect(applyButton.disabled).toBe(false);
+  });
+
+  it("shows an inline error and keeps Apply disabled for an invalid captured chord", async () => {
     setupInvoke({
       validate_hotkey: () => Promise.reject(new Error("bad accelerator")),
     });
@@ -269,6 +354,10 @@ describe("GeneralTab", () => {
     expect(mounted.container.querySelector('[data-testid="hotkey-error"]')?.textContent).toMatch(
       /bad accelerator/i,
     );
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    expect(applyButton.disabled).toBe(true);
     expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
   });
 
@@ -333,16 +422,16 @@ describe("GeneralTab", () => {
     });
   });
 
-  it("rolls back a rejected hotkey and does not re-persist the candidate chord later", async () => {
-    // PR #185 delta 🔴 (the worse case): a rejected hotkey save must revert
-    // the displayed field to the previously-registered chord and must not
-    // let the never-registered candidate ride into a later save.
+  it("does not persist an unbindable chord and shows an error (Apply → register-before-persist)", async () => {
+    // #187 (c/d): Apply's set_settings does register-before-persist; a chord
+    // the OS won't bind fails → not persisted, old hotkey stays, error shown,
+    // and it never rides into a later unrelated save.
     let setCall = 0;
     setupInvoke({
       set_settings: () => {
         setCall += 1;
         return setCall === 1
-          ? Promise.reject(new Error("register failed"))
+          ? Promise.reject(new Error("RegisterHotKey failed"))
           : Promise.resolve(undefined);
       },
     });
@@ -354,19 +443,25 @@ describe("GeneralTab", () => {
       '[data-testid="hotkey-input"]',
     )!;
     focus(input);
-    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // Control+Shift+D (changed)
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
 
-    // Field reverted to the previously-registered hotkey, and the old
-    // shortcut was resumed.
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    click(applyButton); // set_settings #1 rejects (unbindable)
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
+    // Old hotkey stays; inline error shown; pending discarded.
     expect(input.value).toBe("Control+Shift+Space");
-    expect(invoke).toHaveBeenCalledWith(
-      "resume_hotkey",
-      expect.objectContaining({ generation: expect.any(Number) }),
+    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')?.textContent).toMatch(
+      /register/i,
     );
 
-    // A later unrelated save must carry the OLD hotkey, not the rejected
-    // candidate chord.
+    // A later unrelated save carries the OLD hotkey, not the rejected candidate.
     const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
       '[data-testid="sound-cues-checkbox"]',
     )!;
@@ -379,154 +474,81 @@ describe("GeneralTab", () => {
     );
   });
 
-  it("does not start hotkey capture while a settings apply is in flight (apply-during-async-window)", async () => {
-    // PR #185 cycle-3: the capture-during-save interleave is prevented by
-    // construction — beginCapture is gated on the serial queue's "apply in
-    // flight" signal, so no suspend_hotkey races a concurrent settings write.
-    let resolveSet: (() => void) | undefined;
-    setupInvoke({
-      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
-    });
-
+  it("lets other controls auto-apply while a hotkey capture is open (no interference)", async () => {
+    // #187 (e): capture is independent of the serial apply queue — toggling a
+    // checkbox while the hotkey field is capturing still auto-applies, and the
+    // capture stays open.
     mounted = mount(<GeneralTab />);
     await flush();
 
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input); // capturing (suspended)
+    await flush();
+    expect(input.value).toMatch(/press a key/i);
+
+    invoke.mockClear();
     const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
       '[data-testid="sound-cues-checkbox"]',
     )!;
-    click(soundCheckbox); // apply in flight (set_settings pending)
+    click(soundCheckbox);
     await flush();
 
-    invoke.mockClear();
-    const input = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="hotkey-input"]',
-    )!;
-    focus(input); // must be gated — no capture, no suspend
-    await flush();
-
-    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
-    expect(input.value).not.toMatch(/press a key/i);
-
-    resolveSet!(); // let the apply finish
-    await flush();
-  });
-
-  it("gates a refocus during the commit→validate round-trip, before the apply is enqueued", async () => {
-    // PR #185 cycle-4 🟡-4: committing a changed chord sets the in-flight
-    // signal SYNCHRONOUSLY (at setCapturing(false) time), before the
-    // validate_hotkey round-trip — so a refocus during that gap can't slip
-    // past the gate and mint a second suspend. This test deliberately does
-    // NOT flush past the pending validate.
-    let resolveValidate: (() => void) | undefined;
-    setupInvoke({
-      validate_hotkey: () => new Promise<void>((resolve) => (resolveValidate = () => resolve())),
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, sound_cues: false },
     });
-
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const input = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="hotkey-input"]',
-    )!;
-    focus(input); // suspend gen1
-    await flush();
-
-    // Commit a chord — validate is now pending (not yet resolved).
-    keydown(input, "D", { ctrlKey: true, shiftKey: true });
-
-    invoke.mockClear();
-    // Refocus during the validate gap.
-    blur(input);
-    focus(input);
-    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
-
-    resolveValidate!(); // let the commit flow complete
-    await flush();
+    // Capture is unaffected.
+    expect(input.value).toMatch(/press a key/i);
   });
 
-  it("times out a hung set_settings and reverts, releasing the capture gate", async () => {
-    // PR #185 cycle-4 🟡-3: a set_settings that never resolves must not wedge
-    // applyInFlightRef>0 forever (which would silently disable hotkey capture
-    // for the session). A timeout rejects into the revert path.
+  it("times out a hung Apply, reverts, then reconciles from the backend on late success", async () => {
+    // PR #185 🟡: a hung Apply times out into the revert path; if the backend
+    // later SUCCEEDS, the UI reconciles from get_settings so it can't diverge
+    // from persisted truth.
     vi.useFakeTimers();
     try {
+      let resolveSet: (() => void) | undefined;
+      let getCall = 0;
       setupInvoke({
-        set_settings: () => new Promise<void>(() => {}), // hangs forever
+        set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
+        get_settings: () => {
+          getCall += 1;
+          return getCall === 1 ? BASE_SETTINGS : { ...BASE_SETTINGS, hotkey: "Control+Shift+D" };
+        },
       });
 
       mounted = mount(<GeneralTab />);
       await flush();
 
-      const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
-        '[data-testid="sound-cues-checkbox"]',
-      )!;
-      click(soundCheckbox); // apply starts, set_settings hangs, gate held
-      await flush();
-
-      await vi.advanceTimersByTimeAsync(20_000); // fire the timeout
-      await flush();
-
-      expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
-        /tim(e|ed) ?out/i,
-      );
-
-      // Gate released: focusing the hotkey field now starts capture again.
-      invoke.mockClear();
       const input = mounted.container.querySelector<HTMLInputElement>(
         '[data-testid="hotkey-input"]',
       )!;
       focus(input);
+      keydown(input, "D", { ctrlKey: true, shiftKey: true });
       await flush();
-      expect(invoke).toHaveBeenCalledWith(
-        "suspend_hotkey",
-        expect.objectContaining({ generation: expect.any(Number) }),
+
+      const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+        '[data-testid="hotkey-apply-button"]',
+      )!;
+      click(applyButton); // set_settings hangs
+      await flush();
+
+      await vi.advanceTimersByTimeAsync(20_000); // timeout → revert to old
+      await flush();
+      expect(mounted.container.querySelector('[data-testid="hotkey-error"]')?.textContent).toMatch(
+        /tim(e|ed) ?out/i,
       );
+      expect(input.value).toBe("Control+Shift+Space");
+
+      // The backend actually completes the save late → reconcile from truth.
+      resolveSet!();
+      await flush();
+      expect(invoke).toHaveBeenCalledWith("get_settings");
+      expect(input.value).toBe("Control+Shift+D");
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("keeps the hotkey registered across a commit→refocus interleave (TOCTOU)", async () => {
-    // PR #185 cycle-4: committing a changed chord enqueues an apply; its
-    // set_settings is the sole registrar of the new binding (no resume
-    // double-register). Refocusing the field while that apply is in flight
-    // must NOT mint a second suspend that clobbers the generation — the gate
-    // blocks it — and the persist still lands.
-    let resolveSet: (() => void) | undefined;
-    setupInvoke({
-      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
-    });
-
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const input = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="hotkey-input"]',
-    )!;
-    invoke.mockClear();
-    focus(input);
-    await flush();
-
-    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // commit changed → apply in flight
-    await flush();
-
-    // Try to re-enter capture while the commit's apply is still saving.
-    blur(input);
-    await flush();
-    focus(input);
-    await flush();
-
-    resolveSet!(); // apply completes
-    await flush();
-
-    // Exactly ONE suspend across the whole interleave (the initial focus) —
-    // the refocus was gated, so the generation was never clobbered.
-    const suspendCalls = invoke.mock.calls.filter((c) => c[0] === "suspend_hotkey");
-    expect(suspendCalls).toHaveLength(1);
-    // set_settings persisted the new chord (its register-gate binds it).
-    expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
-    });
   });
 
   it("resets a stuck capture when the backend signals the window was hidden mid-capture", async () => {
@@ -696,55 +718,6 @@ describe("GeneralTab", () => {
     );
   });
 
-  it("persists a committed changed chord via set_settings, which is the sole registrar (no resume)", async () => {
-    // PR #185 cycle-4 🔴-1 (#91 register-before-persist restored): for a
-    // CHANGED chord, set_settings does the real OS registration as its
-    // persist-gate — so a chord that can't bind is never persisted. resume
-    // must NOT ALSO re-register (no double-register): the committed-changed
-    // success path hands registration entirely to set_settings.
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const input = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="hotkey-input"]',
-    )!;
-    focus(input);
-    invoke.mockClear();
-    keydown(input, "D", { ctrlKey: true, shiftKey: true });
-    await flush();
-
-    expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
-    });
-    // set_settings is the single registration point — no resume double-register.
-    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey", expect.anything());
-  });
-
-  it("resumes (and does NOT re-persist) when the committed chord equals the current hotkey", async () => {
-    // PR #185 Sentinel 🔴-1(a): re-pressing the CURRENT chord
-    // (Control+Shift+Space) means set_settings would see hotkey_changed ==
-    // false and re-register nothing, so the field must resume itself — and
-    // there is nothing to persist.
-    mounted = mount(<GeneralTab />);
-    await flush();
-
-    const input = mounted.container.querySelector<HTMLInputElement>(
-      '[data-testid="hotkey-input"]',
-    )!;
-    focus(input);
-    invoke.mockClear();
-    keydown(input, "Space", { ctrlKey: true, shiftKey: true });
-    await flush();
-
-    expect(invoke).toHaveBeenCalledWith("validate_hotkey", {
-      accelerator: "Control+Shift+Space",
-    });
-    expect(invoke).toHaveBeenCalledWith(
-      "resume_hotkey",
-      expect.objectContaining({ generation: expect.any(Number) }),
-    );
-    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
-  });
 
   it("resumes the global hotkey on unmount while a capture suspend is still outstanding", async () => {
     // PR #185 Sentinel 🔴-1(b): the React-unmount safety net (the window's
@@ -968,7 +941,8 @@ describe("GeneralTab", () => {
     // patched field, preserving the concurrent File.
     let rejectSet: (() => void) | undefined;
     setupInvoke({
-      set_settings: () => new Promise<void>((_res, rej) => (rejectSet = () => rej(new Error("boom")))),
+      set_settings: () =>
+        new Promise<void>((_res, rej) => (rejectSet = () => rej(new Error("boom")))),
     });
 
     mounted = mount(<GeneralTab />);
