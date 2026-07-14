@@ -11,9 +11,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
-    apply_settings_to_state, model_registry_entries, output_mode_toggle_label, react_to_transition,
-    register_hotkey, save_settings_to_store, spec_for_preset, to_models_preset,
-    to_tray_output_mode, unregister_hotkey, AppState, ModelRegistryEntry,
+    apply_settings_to_state, is_settings_window, model_registry_entries, output_mode_toggle_label,
+    react_to_transition, register_hotkey, save_settings_to_store, should_resume_hotkey,
+    spec_for_preset, to_models_preset, to_tray_output_mode, unregister_hotkey, AppState,
+    ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -217,22 +218,56 @@ pub fn model_registry() -> Vec<ModelRegistryEntry> {
 /// still-live shortcut doesn't fire a dictation while the user is pressing
 /// keys meant to be captured into the field instead. Paired with
 /// [`resume_hotkey`], which the field calls on every way capture can end.
+///
+/// `generation` is a monotonic token minted by the calling window (PR #185
+/// Sentinel 🔴-1(iii)): it's stored as the latest outstanding suspend so
+/// [`resume_hotkey`] can reject a stale, out-of-order resume. Rejected
+/// unless invoked from the settings window (🟡-4) — the commands are in the
+/// global `invoke_handler`, so an unpaired suspend from any other webview
+/// would otherwise DoS the recording trigger.
 #[tauri::command]
-pub fn suspend_hotkey(app: AppHandle) -> Result<(), String> {
-    unregister_hotkey(&app).map_err(|e| e.to_string())
+pub fn suspend_hotkey(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<(), String> {
+    if !is_settings_window(window.label()) {
+        return Err("suspend_hotkey is only callable from the settings window".to_string());
+    }
+    unregister_hotkey(window.app_handle()).map_err(|e| e.to_string())?;
+    *state.hotkey_suspend_gen.lock().unwrap() = generation;
+    Ok(())
 }
 
 /// Re-registers the current (persisted) hotkey as the global dictation
 /// shortcut (issue #181) — called whenever hotkey capture ends without a
-/// newly-committed chord already re-registering it via `set_settings`
-/// (Escape, blur mid-capture, or a captured chord that failed
-/// `validate_hotkey`; see `src/lib/hotkeyCapture.ts`'s
-/// `captureEndNeedsResume`). Reads the hotkey from live state rather than
-/// taking one as an argument so a cancelled/invalid capture always restores
-/// whatever was actually registered before capture began, never a
-/// not-yet-persisted candidate.
+/// newly-committed *changed* chord already re-registering it via
+/// `set_settings` (Escape, blur mid-capture, an invalid chord, or a
+/// committed chord equal to the current hotkey; see
+/// `src/lib/hotkeyCapture.ts`'s `captureEndNeedsResume`). Reads the hotkey
+/// from live state rather than taking one as an argument so a cancelled/
+/// invalid capture always restores whatever was actually registered before
+/// capture began, never a not-yet-persisted candidate.
+///
+/// Only re-registers when `generation` is still the latest outstanding
+/// suspend ([`should_resume_hotkey`], PR #185 Sentinel 🔴-1(iii)) so an
+/// out-of-order resume can't re-enable the shortcut during a newer capture;
+/// clears the generation once it does, so a duplicate resume is a no-op.
+/// Rejected unless invoked from the settings window (🟡-4).
 #[tauri::command]
-pub fn resume_hotkey(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn resume_hotkey(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<(), String> {
+    if !is_settings_window(window.label()) {
+        return Err("resume_hotkey is only callable from the settings window".to_string());
+    }
     let hotkey = state.settings.lock().unwrap().hotkey.clone();
-    register_hotkey(&app, &hotkey).map_err(|e| e.to_string())
+    let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
+    if should_resume_hotkey(*gen_slot, generation) {
+        register_hotkey(window.app_handle(), &hotkey).map_err(|e| e.to_string())?;
+        *gen_slot = 0;
+    }
+    Ok(())
 }

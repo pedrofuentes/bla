@@ -142,6 +142,14 @@ pub(crate) struct AppState {
     /// instead of hiding the pill out from under the second one's own still-
     /// live visible window.
     pill_visibility_epoch: AtomicU64,
+    /// PR #185 Sentinel 🔴-1: the generation of the latest outstanding
+    /// hotkey-capture suspend (`commands::suspend_hotkey`), or `0` when the
+    /// global dictation hotkey is not suspended. A monotonic token minted by
+    /// the settings window and echoed back on `commands::resume_hotkey` so
+    /// out-of-order IPC can't clobber a live capture (see
+    /// [`should_resume_hotkey`]); `force_resume_hotkey` resets it to `0` when
+    /// it restores the shortcut on window close.
+    hotkey_suspend_gen: Mutex<u64>,
     /// Issue #115: the cached Whisper engine, so it's loaded from disk (a
     /// ~574 MB read for the default preset) at most once per selected
     /// preset rather than on every dictation. `None` until the first build
@@ -675,6 +683,47 @@ fn register_hotkey(
 /// capture ends.
 fn unregister_hotkey(app: &tauri::AppHandle) -> Result<(), tauri_plugin_global_shortcut::Error> {
     app.global_shortcut().unregister_all()
+}
+
+/// Whether a window `label` is allowed to suspend/resume the global
+/// dictation hotkey (PR #185 Sentinel 🟡-4). Both commands live in the
+/// global `invoke_handler`, so without this gate any window's webview could
+/// call an unpaired `suspend_hotkey` and DoS the recording trigger — only
+/// the settings window (whose hotkey-capture field is the sole legitimate
+/// caller) may. Pure and window-runtime-free so it's unit-testable.
+fn is_settings_window(label: &str) -> bool {
+    label == SETTINGS_WINDOW_LABEL
+}
+
+/// Whether a `resume_hotkey` carrying `requested_gen` should actually
+/// re-register the shortcut, given the latest suspend's `current_gen` (PR
+/// #185 Sentinel 🔴-1(iii)). A monotonic generation token makes suspend/
+/// resume idempotent under out-of-order IPC: a resume only acts when its
+/// generation is still the current suspend's, so a stale resume (its
+/// suspend already superseded by a newer one) or the zero sentinel (no
+/// suspend outstanding) is a no-op and can't clobber a live capture. Pure.
+fn should_resume_hotkey(current_gen: u64, requested_gen: u64) -> bool {
+    requested_gen != 0 && current_gen == requested_gen
+}
+
+/// Backend safety net (PR #185 Sentinel 🔴-1(b)): force-restore the global
+/// dictation hotkey if a capture suspend is still outstanding. The settings
+/// window is *hidden* (not destroyed) on close, so React never unmounts and
+/// a suspend from its hotkey-capture field would otherwise leave the global
+/// shortcut dead until app restart. Called from the settings window's
+/// close/hide handler. Idempotent — a no-op unless currently suspended
+/// (generation != 0), and it clears the generation so any later stale
+/// frontend resume is ignored by [`should_resume_hotkey`].
+fn force_resume_hotkey(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let hotkey = state.settings.lock().unwrap().hotkey.clone();
+    let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
+    if *gen_slot != 0 {
+        if let Err(err) = register_hotkey(app, &hotkey) {
+            eprintln!("bla: failed to restore global hotkey on settings-window close: {err}");
+        }
+        *gen_slot = 0;
+    }
 }
 
 /// Monotonic timestamp for the hotkey state machine: an opaque duration
@@ -1544,6 +1593,7 @@ pub fn run() {
                 tray_state_item: Mutex::new(Some(tray_state_item)),
                 tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
                 pill_visibility_epoch: AtomicU64::new(0),
+                hotkey_suspend_gen: Mutex::new(0),
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
             };
@@ -1604,6 +1654,12 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
+                        // PR #185 Sentinel 🔴-1(b): the window hides (not
+                        // destroys), so React never unmounts — if the
+                        // hotkey-capture field had suspended the global
+                        // shortcut, restore it here or it stays dead until
+                        // app restart.
+                        force_resume_hotkey(&close_handle);
                         if let Some(window) = close_handle.get_webview_window(SETTINGS_WINDOW_LABEL)
                         {
                             let _ = window.hide();
