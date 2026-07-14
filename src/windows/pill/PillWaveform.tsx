@@ -2,12 +2,14 @@
  * Canvas render layer for the pill's live waveform (issue #126, M2 PR 2.3).
  * Thin and intentionally untested (view-only render code, mirroring
  * AGENTS.md's OS-integration-glue exemption: "keep all logic out of it so
- * the logic stays testable") -- every decision about which bars to draw
- * lives in `src/lib/waveform.ts`'s `barsFromLevels`, which is fully unit
- * tested; this component only paints the numbers it's given onto a plain
- * 2D canvas context (no charting library -- the canvas element and its 2D
- * context are already part of every browser/webview, so this adds no new
- * dependency).
+ * the logic stays testable") -- every decision about which bars to draw,
+ * and their already-scaled-for-display `0.0..=1.0` heights (issue #179's
+ * `scaleLevelForDisplay`, so raw speech-level RMS doesn't floor every bar to
+ * `MIN_BAR_HEIGHT`), lives in `src/lib/waveform.ts` (`barsFromLevels` +
+ * `scaleLevelForDisplay`), which is fully unit tested; this component only
+ * paints the numbers it's given onto a plain 2D canvas context (no charting
+ * library -- the canvas element and its 2D context are already part of
+ * every browser/webview, so this adds no new dependency).
  */
 import { useEffect, useRef } from "react";
 

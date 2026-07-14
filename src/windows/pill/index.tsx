@@ -6,7 +6,7 @@ import { cueForTransition, shouldPlayCue } from "../../lib/soundCue";
 import { playCue } from "../../lib/soundCuePlayer";
 import { parsePipelineState, type PipelineState } from "../../lib/status";
 import { toastForError, type Toast as ToastSpec } from "../../lib/toast";
-import { barsFromLevels } from "../../lib/waveform";
+import { barsFromLevels, scaleLevelForDisplay } from "../../lib/waveform";
 import { PillWaveform } from "./PillWaveform";
 import { PipelineErrorToast } from "./Toast";
 
@@ -21,10 +21,15 @@ import { PipelineErrorToast } from "./Toast";
  * shell: `pipeline-state-changed` drives `pillReducer` (`src/lib/pillState.ts`)
  * for the pill's mode (recording/transcribing/done/error, with a ~1.5s
  * auto-hide back to idle after "done"); `audio-level` feeds a fixed-size
- * ring buffer (`pushLevel`, `src/lib/levelBuffer.ts`) that `barsFromLevels`
- * (`src/lib/waveform.ts`) lays out for the canvas waveform (`PillWaveform`,
- * an untested thin render layer — all its layout decisions live in the
- * tested `barsFromLevels`). `lib.rs::set_pipeline_state` still owns
+ * ring buffer (`pushLevel`, `src/lib/levelBuffer.ts`, which keeps the raw
+ * RMS) that `barsFromLevels` (`src/lib/waveform.ts`) lays out for the canvas
+ * waveform, then `scaleLevelForDisplay` (also `waveform.ts`; issue #179)
+ * applies a perceptual gain so the pill's bars actually move -- raw speech
+ * RMS is small enough (~0.01-0.09) that `PillWaveform`'s linear
+ * `level * HEIGHT` would floor every bar to its minimum height. Both are
+ * `PillWaveform`'s only inputs (an untested thin render layer — all its
+ * layout and scaling decisions live in the tested `waveform.ts`).
+ * `lib.rs::set_pipeline_state` still owns
  * showing/hiding the real OS window (`tray::pill_visibility_for`); this
  * component only decides what to render while it's visible. Only ever
  * renders fixed state labels (`pillLabel`) — never transcript/clipboard
@@ -196,7 +201,7 @@ export function PillWindow() {
   return (
     <PillShell toast={toastNode}>
       {state.mode === "recording" ? (
-        <PillWaveform bars={barsFromLevels(levels, BAR_COUNT)} />
+        <PillWaveform bars={barsFromLevels(levels, BAR_COUNT).map(scaleLevelForDisplay)} />
       ) : (
         <span
           aria-hidden
