@@ -55,32 +55,52 @@ pub fn set_settings(
         )
     };
 
-    // Issue #91 (Sentinel 🔴) — register-before-persist. A changed hotkey is
-    // validated AND actually bound to the OS BEFORE anything is persisted: a
-    // chord that parses but the OS refuses to register (already claimed by
-    // another app, or OS-reserved — a real failure mode on Windows;
-    // macOS's registrar returns Ok) is rejected here and NEVER written to
-    // settings.json, so it can't brick dictation across the next launch.
+    // Issue #91 (Sentinel 🔴) — register-before-persist WITH rollback. A
+    // changed hotkey is validated AND actually bound to the OS BEFORE anything
+    // is persisted: a chord that parses but the OS refuses to register
+    // (already claimed by another app, or OS-reserved — a real failure mode on
+    // Windows; macOS's registrar returns Ok) is rejected here and NEVER
+    // written to settings.json, so it can't brick dictation across the next
+    // launch.
     //
-    // PR #185 cycle-4: `set_settings` owns the registration of the *committed
-    // chord* (this persist-gate), while `suspend_hotkey`/`resume_hotkey` own
-    // only the capture-window suspend/restore of the shortcut. These are
-    // temporally disjoint — `beginCapture` is gated on the frontend's
-    // in-flight signal, so no `suspend_hotkey` runs concurrently with an
-    // apply — so `set_settings` doing the OS bind here does NOT reintroduce
-    // the two-writer generation TOCTOU that earlier cycles fought. After a
-    // successful bind we clear `hotkey_suspend_gen` (the committed chord ends
-    // the capture): the frontend does NOT resume for a committed-changed
-    // chord, so this is the single registration point (no double-register).
-    // On a bind failure this returns `Err` before persisting; the settings
-    // window then reverts the field and `resume_hotkey`s the prior binding.
+    // PR #185 cycle-5 (#187, cofounder decision): the hotkey field now uses an
+    // explicit Apply button — capture (suspend/resume) fully ENDS and restores
+    // the prior binding before Apply's `set_settings` runs, so this command is
+    // the sole registrar of a persisted hotkey change and `hotkey_suspend_gen`
+    // is owned entirely by suspend/resume for the capture window. `set_settings`
+    // therefore does NOT touch the generation at all — dissolving the
+    // two-writer TOCTOU that earlier cycles fought.
+    //
+    // Rollback keeps the OS binding and settings.json in agreement on failure:
+    // capture the currently-registered (prior) hotkey, register the new one,
+    // then persist — and if EITHER the register or the persist fails, restore
+    // the prior binding before returning `Err`, so the OS is never left bound
+    // to NEW while settings.json still says OLD (or vice-versa).
+    let prior_hotkey = if hotkey_changed {
+        Some(state.settings.lock().unwrap().hotkey.clone())
+    } else {
+        None
+    };
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
-        register_hotkey(&app, &settings.hotkey).map_err(|e| e.to_string())?;
-        *state.hotkey_suspend_gen.lock().unwrap() = 0;
+        if let Err(err) = register_hotkey(&app, &settings.hotkey) {
+            // The new chord won't bind (register_hotkey unregisters first, so
+            // the OS is now unbound) — restore the prior binding and reject.
+            if let Some(prior) = &prior_hotkey {
+                let _ = register_hotkey(&app, prior);
+            }
+            return Err(err.to_string());
+        }
     }
 
-    save_settings_to_store(&app, &settings)?;
+    if let Err(err) = save_settings_to_store(&app, &settings) {
+        // Persist failed AFTER a successful register — roll the OS binding
+        // back to the prior hotkey so it matches the (unchanged) settings.json.
+        if let Some(prior) = &prior_hotkey {
+            let _ = register_hotkey(&app, prior);
+        }
+        return Err(err);
+    }
 
     // Issue #126: thin OS glue over `tauri-plugin-autostart`'s
     // `AutoLaunchManager` — the decision of WHETHER to call this already
