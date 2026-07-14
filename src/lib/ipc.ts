@@ -87,10 +87,15 @@ export interface Commands {
   download_selected_model: { result: DownloadStartResult };
   /** Mirrors `commands::model_registry` (issue #184). */
   model_registry: { result: ModelRegistryEntry[] };
-  /** Mirrors `commands::suspend_hotkey` (issue #181) — see `src/lib/hotkeyCapture.ts`. */
-  suspend_hotkey: { result: void };
+  /**
+   * Mirrors `commands::suspend_hotkey` (issue #181) — see
+   * `src/lib/hotkeyCapture.ts`. `generation` is a monotonic token minted by
+   * this window and echoed back on `resume_hotkey` so an out-of-order resume
+   * can't clobber a live capture (PR #185 Sentinel 🔴-1).
+   */
+  suspend_hotkey: { args: { generation: number }; result: void };
   /** Mirrors `commands::resume_hotkey` (issue #181) — see `src/lib/hotkeyCapture.ts`. */
-  resume_hotkey: { result: void };
+  resume_hotkey: { args: { generation: number }; result: void };
 }
 
 /**

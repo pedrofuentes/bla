@@ -188,6 +188,43 @@ describe("GeneralTab", () => {
     });
   });
 
+  it("does not lose an earlier field when two auto-applies overlap in flight", async () => {
+    // PR #185 Sentinel 🔴-2 (lost-update race): toggling two controls in
+    // quick succession before the first set_settings resolves must have the
+    // SECOND write build on the first's change, not on a stale snapshot —
+    // otherwise the later write silently reverts the earlier field.
+    const resolvers: Array<() => void> = [];
+    setupInvoke({
+      set_settings: () => new Promise<void>((resolve) => resolvers.push(() => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+
+    invoke.mockClear();
+    click(launchCheckbox); // set_settings #1 in flight (launch_at_login: true)
+    click(soundCheckbox); // set_settings #2 in flight — must build on #1
+    await flush();
+
+    // Let both in-flight writes resolve.
+    act(() => resolvers.forEach((r) => r()));
+    await flush();
+
+    const setCalls = invoke.mock.calls.filter((c) => c[0] === "set_settings");
+    expect(setCalls).toHaveLength(2);
+    // The second write carries BOTH changes — the first field is not lost.
+    expect(setCalls[1][1]).toEqual({
+      settings: { ...BASE_SETTINGS, launch_at_login: true, sound_cues: false },
+    });
+  });
+
   it("auto-applies a validated captured hotkey immediately via set_settings", async () => {
     mounted = mount(<GeneralTab />);
     await flush();
@@ -306,7 +343,11 @@ describe("GeneralTab", () => {
     focus(input);
     await flush();
 
-    expect(invoke).toHaveBeenCalledWith("suspend_hotkey");
+    // PR #185 Sentinel 🔴-1(iii): suspend carries a monotonic generation.
+    expect(invoke).toHaveBeenCalledWith(
+      "suspend_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
   });
 
   it("resumes the global hotkey when capture is cancelled via Escape", async () => {
@@ -321,7 +362,34 @@ describe("GeneralTab", () => {
     keydown(input, "Escape");
     await flush();
 
-    expect(invoke).toHaveBeenCalledWith("resume_hotkey");
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+  });
+
+  it("resumes with the SAME generation the matching suspend minted", async () => {
+    // PR #185 Sentinel 🔴-1(iii): the resume must echo the generation of the
+    // suspend it pairs with, so the backend can reject a stale resume.
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    invoke.mockClear();
+    focus(input);
+    await flush();
+    keydown(input, "Escape");
+    await flush();
+
+    const suspendCall = invoke.mock.calls.find((c) => c[0] === "suspend_hotkey");
+    const resumeCall = invoke.mock.calls.find((c) => c[0] === "resume_hotkey");
+    expect(suspendCall).toBeDefined();
+    expect(resumeCall).toBeDefined();
+    expect((resumeCall![1] as { generation: number }).generation).toBe(
+      (suspendCall![1] as { generation: number }).generation,
+    );
   });
 
   it("resumes the global hotkey when the field loses focus mid-capture", async () => {
@@ -336,7 +404,10 @@ describe("GeneralTab", () => {
     blur(input);
     await flush();
 
-    expect(invoke).toHaveBeenCalledWith("resume_hotkey");
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
   });
 
   it("resumes the global hotkey when the captured chord fails validation", async () => {
@@ -355,10 +426,16 @@ describe("GeneralTab", () => {
     keydown(input, "Z", { ctrlKey: true });
     await flush();
 
-    expect(invoke).toHaveBeenCalledWith("resume_hotkey");
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
   });
 
-  it("does not call resume_hotkey for a successfully committed, auto-applied chord", async () => {
+  it("does not call resume_hotkey for a committed chord that CHANGED the hotkey", async () => {
+    // A changed chord is re-registered by its own set_settings, so no
+    // explicit resume — Control+Shift+D differs from the current
+    // Control+Shift+Space.
     mounted = mount(<GeneralTab />);
     await flush();
 
@@ -370,7 +447,82 @@ describe("GeneralTab", () => {
     keydown(input, "D", { ctrlKey: true, shiftKey: true });
     await flush();
 
-    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey");
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
+    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey", expect.anything());
+  });
+
+  it("resumes (and does NOT re-persist) when the committed chord equals the current hotkey", async () => {
+    // PR #185 Sentinel 🔴-1(a): re-pressing the CURRENT chord
+    // (Control+Shift+Space) means set_settings would see hotkey_changed ==
+    // false and re-register nothing, so the field must resume itself — and
+    // there is nothing to persist.
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    invoke.mockClear();
+    keydown(input, "Space", { ctrlKey: true, shiftKey: true });
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("validate_hotkey", {
+      accelerator: "Control+Shift+Space",
+    });
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+  });
+
+  it("resumes the global hotkey on unmount while a capture suspend is still outstanding", async () => {
+    // PR #185 Sentinel 🔴-1(b): the React-unmount safety net (the window's
+    // hide path is covered backend-side in lib.rs). Focusing suspends; if
+    // the component unmounts before capture ends, the effect cleanup must
+    // restore the shortcut.
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    await flush();
+
+    invoke.mockClear();
+    mounted.unmount();
+    mounted = undefined;
+
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+  });
+
+  it("surfaces a resume_hotkey failure as a save error instead of swallowing it", async () => {
+    // PR #185 Sentinel 🟡-3: a fire-and-forget resume that rejects would
+    // otherwise leave the hotkey dead silently.
+    setupInvoke({
+      resume_hotkey: () => Promise.reject(new Error("hotkey OS reject")),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    keydown(input, "Escape");
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
+      /hotkey OS reject/i,
+    );
   });
 
   // -------------------------------------------------------------------
