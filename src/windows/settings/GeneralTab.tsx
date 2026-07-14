@@ -3,11 +3,18 @@ import {
   invoke,
   onEvent,
   type ModelPreset,
-  type RecordingMode,
+  type ModelRegistryEntry,
   type Settings,
 } from "../../lib/ipc";
-import { modelPresetLabel, modelStatusLabel, type ModelStatus } from "../../lib/status";
+import {
+  formatBytes,
+  modelPresetLabel,
+  modelStatusLabel,
+  type ModelStatus,
+} from "../../lib/status";
 import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
+import { captureEndNeedsResume, type CaptureEndReason } from "../../lib/hotkeyCapture";
+import { applySettingsPatch } from "../../lib/settingsPatch";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
 
@@ -19,19 +26,37 @@ type SaveStatus = "idle" | "saving" | "saved";
  * and hold-vs-toggle recording mode. Talks to the core only through
  * `src/lib/ipc.ts`.
  *
- * M2 PR 2.6 adds two plain persisted-preference checkboxes: "Launch bla at
- * login" (`launch_at_login` — the backend flips OS autostart registration
- * as a `set_settings` side-effect; see `commands::set_settings`) and "Play
- * sound cues" (`sound_cues` — a pure preference in this PR; cue playback
- * itself is PR 2.7). Both follow the same load-into-local-state /
- * spread-into-`next`-on-save pattern as every other control here.
+ * Issue #183 (AC-7 smoke test): every control here auto-applies on change —
+ * there is no Save button. The cofounder changed the model preset, the
+ * hold/toggle mode, and the hotkey in the AC-7 smoke test, saw nothing
+ * happen (the previous flow required a separate Save click), and reported
+ * all three as broken. The backend already applies everything live
+ * (`commands::set_settings` -> `apply_settings_to_state`), so each control's
+ * `onChange` merges just its own field into the latest known settings
+ * snapshot (`applySettingsPatch`, issue #183) and calls `set_settings`
+ * immediately, showing a brief "Saved" confirmation (`saveStatus`) or an
+ * inline `save-error` on failure. The hotkey field is the one exception:
+ * issue #91's validate-before-persist invariant still applies — a captured
+ * chord is validated first, and only a chord that validates is auto-applied;
+ * an invalid one shows an inline error and is never sent to `set_settings`.
  *
- * Hotkey save ordering mirrors the backend's validate-before-persist
- * invariant (issue #91 Sentinel 🔴, `settings::persist_validated`): a
- * captured chord is validated via the new `validate_hotkey` command
- * immediately, and `handleSave` refuses to call `set_settings` at all while
- * a validation error is outstanding — an invalid hotkey can never reach
- * `set_settings` from this form.
+ * Issue #181 (AC-7 smoke test): while the hotkey-capture field is focused,
+ * the still-live global dictation shortcut used to keep firing (starting a
+ * dictation) instead of the keypress being captured for rebinding. Focusing
+ * the field now calls `suspend_hotkey` to unregister the global shortcut;
+ * every way capture can end other than a successfully committed+auto-applied
+ * chord (Escape, losing focus mid-capture, or a captured chord that fails
+ * `validate_hotkey`) calls `resume_hotkey` to restore it —
+ * `captureEndNeedsResume` (`src/lib/hotkeyCapture.ts`) is the pure decision
+ * of which reasons need that explicit call; a committed chord's own
+ * `set_settings` auto-apply already re-registers the (new) hotkey as part of
+ * that save, so an extra resume there would be redundant.
+ *
+ * Issue #184: the model picker shows each preset's download size (e.g.
+ * "Small — 488 MB"), fetched from the `model_registry` command
+ * (`ModelRegistryEntry[]`, mirroring `models::ModelSpec.size_bytes`) and
+ * formatted with `formatBytes`. Falls back to the plain preset label if the
+ * registry hasn't loaded (or failed to) yet.
  *
  * Event subscriptions (PR #134 Sentinel 🔴-1) are established individually,
  * not via a single `Promise.all`: a rejected subscription (the observable
@@ -44,21 +69,18 @@ type SaveStatus = "idle" | "saving" | "saved";
  *
  * The `settings` snapshot tracks `output-mode-changed` (PR #134 Sentinel
  * 🔴-2, mirroring `App.tsx`): the tray menu / status window can flip the
- * output mode while this window is open, and Save spreads the snapshot into
- * a full `set_settings` payload — without the subscription, Save would
- * silently revert + re-persist the concurrent change.
+ * output mode while this window is open, and every auto-apply merges its
+ * patch into the latest snapshot rather than a stale mount-time one — so a
+ * concurrent tray-triggered mode switch is never clobbered.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [hotkeyInput, setHotkeyInput] = useState("");
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
-  const [recordingMode, setRecordingMode] = useState<RecordingMode>("Hold");
-  const [modelPreset, setModelPreset] = useState<ModelPreset>("LargeV3Turbo");
-  const [launchAtLogin, setLaunchAtLogin] = useState(false);
-  const [soundCues, setSoundCues] = useState(true);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [downloadPercent, setDownloadPercent] = useState<number | undefined>(undefined);
+  const [modelRegistry, setModelRegistry] = useState<ModelRegistryEntry[]>([]);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
@@ -71,10 +93,6 @@ export function GeneralTab() {
         if (cancelled) return;
         setSettings(loaded);
         setHotkeyInput(loaded.hotkey);
-        setRecordingMode(loaded.recording_mode);
-        setModelPreset(loaded.model_preset);
-        setLaunchAtLogin(loaded.launch_at_login);
-        setSoundCues(loaded.sound_cues);
       })
       .catch((err) => {
         if (!cancelled) setSaveError(String(err));
@@ -90,6 +108,17 @@ export function GeneralTab() {
           setModelStatus("error");
           setSaveError(String(err));
         }
+      });
+
+    // Issue #184: best-effort — a failed fetch just leaves the picker
+    // showing plain preset labels (no size suffix) rather than blocking or
+    // erroring the whole tab over a non-critical enhancement.
+    invoke("model_registry")
+      .then((entries) => {
+        if (!cancelled) setModelRegistry(entries);
+      })
+      .catch(() => {
+        /* picker falls back to plain labels; nothing else depends on this */
       });
 
     // PR #134 Sentinel 🔴-1: NOT a single Promise.all — one rejected
@@ -114,8 +143,9 @@ export function GeneralTab() {
           setSaveError(message);
         }
       }),
-      // PR #134 Sentinel 🔴-2 (mirrors App.tsx): keep the snapshot Save
-      // spreads in sync with tray-/status-window-triggered mode switches.
+      // PR #134 Sentinel 🔴-2 (mirrors App.tsx): keep the snapshot every
+      // auto-apply merges onto in sync with tray-/status-window-triggered
+      // mode switches.
       onEvent("output-mode-changed", (mode) => {
         if (!cancelled) {
           setSettings((prev) => (prev ? { ...prev, output_mode: mode } : prev));
@@ -141,10 +171,67 @@ export function GeneralTab() {
     };
   }, []);
 
+  // Issue #183: the single merge point every control's auto-apply goes
+  // through — see the component doc comment.
+  const applySettingsChange = useCallback(
+    async (patch: Partial<Settings>) => {
+      if (!settings) return;
+      const next = applySettingsPatch(settings, patch);
+
+      setSaveStatus("saving");
+      setSaveError(null);
+
+      try {
+        await invoke("set_settings", { settings: next });
+        setSettings(next);
+        setSaveStatus("saved");
+        // Issue #91/#110 pattern reuse: after a preset change auto-applies,
+        // re-check the newly-selected preset's on-disk status the same way
+        // the initial mount does.
+        if (patch.model_preset !== undefined) {
+          invoke("download_selected_model")
+            .then((result) =>
+              setModelStatus(result === "already-present" ? "ready" : "downloading"),
+            )
+            .catch((err) => {
+              setModelStatus("error");
+              setSaveError(String(err));
+            });
+        }
+      } catch (err) {
+        setSaveStatus("idle");
+        setSaveError(String(err));
+      }
+    },
+    [settings],
+  );
+
+  // Issue #181: ends hotkey capture, optionally reverting the field's
+  // displayed value, and restores the global shortcut when
+  // `captureEndNeedsResume` says this end reason needs it.
+  const endCapture = useCallback((reason: CaptureEndReason, revertTo?: string) => {
+    setCapturing(false);
+    if (revertTo !== undefined) setHotkeyInput(revertTo);
+    if (captureEndNeedsResume(reason)) {
+      void invoke("resume_hotkey");
+    }
+  }, []);
+
   const beginCapture = useCallback(() => {
     setCapturing(true);
     setHotkeyError(null);
+    void invoke("suspend_hotkey");
   }, []);
+
+  const handleHotkeyBlur = useCallback(() => {
+    // Only a genuine "lost focus mid-capture" needs a resume — a blur
+    // firing right after a chord already committed (capturing is already
+    // false by then) must not re-suspend/resume against a save that may
+    // still be in flight.
+    if (capturing) {
+      endCapture("blur", settings?.hotkey ?? hotkeyInput);
+    }
+  }, [capturing, settings, hotkeyInput, endCapture]);
 
   const handleHotkeyKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -155,7 +242,7 @@ export function GeneralTab() {
       e.preventDefault();
 
       if (e.key === "Escape") {
-        setCapturing(false);
+        endCapture("escape", settings?.hotkey ?? hotkeyInput);
         return;
       }
 
@@ -169,45 +256,18 @@ export function GeneralTab() {
       setCapturing(false);
       setHotkeyInput(chord);
       invoke("validate_hotkey", { accelerator: chord })
-        .then(() => setHotkeyError(null))
-        .catch((err) => setHotkeyError(String(err)));
-    },
-    [capturing],
-  );
-
-  const handleSave = useCallback(async () => {
-    if (!settings || hotkeyError) return;
-
-    setSaveStatus("saving");
-    setSaveError(null);
-
-    const next: Settings = {
-      ...settings,
-      hotkey: hotkeyInput,
-      recording_mode: recordingMode,
-      model_preset: modelPreset,
-      launch_at_login: launchAtLogin,
-      sound_cues: soundCues,
-    };
-
-    try {
-      await invoke("set_settings", { settings: next });
-      setSettings(next);
-      setSaveStatus("saved");
-      // Issue #91/#110 pattern reuse: after a successful save, re-check the
-      // (possibly just-changed) model preset's on-disk status the same way
-      // the initial mount does.
-      invoke("download_selected_model")
-        .then((result) => setModelStatus(result === "already-present" ? "ready" : "downloading"))
+        .then(() => {
+          setHotkeyError(null);
+          endCapture("committed");
+          void applySettingsChange({ hotkey: chord });
+        })
         .catch((err) => {
-          setModelStatus("error");
-          setSaveError(String(err));
+          setHotkeyError(String(err));
+          endCapture("invalid");
         });
-    } catch (err) {
-      setSaveStatus("idle");
-      setSaveError(String(err));
-    }
-  }, [settings, hotkeyInput, hotkeyError, recordingMode, modelPreset, launchAtLogin, soundCues]);
+    },
+    [capturing, settings, hotkeyInput, endCapture, applySettingsChange],
+  );
 
   if (!settings) {
     return <p className="text-sm text-neutral-500 dark:text-neutral-400">Loading…</p>;
@@ -226,7 +286,7 @@ export function GeneralTab() {
           readOnly
           value={capturing ? "Press a key combination… (Esc to cancel)" : hotkeyInput}
           onFocus={beginCapture}
-          onBlur={() => setCapturing(false)}
+          onBlur={handleHotkeyBlur}
           onKeyDown={handleHotkeyKeyDown}
           className="rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
         />
@@ -245,8 +305,8 @@ export function GeneralTab() {
               type="radio"
               name="recording-mode"
               data-testid="mode-hold"
-              checked={recordingMode === "Hold"}
-              onChange={() => setRecordingMode("Hold")}
+              checked={settings.recording_mode === "Hold"}
+              onChange={() => void applySettingsChange({ recording_mode: "Hold" })}
             />
             Hold to record
           </label>
@@ -255,8 +315,8 @@ export function GeneralTab() {
               type="radio"
               name="recording-mode"
               data-testid="mode-toggle"
-              checked={recordingMode === "Toggle"}
-              onChange={() => setRecordingMode("Toggle")}
+              checked={settings.recording_mode === "Toggle"}
+              onChange={() => void applySettingsChange({ recording_mode: "Toggle" })}
             />
             Toggle to record
           </label>
@@ -270,15 +330,24 @@ export function GeneralTab() {
         <select
           id="model-preset-select"
           data-testid="model-preset-select"
-          value={modelPreset}
-          onChange={(e) => setModelPreset(e.target.value as ModelPreset)}
+          value={settings.model_preset}
+          onChange={(e) =>
+            void applySettingsChange({ model_preset: e.target.value as ModelPreset })
+          }
           className="rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm dark:border-neutral-700 dark:bg-neutral-950"
         >
-          {MODEL_PRESETS.map((preset) => (
-            <option key={preset} value={preset}>
-              {modelPresetLabel(preset)}
-            </option>
-          ))}
+          {MODEL_PRESETS.map((preset) => {
+            const sizeBytes = modelRegistry.find((entry) => entry.preset === preset)?.size_bytes;
+            const label =
+              sizeBytes === undefined
+                ? modelPresetLabel(preset)
+                : `${modelPresetLabel(preset)} — ${formatBytes(sizeBytes)}`;
+            return (
+              <option key={preset} value={preset}>
+                {label}
+              </option>
+            );
+          })}
         </select>
         <p data-testid="model-status" className="text-xs text-neutral-500 dark:text-neutral-400">
           {modelStatusLabel(modelStatus, downloadPercent)}
@@ -290,8 +359,8 @@ export function GeneralTab() {
           <input
             type="checkbox"
             data-testid="launch-at-login-checkbox"
-            checked={launchAtLogin}
-            onChange={(e) => setLaunchAtLogin(e.target.checked)}
+            checked={settings.launch_at_login}
+            onChange={(e) => void applySettingsChange({ launch_at_login: e.target.checked })}
           />
           Launch bla at login
         </label>
@@ -299,8 +368,8 @@ export function GeneralTab() {
           <input
             type="checkbox"
             data-testid="sound-cues-checkbox"
-            checked={soundCues}
-            onChange={(e) => setSoundCues(e.target.checked)}
+            checked={settings.sound_cues}
+            onChange={(e) => void applySettingsChange({ sound_cues: e.target.checked })}
           />
           Play sound cues
         </label>
@@ -318,25 +387,11 @@ export function GeneralTab() {
         </p>
       )}
 
-      <div className="flex items-center gap-3">
-        <button
-          type="button"
-          data-testid="save-button"
-          onClick={handleSave}
-          disabled={!!hotkeyError || saveStatus === "saving"}
-          className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 hover:bg-blue-500"
-        >
-          {saveStatus === "saving" ? "Saving…" : "Save"}
-        </button>
-        {saveStatus === "saved" && (
-          <span
-            data-testid="save-status"
-            className="text-xs text-neutral-500 dark:text-neutral-400"
-          >
-            Saved
-          </span>
-        )}
-      </div>
+      {saveStatus === "saved" && (
+        <span data-testid="save-status" className="text-xs text-neutral-500 dark:text-neutral-400">
+          Saved ✓
+        </span>
+      )}
     </div>
   );
 }
