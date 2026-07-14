@@ -13,7 +13,6 @@ import {
   type ModelStatus,
 } from "../../lib/status";
 import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
-import { captureEndNeedsResume, type CaptureEndReason } from "../../lib/hotkeyCapture";
 import { applySettingsPatch } from "../../lib/settingsPatch";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
@@ -32,32 +31,48 @@ type SaveStatus = "idle" | "saving" | "saved";
  * happen (the previous flow required a separate Save click), and reported
  * all three as broken. The backend already applies everything live
  * (`commands::set_settings` -> `apply_settings_to_state`), so each control's
- * `onChange` merges just its own field into the latest known settings
- * snapshot (`applySettingsPatch`, issue #183) and calls `set_settings`
- * immediately, showing a brief "Saved" confirmation (`saveStatus`) or an
- * inline `save-error` on failure. The hotkey field is the one exception:
- * issue #91's validate-before-persist invariant still applies — a captured
- * chord is validated first, and only a chord that validates is auto-applied;
- * an invalid one shows an inline error and is never sent to `set_settings`.
+ * `onChange` calls `applySettingsChange`, showing a brief "Saved"
+ * confirmation (`saveStatus`) or an inline `save-error` on failure. The
+ * hotkey field is the one exception: issue #91's validate-before-persist
+ * invariant still applies — a captured chord is validated first, and only a
+ * chord that validates is auto-applied; an invalid one shows an inline error
+ * and is never sent to `set_settings`.
  *
- * Issue #181 (AC-7 smoke test): while the hotkey-capture field is focused,
- * the still-live global dictation shortcut used to keep firing (starting a
- * dictation) instead of the keypress being captured for rebinding. Focusing
- * the field calls `suspend_hotkey` (minting a monotonic generation token);
- * capture ending calls `resume_hotkey` with that same token unless a
- * committed chord actually CHANGED the hotkey — in which case that save's
- * `set_settings` re-registers the new binding itself. `captureEndNeedsResume`
- * (`src/lib/hotkeyCapture.ts`) is the pure decision of which reasons need the
- * explicit resume, including PR #185 Sentinel 🔴-1(a): re-pressing the
- * CURRENT chord commits an *unchanged* hotkey, so `set_settings` re-registers
- * nothing and the field must resume itself. Two more #185 safety nets keep
- * the global hotkey from being left permanently dead: the effect cleanup
- * resumes if the component unmounts mid-capture (🔴-1(b), React side; the
- * hidden-not-destroyed window path is covered backend-side in `lib.rs`), and
- * every `suspend_hotkey`/`resume_hotkey` invoke has a `.catch` that surfaces
- * an OS rejection as a save error rather than swallowing it (🟡-3). The
- * generation token (🔴-1(iii)) lets the backend reject a stale, out-of-order
- * resume so it can't re-enable the shortcut during a newer capture.
+ * ## Concurrency model (PR #185 cycle-3 — holistic refactor)
+ *
+ * Two independent hazards — overlapping optimistic applies, and two owners
+ * of the OS shortcut registration — caused a string of interleave bugs, so
+ * both are eliminated by construction rather than patched:
+ *
+ * 1. **Serial apply queue.** `applySettingsChange` enqueues onto a single
+ *    promise chain (`applyQueueRef`); exactly one apply runs at a time, each
+ *    awaiting the previous one's `set_settings` before it starts. Because
+ *    applies never overlap there is no lost update, no stale-closure merge,
+ *    and no "a newer apply superseded this one" reconciliation: an apply
+ *    reads the latest settings (`settingsRef`) when it *runs*, and on
+ *    rejection it simply reverts `settingsRef`/state to the base it captured
+ *    (no later apply has run yet). `applyInFlightRef` counts queued+running
+ *    applies for the capture gate below.
+ *
+ * 2. **Single owner of the global shortcut.** Only the
+ *    `suspend_hotkey`/`resume_hotkey` pair (backend, guarded by a monotonic
+ *    generation token) ever registers/unregisters the dictation shortcut —
+ *    `set_settings` no longer touches it. Focusing the field suspends
+ *    (minting a generation); every way capture ends resumes with that same
+ *    generation. A committed chord that CHANGED the hotkey persists via the
+ *    queued `set_settings`, then resumes so the sole owner re-registers the
+ *    newly-persisted chord (ordered after the save); an unchanged chord and
+ *    the cancel/blur/invalid paths resume immediately. To keep a capture
+ *    from ever racing a settings write, `beginCapture` is *gated* on
+ *    `applyInFlightRef` — it won't start (won't suspend) while any apply is
+ *    in flight, so the commit→refocus interleave can't occur.
+ *
+ * Safety nets so the shortcut can't be left dead: the effect cleanup resumes
+ * if the component unmounts mid-capture (the hidden-not-destroyed settings
+ * window is covered backend-side by `force_resume_hotkey` +
+ * `hotkey-capture-reset`), and every suspend/resume invoke has a `.catch`
+ * that surfaces an OS rejection as a save error. All async continuations are
+ * guarded by `cancelledRef` so a late resolution after unmount is a no-op.
  *
  * Issue #184: the model picker shows each preset's download size (e.g.
  * "Small — 488 MB"), fetched from the `model_registry` command
@@ -74,15 +89,11 @@ type SaveStatus = "idle" | "saving" | "saved";
  * unmount. The window's own event access is granted by
  * `src-tauri/capabilities/settings.json`.
  *
- * The latest settings are held in a `useRef` (PR #185 Sentinel 🔴-2), not
- * just React state: every auto-apply merges its patch against the ref and
- * updates it *synchronously* before awaiting `set_settings`, so two controls
- * toggled in quick succession each build on the prior change instead of a
- * stale closed-over snapshot — otherwise the later, slower write would
- * silently revert the earlier field (a lost update). The ref is also how the
- * `output-mode-changed` subscription (PR #134 Sentinel 🔴-2, mirroring
- * `App.tsx`) keeps a concurrent tray-/status-window mode switch from being
- * clobbered by the next auto-apply.
+ * The `settings` snapshot is mirrored in `settingsRef` so the serial apply
+ * queue and the `output-mode-changed` subscription (PR #134 Sentinel 🔴-2,
+ * mirroring `App.tsx`) read/merge against the latest value; a concurrent
+ * tray-/status-window mode switch is therefore never clobbered by the next
+ * auto-apply.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -96,16 +107,24 @@ export function GeneralTab() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
 
-  // PR #185 Sentinel 🔴-2: the synchronously-updated source of truth every
-  // auto-apply builds its patch on (see the component doc comment). Kept in
-  // lock-step with the `settings` state.
+  // The latest known settings, read by each queued apply when it RUNS (see
+  // the concurrency-model doc comment). Kept in lock-step with `settings`.
   const settingsRef = useRef<Settings | null>(null);
-  // PR #185 Sentinel 🔴-1(iii): the generation of the current outstanding
-  // hotkey-capture suspend (null when not suspended), and the monotonic
-  // counter that mints them. `resume_hotkey` echoes the active generation so
-  // the backend can reject a stale, out-of-order resume.
+  // Serial apply queue + in-flight count. `applyQueueRef` chains applies so
+  // exactly one runs at a time; `applyInFlightRef` (queued + running) is the
+  // signal `beginCapture` gates on so a capture never races a settings write.
+  const applyQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const applyInFlightRef = useRef(0);
+  // The generation of the current outstanding hotkey-capture suspend (null
+  // when not suspended) + the monotonic counter that mints them.
+  // `resume_hotkey` echoes the active generation so the backend rejects a
+  // stale, out-of-order resume.
   const suspendGenCounterRef = useRef(0);
   const activeSuspendGenRef = useRef<number | null>(null);
+  // Set on unmount so late async continuations (queued applies, suspend/
+  // resume catches, the model-download re-check) no-op instead of touching
+  // state on an unmounted tree.
+  const cancelledRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -205,12 +224,13 @@ export function GeneralTab() {
 
     return () => {
       cancelled = true;
+      cancelledRef.current = true;
       for (const unlisten of active) unlisten();
-      // PR #185 Sentinel 🔴-1(b): if the component unmounts while a capture
-      // suspend is still outstanding, restore the global shortcut so it
-      // can't be left dead. (The settings window is hidden — not destroyed —
-      // on close, so this rarely fires on a real close; that path is covered
-      // backend-side by `force_resume_hotkey` in lib.rs.)
+      // PR #185 🔴-1(b): if the component unmounts while a capture suspend is
+      // still outstanding, restore the global shortcut so it can't be left
+      // dead. (The settings window is hidden — not destroyed — on close, so
+      // this rarely fires on a real close; that path is covered backend-side
+      // by `force_resume_hotkey` + the `hotkey-capture-reset` event.)
       const pendingGen = activeSuspendGenRef.current;
       if (pendingGen !== null) {
         activeSuspendGenRef.current = null;
@@ -221,94 +241,82 @@ export function GeneralTab() {
     };
   }, []);
 
-  // Issue #181 / PR #185 🔴-1(iii): unregister the global shortcut and mint
-  // a fresh generation as the current outstanding suspend. 🟡-3: surface an
-  // OS rejection instead of swallowing it.
+  // Issue #181: unregister the global shortcut and mint a fresh generation
+  // as the current outstanding suspend. Surfaces an OS rejection instead of
+  // swallowing it (guarded so a post-unmount rejection is a no-op).
   const suspendHotkey = useCallback(() => {
     const generation = ++suspendGenCounterRef.current;
     activeSuspendGenRef.current = generation;
-    void invoke("suspend_hotkey", { generation }).catch((err) => setSaveError(String(err)));
+    void invoke("suspend_hotkey", { generation }).catch((err) => {
+      if (!cancelledRef.current) setSaveError(String(err));
+    });
   }, []);
 
-  // Issue #181 / PR #185 🔴-1(iii): restore the shortcut, echoing the active
-  // suspend's generation so the backend rejects it if a newer suspend has
-  // since superseded it. No-op if there's no outstanding suspend. 🟡-3:
-  // surface an OS rejection rather than leaving the hotkey silently dead.
+  // Issue #181: restore the shortcut, echoing the active suspend's generation
+  // so the backend rejects it if a newer suspend has since superseded it.
+  // No-op if there's no outstanding suspend. The SINGLE code path (with the
+  // backend) that re-registers the shortcut after a capture.
   const resumeHotkey = useCallback(() => {
     const generation = activeSuspendGenRef.current;
     activeSuspendGenRef.current = null;
     if (generation === null) return;
-    void invoke("resume_hotkey", { generation }).catch((err) => setSaveError(String(err)));
+    void invoke("resume_hotkey", { generation }).catch((err) => {
+      if (!cancelledRef.current) setSaveError(String(err));
+    });
   }, []);
 
-  // Issue #183: the single merge point every control's auto-apply goes
-  // through — see the component doc comment. Reads/writes `settingsRef`
-  // synchronously (PR #185 🔴-2) so overlapping auto-applies don't lose
-  // updates, so it needs no reactive deps.
-  const applySettingsChange = useCallback(
+  // The body of one queued apply (see the concurrency-model doc comment).
+  // Runs serially — reads `settingsRef` when it STARTS (up to date, since no
+  // other apply overlaps), so on rejection it can simply revert to the base
+  // it captured. Never throws (the queue keeps draining).
+  const runApply = useCallback(
     async (patch: Partial<Settings>) => {
       const base = settingsRef.current;
       if (!base) return;
       const next = applySettingsPatch(base, patch);
-      // Synchronous: a second auto-apply firing before this one's IPC
-      // resolves builds on THIS change, not the pre-change snapshot.
       settingsRef.current = next;
       setSettings(next);
-
       setSaveStatus("saving");
       setSaveError(null);
 
       try {
         await invoke("set_settings", { settings: next });
+        if (cancelledRef.current) return;
         setSaveStatus("saved");
-        // A changed hotkey is re-registered by set_settings itself, so the
-        // capture suspend is now resolved — clear it so no later resume
-        // (or the unmount safety net) double-registers.
+        // Single-owner registration: a committed hotkey change is
+        // re-registered by resume AFTER set_settings persisted it (set_settings
+        // no longer registers).
         if (patch.hotkey !== undefined) {
-          activeSuspendGenRef.current = null;
+          resumeHotkey();
         }
         // Issue #91/#110 pattern reuse: after a preset change auto-applies,
-        // re-check the newly-selected preset's on-disk status the same way
-        // the initial mount does.
+        // re-check the newly-selected preset's on-disk status.
         if (patch.model_preset !== undefined) {
           invoke("download_selected_model")
-            .then((result) =>
-              setModelStatus(result === "already-present" ? "ready" : "downloading"),
-            )
+            .then((result) => {
+              if (!cancelledRef.current) {
+                setModelStatus(result === "already-present" ? "ready" : "downloading");
+              }
+            })
             .catch((err) => {
-              setModelStatus("error");
-              setSaveError(String(err));
+              if (!cancelledRef.current) {
+                setModelStatus("error");
+                setSaveError(String(err));
+              }
             });
         }
       } catch (err) {
+        if (cancelledRef.current) return;
         setSaveStatus("idle");
         setSaveError(String(err));
-        // PR #185 delta 🔴: the optimistic write was applied before the
-        // await, so a rejection must roll it back or the rejected value
-        // lingers in `settingsRef` and rides into the next auto-apply.
-        if (settingsRef.current === next) {
-          // No later auto-apply built on this one — revert to the pre-patch
-          // snapshot (and the pre-patch hotkey display, if this was a
-          // hotkey change).
-          settingsRef.current = base;
-          setSettings(base);
-          if (patch.hotkey !== undefined) setHotkeyInput(base.hotkey);
-        } else {
-          // A later apply already built on `next`; a blind revert to `base`
-          // would clobber that newer change. Resync from the backend's
-          // actual persisted truth instead.
-          invoke("get_settings")
-            .then((loaded) => {
-              settingsRef.current = loaded;
-              setSettings(loaded);
-              setHotkeyInput(loaded.hotkey);
-            })
-            .catch((resyncErr) => setSaveError(String(resyncErr)));
-        }
-        // PR #185 🔴-1: if a hotkey save failed, set_settings may have left
-        // the shortcut unregistered — restore whatever was registered before
-        // capture so it can't be left dead.
+        // Serial queue → no later apply has run, so revert to THIS apply's
+        // captured base (and its pre-change hotkey display).
+        settingsRef.current = base;
+        setSettings(base);
         if (patch.hotkey !== undefined) {
+          setHotkeyInput(base.hotkey);
+          // The save (and thus the resume-driven re-register) didn't happen —
+          // restore the previously-registered shortcut so it can't be dead.
           resumeHotkey();
         }
       }
@@ -316,33 +324,54 @@ export function GeneralTab() {
     [resumeHotkey],
   );
 
+  // Issue #183: every control's auto-apply enqueues onto the serial queue.
+  // `applyInFlightRef` (queued + running) is the capture gate's signal.
+  const applySettingsChange = useCallback(
+    (patch: Partial<Settings>) => {
+      applyInFlightRef.current += 1;
+      const task = () =>
+        runApply(patch).finally(() => {
+          applyInFlightRef.current -= 1;
+        });
+      // `task` never rejects (runApply catches), so the chain stays alive;
+      // the second arg keeps it draining even if a prior link somehow did.
+      applyQueueRef.current = applyQueueRef.current.then(task, task);
+      return applyQueueRef.current;
+    },
+    [runApply],
+  );
+
   // Issue #181: ends hotkey capture, optionally reverting the field's
-  // displayed value, and restores the global shortcut when
-  // `captureEndNeedsResume` says this end reason needs it.
+  // displayed value, and always restoring the global shortcut (resume is the
+  // single owner). Used for the cancel/blur/invalid paths; a committed chord
+  // is handled inline in `handleHotkeyKeyDown` (its changed variant resumes
+  // only after the queued save persists the new binding).
   const endCapture = useCallback(
-    (reason: CaptureEndReason, revertTo?: string) => {
+    (revertTo?: string) => {
       setCapturing(false);
       if (revertTo !== undefined) setHotkeyInput(revertTo);
-      if (captureEndNeedsResume(reason)) {
-        resumeHotkey();
-      }
+      resumeHotkey();
     },
     [resumeHotkey],
   );
 
   const beginCapture = useCallback(() => {
+    // Gate (PR #185 cycle-3): never start a capture — and never suspend the
+    // shortcut — while a settings apply is in flight, so a capture can't race
+    // a concurrent settings write (the commit→refocus / apply-during-save
+    // interleave). The blocked focus simply doesn't enter capture mode.
+    if (applyInFlightRef.current > 0) return;
     setCapturing(true);
     setHotkeyError(null);
     suspendHotkey();
   }, [suspendHotkey]);
 
   const handleHotkeyBlur = useCallback(() => {
-    // Only a genuine "lost focus mid-capture" needs a resume — a blur
-    // firing right after a chord already committed (capturing is already
-    // false by then) must not re-suspend/resume against a save that may
-    // still be in flight.
+    // Only a genuine "lost focus mid-capture" needs a resume — a blur firing
+    // right after a chord already committed (capturing is already false by
+    // then) must not resume against a save that may still be in flight.
     if (capturing) {
-      endCapture("blur", settingsRef.current?.hotkey ?? hotkeyInput);
+      endCapture(settingsRef.current?.hotkey ?? hotkeyInput);
     }
   }, [capturing, hotkeyInput, endCapture]);
 
@@ -355,7 +384,7 @@ export function GeneralTab() {
       e.preventDefault();
 
       if (e.key === "Escape") {
-        endCapture("escape", settingsRef.current?.hotkey ?? hotkeyInput);
+        endCapture(settingsRef.current?.hotkey ?? hotkeyInput);
         return;
       }
 
@@ -370,21 +399,25 @@ export function GeneralTab() {
       setHotkeyInput(chord);
       invoke("validate_hotkey", { accelerator: chord })
         .then(() => {
+          if (cancelledRef.current) return;
           setHotkeyError(null);
           const changed = chord !== (settingsRef.current?.hotkey ?? "");
           if (changed) {
-            // set_settings re-registers the new binding as part of the save.
+            // Persist via the serial queue; runApply's success resumes so the
+            // single owner re-registers the newly-persisted chord (ordered
+            // after the save). Don't resume here — that would register the
+            // OLD binding before the save lands.
             void applySettingsChange({ hotkey: chord });
-          }
-          // PR #185 🔴-1(a): an unchanged committed chord re-registers
-          // nothing via set_settings, so resume the suspend ourselves.
-          if (captureEndNeedsResume("committed", changed)) {
+          } else {
+            // Unchanged chord: nothing to persist — just restore the shortcut.
             resumeHotkey();
           }
         })
         .catch((err) => {
+          if (cancelledRef.current) return;
           setHotkeyError(String(err));
-          endCapture("invalid");
+          // Invalid: keep the rejected chord + error visible; resume only.
+          endCapture();
         });
     },
     [capturing, hotkeyInput, endCapture, applySettingsChange, resumeHotkey],
