@@ -585,6 +585,34 @@ mod mapping_tests {
             settings::ModelPreset::Small
         );
     }
+
+    // PR #185 Sentinel 🟡-4: suspend_hotkey/resume_hotkey are in the global
+    // invoke_handler, so any window's webview can call them. Only the
+    // settings window is allowed to suspend/resume the recording trigger —
+    // this pure predicate is the gate each command checks against
+    // `window.label()`.
+    #[test]
+    fn is_settings_window_only_accepts_the_settings_label() {
+        assert!(is_settings_window(SETTINGS_WINDOW_LABEL));
+        assert!(!is_settings_window("main"));
+        assert!(!is_settings_window("pill"));
+        assert!(!is_settings_window(""));
+    }
+
+    // PR #185 Sentinel 🔴-1(iii): a monotonic generation token makes
+    // suspend/resume idempotent under out-of-order IPC. A resume only
+    // restores the hotkey when its generation is still the latest suspend's
+    // — a stale resume (superseded by a newer suspend) or the zero sentinel
+    // (no suspend active) must be a no-op so it can't clobber a live capture.
+    #[test]
+    fn should_resume_hotkey_only_when_the_generation_is_the_current_suspend() {
+        assert!(should_resume_hotkey(5, 5));
+        // A stale resume from a capture superseded by a newer suspend.
+        assert!(!should_resume_hotkey(6, 5));
+        // The zero sentinel means "not suspended" — never resume.
+        assert!(!should_resume_hotkey(0, 0));
+        assert!(!should_resume_hotkey(5, 0));
+    }
 }
 
 /// Loads persisted settings from the `tauri-plugin-store`-backed
