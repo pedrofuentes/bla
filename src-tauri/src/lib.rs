@@ -32,6 +32,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -260,6 +261,43 @@ fn spec_for_preset(preset: models::ModelPreset) -> models::ModelSpec {
         .into_iter()
         .find(|spec| spec.preset == preset)
         .expect("model_registry() covers every ModelPreset variant")
+}
+
+/// Translate the models downloader's registry [`models::ModelPreset`] back
+/// to the persisted [`settings::ModelPreset`] — the inverse of
+/// [`to_models_preset`], used by [`model_registry_entries`] to key each
+/// entry the same way `Settings.model_preset` already is on the frontend.
+fn to_settings_preset(preset: models::ModelPreset) -> settings::ModelPreset {
+    match preset {
+        models::ModelPreset::LargeV3TurboQ5 => settings::ModelPreset::LargeV3Turbo,
+        models::ModelPreset::Small => settings::ModelPreset::Small,
+    }
+}
+
+/// One entry of the model picker's registry, mirrored to the frontend via
+/// `commands::model_registry` (issue #184): a settings-safe preset id plus
+/// its exact download size in bytes, so the UI can render e.g. "Small — 488
+/// MB" using its own `formatBytes`/`modelPresetLabel` rather than
+/// duplicating that formatting on the Rust side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ModelRegistryEntry {
+    pub preset: settings::ModelPreset,
+    pub size_bytes: u64,
+}
+
+/// Pure data behind `commands::model_registry` (issue #184): every
+/// supported preset's settings-safe id and exact download size, sourced
+/// from `models::model_registry()` — the single source of truth for
+/// `size_bytes` — and translated so the frontend can key each entry
+/// directly against `Settings.model_preset`.
+pub(crate) fn model_registry_entries() -> Vec<ModelRegistryEntry> {
+    models::model_registry()
+        .into_iter()
+        .map(|spec| ModelRegistryEntry {
+            preset: to_settings_preset(spec.preset),
+            size_bytes: spec.size_bytes,
+        })
+        .collect()
 }
 
 /// Label for the tray menu's output-mode toggle line (issue #110): names
@@ -1373,6 +1411,7 @@ pub fn run() {
             commands::set_output_mode,
             commands::validate_hotkey,
             commands::download_selected_model,
+            commands::model_registry,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

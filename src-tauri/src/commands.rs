@@ -11,8 +11,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
-    apply_settings_to_state, output_mode_toggle_label, react_to_transition, register_hotkey,
-    save_settings_to_store, spec_for_preset, to_models_preset, to_tray_output_mode, AppState,
+    apply_settings_to_state, model_registry_entries, output_mode_toggle_label, react_to_transition,
+    register_hotkey, save_settings_to_store, spec_for_preset, to_models_preset,
+    to_tray_output_mode, AppState, ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -200,4 +201,13 @@ pub fn download_selected_model(
     });
 
     Ok("downloading".to_string())
+}
+
+/// Every supported Whisper model preset's settings-safe id and exact
+/// download size in bytes (issue #184), for the settings window's model
+/// picker to render e.g. "Small — 488 MB" — thin wrapper over the pure,
+/// unit-tested [`model_registry_entries`].
+#[tauri::command]
+pub fn model_registry() -> Vec<ModelRegistryEntry> {
+    model_registry_entries()
 }
