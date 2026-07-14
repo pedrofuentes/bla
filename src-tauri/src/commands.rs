@@ -55,23 +55,25 @@ pub fn set_settings(
         )
     };
 
-    // Issue #91 (Sentinel 🔴): validate + register the new hotkey BEFORE
-    // persisting anything. A malformed/unregistrable hotkey is rejected at
-    // the IPC boundary (returns Err to the caller) and NEVER written to
-    // settings.json — a persisted bad hotkey would brick the next launch.
-    // `validate_hotkey` is the pure, unit-tested parse; `register_hotkey`
-    // uses the same parser, so a value that validates is the value that
-    // registers. Persisting happens only after both succeed.
+    // Issue #91 (Sentinel 🔴): validate the new hotkey BEFORE persisting
+    // anything. A malformed/unparseable hotkey is rejected at the IPC
+    // boundary (returns Err) and NEVER written to settings.json — a persisted
+    // bad hotkey would brick the next launch. `validate_hotkey` uses the same
+    // parser `register_hotkey` does, so a value that validates is a value
+    // that registers.
+    //
+    // PR #185 cycle-3 (single-owner refactor): `set_settings` does NOT
+    // register the hotkey or touch `hotkey_suspend_gen`. The global shortcut
+    // has exactly one owner — the `suspend_hotkey`/`resume_hotkey` pair
+    // (guarded by the generation token) — so a committed hotkey change is
+    // re-registered by the settings window's `resume_hotkey` AFTER this save
+    // persists it, never by two independent writers racing the OS
+    // registration + generation (the TOCTOU that bricked the hotkey across
+    // earlier fix cycles). Startup registration (`run()`'s setup) and the
+    // close-time `force_resume_hotkey` net remain the only other registrars,
+    // and are mutually exclusive in time with an active capture.
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
-        register_hotkey(&app, &settings.hotkey).map_err(|e| e.to_string())?;
-        // PR #185 Sentinel delta 🟡-2: this register supersedes any
-        // outstanding hotkey-capture suspend (a committed-changed chord ends
-        // capture), so clear the suspend generation — its doc contract is
-        // "0 when not suspended". Otherwise `force_resume_hotkey` on a later
-        // settings-window close would see gen != 0 and do a redundant
-        // unregister_all()+register.
-        *state.hotkey_suspend_gen.lock().unwrap() = 0;
     }
 
     save_settings_to_store(&app, &settings)?;
