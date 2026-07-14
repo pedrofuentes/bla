@@ -13,3 +13,25 @@ import type { Settings } from "./ipc";
 export function applySettingsPatch(settings: Settings, patch: Partial<Settings>): Settings {
   return { ...settings, ...patch };
 }
+
+/**
+ * Rolls back a failed auto-apply (PR #185 cycle-4 🔴-2). Returns `current`
+ * with only the keys that `patch` touched reset to their `base` (pre-apply)
+ * values — every other field of `current` is preserved. This is deliberately
+ * NOT a blind `= base`: while an apply was in flight an out-of-band writer
+ * (the `output-mode-changed` subscription, driven by the tray/status window)
+ * may have mutated other fields, and those concurrent changes must survive
+ * the rollback rather than be clobbered back to the apply's stale base.
+ * Pure — mutates neither input.
+ */
+export function revertPatchedFields(
+  current: Settings,
+  base: Settings,
+  patch: Partial<Settings>,
+): Settings {
+  const restored: Partial<Settings> = {};
+  for (const key of Object.keys(patch) as (keyof Settings)[]) {
+    (restored as Record<string, unknown>)[key] = base[key];
+  }
+  return { ...current, ...restored };
+}
