@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — M2: UI shell (pending AC-7 cofounder smoke test)
+
+### Added
+
+- M2 windows scaffold (issue #126): added the always-on-top recording pill and full settings windows as hidden-by-default app windows, wired a tray "Settings…" item to show them, and made the pill window show/hide automatically while dictating — placeholder UI for now, real content lands in later M2 PRs.
+- Throttled audio-level event stream (issue #126): the core now emits an `audio-level` event (~30Hz, RMS `0.0..=1.0`) while a dictation is being captured, so the recording pill's live meter (a later M2 PR) has a real signal to draw — computed off the real-time audio thread, never emitting raw samples.
+- Recording pill waveform + state UI (issue #126): the pill now renders a live canvas waveform from the `audio-level` event stream while recording, and shows a distinct dot/label for transcribing, done (auto-hiding after ~1.5s), and error states, driven by `pipeline-state-changed` — replacing the earlier placeholder shell.
+- Enabled real window transparency for the pill on macOS (issue #129) so its rounded shape renders over the desktop instead of an opaque backdrop.
+- Clamped the emitted `audio-level` value to its documented `0.0..=1.0` range (issue #136) so driver-clipped input can no longer exceed it.
+- Typed pipeline-error toasts (issue #126): the pill window now shows a small, auto-dismissing toast when the mic fails to start, the Whisper model is missing, or the local Ollama cleanup backend is unreachable (informational — dictation still pastes via the regex fallback) — styled distinctly for informational vs blocking notices, and never carrying dictated text.
+- Settings window General tab (issue #126): hotkey capture (press a key combination, validated live via a new `validate_hotkey` command before it's ever saved), Whisper model preset selection with download progress, and hold-vs-toggle recording mode — the tab bar's full shape (History/Dictionary/Tone/Snippets) is in place, with the rest of the tabs landing in later M2 increments.
+- Launch-at-login + sound-cue preference (issue #126): a new "Launch bla at login" checkbox in the settings window's General tab enables/disables OS login autostart immediately on save (via `tauri-plugin-autostart`), and a new "Play sound cues" checkbox persists the preference cue playback will read starting in the next M2 increment.
+- Synthesized sound cues (issue #126): the recording pill now plays a short, purely synthesized tone (Web Audio `OscillatorNode`, no bundled audio files or recordings) on dictation start, on a successfully completed dictation, and on error — gated by the existing "Play sound cues" preference from the settings window's General tab, and silent for a cancelled dictation so cancelling never sounds like a failure.
+
+## [0.1.0] — M1: MVP dictation pipeline (pending AC-7 gate #27)
+
 ### Added
 
 - M1 minimal shell (issue #110): replaced the create-tauri-app boilerplate

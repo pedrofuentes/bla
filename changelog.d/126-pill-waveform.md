@@ -1,3 +1,0 @@
-- Recording pill waveform + state UI (issue #126): the pill now renders a live canvas waveform from the `audio-level` event stream while recording, and shows a distinct dot/label for transcribing, done (auto-hiding after ~1.5s), and error states, driven by `pipeline-state-changed` — replacing the earlier placeholder shell.
-- Enabled real window transparency for the pill on macOS (issue #129) so its rounded shape renders over the desktop instead of an opaque backdrop.
-- Clamped the emitted `audio-level` value to its documented `0.0..=1.0` range (issue #136) so driver-clipped input can no longer exceed it.
