@@ -1,0 +1,11 @@
+# Pin the toolchain so macOS + Windows + CI all build the identical rustc.
+#
+# `libsqlite3-sys 0.38.1` (pulled in by `rusqlite 0.40.1`, which requires
+# `^0.38.1`) uses the `cfg_select!` macro in its build script, which needs a
+# rustc new enough to provide it. An older Windows toolchain fails with
+# `E0658: use of unstable library feature 'cfg_select'` (rust-lang/rust#115585)
+# while the macOS dev box (rustc 1.96.1) builds it cleanly — the repo had no
+# toolchain pin, so the platforms drifted. See DECISIONS.md ADR-0010.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
