@@ -22,6 +22,13 @@
 
 <!-- Add new decisions below this line, most recent first -->
 
+### ADR-0010: Pin the Rust toolchain to 1.96.1
+**Date**: 2026-07-13
+**Status**: Accepted
+**Context**: `rusqlite 0.40.1` (M3 store foundation, #161) requires `libsqlite3-sys ^0.38.1`, whose build script uses the `cfg_select!` macro. An older Windows rustc fails to compile it (`E0658: use of unstable library feature 'cfg_select'`, rust-lang/rust#115585), while the macOS dev box (rustc 1.96.1) builds it fine — the repo had no toolchain pin, so the two platforms drifted.
+**Decision**: Add `rust-toolchain.toml` pinning `channel = "1.96.1"`; dev machines and the Windows CI job pick it up via `rustup` automatically. Down-pinning `libsqlite3-sys` was rejected — `rusqlite 0.40.1` hard-requires `^0.38.1`, so it cannot be lowered without downgrading `rusqlite` and reworking the M3 store code.
+**Consequences**: All platforms + CI build one rustc; the pin is bumped deliberately. A future `rusqlite`/`libsqlite3-sys` bump may raise the compiler floor again — revisit the pin then.
+
 ### ADR-0009: Accept the macOS private API for pill-window transparency
 **Date**: 2026-07-10
 **Status**: Accepted
