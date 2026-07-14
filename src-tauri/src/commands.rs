@@ -13,7 +13,7 @@ use tauri_plugin_autostart::ManagerExt;
 use crate::{
     apply_settings_to_state, model_registry_entries, output_mode_toggle_label, react_to_transition,
     register_hotkey, save_settings_to_store, spec_for_preset, to_models_preset,
-    to_tray_output_mode, AppState, ModelRegistryEntry,
+    to_tray_output_mode, unregister_hotkey, AppState, ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -210,4 +210,29 @@ pub fn download_selected_model(
 #[tauri::command]
 pub fn model_registry() -> Vec<ModelRegistryEntry> {
     model_registry_entries()
+}
+
+/// Temporarily unregisters the global dictation hotkey (issue #181): called
+/// when the settings window's hotkey-capture field gains focus, so the
+/// still-live shortcut doesn't fire a dictation while the user is pressing
+/// keys meant to be captured into the field instead. Paired with
+/// [`resume_hotkey`], which the field calls on every way capture can end.
+#[tauri::command]
+pub fn suspend_hotkey(app: AppHandle) -> Result<(), String> {
+    unregister_hotkey(&app).map_err(|e| e.to_string())
+}
+
+/// Re-registers the current (persisted) hotkey as the global dictation
+/// shortcut (issue #181) — called whenever hotkey capture ends without a
+/// newly-committed chord already re-registering it via `set_settings`
+/// (Escape, blur mid-capture, or a captured chord that failed
+/// `validate_hotkey`; see `src/lib/hotkeyCapture.ts`'s
+/// `captureEndNeedsResume`). Reads the hotkey from live state rather than
+/// taking one as an argument so a cancelled/invalid capture always restores
+/// whatever was actually registered before capture began, never a
+/// not-yet-persisted candidate.
+#[tauri::command]
+pub fn resume_hotkey(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let hotkey = state.settings.lock().unwrap().hotkey.clone();
+    register_hotkey(&app, &hotkey).map_err(|e| e.to_string())
 }

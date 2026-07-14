@@ -639,6 +639,16 @@ fn register_hotkey(
     })
 }
 
+/// Unregisters the global dictation hotkey without registering a new one
+/// (issue #181, `commands::suspend_hotkey`) — called while the settings
+/// window's hotkey-capture field is active so keypresses are captured for
+/// rebinding instead of also triggering a dictation via the still-live
+/// shortcut. [`register_hotkey`]/`commands::resume_hotkey` re-register when
+/// capture ends.
+fn unregister_hotkey(app: &tauri::AppHandle) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    app.global_shortcut().unregister_all()
+}
+
 /// Monotonic timestamp for the hotkey state machine: an opaque duration
 /// since process start, never the wall clock — mirrors
 /// `hotkeys::Timestamp`'s contract (the machine only ever compares two of
@@ -1412,6 +1422,8 @@ pub fn run() {
             commands::validate_hotkey,
             commands::download_selected_model,
             commands::model_registry,
+            commands::suspend_hotkey,
+            commands::resume_hotkey,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
