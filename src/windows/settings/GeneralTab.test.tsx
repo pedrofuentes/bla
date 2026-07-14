@@ -299,9 +299,7 @@ describe("GeneralTab", () => {
     setupInvoke({
       set_settings: () => {
         setCall += 1;
-        return setCall === 1
-          ? Promise.reject(new Error("disk full"))
-          : Promise.resolve(undefined);
+        return setCall === 1 ? Promise.reject(new Error("disk full")) : Promise.resolve(undefined);
       },
     });
 

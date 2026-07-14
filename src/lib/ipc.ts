@@ -146,6 +146,14 @@ export interface Events {
    */
   "audio-level": number;
   /**
+   * PR #185 Sentinel delta 🟡-3: the settings window was hidden (not
+   * destroyed) while its hotkey-capture field was mid-capture. The backend
+   * force-restores the OS shortcut on close and emits this so the field
+   * leaves capture mode instead of staying stuck (`capturing === true`,
+   * swallowing keys) when the window is reopened. Unit payload (`null`).
+   */
+  "hotkey-capture-reset": null;
+  /**
    * A typed pipeline error/notice (issue #126, M2 PR 2.4) — emitted from
    * `lib.rs`'s capture-start failure, `run_pipeline_in_background`'s error
    * paths, and the AC-4 Ollama-unreachable fallback path (informational,

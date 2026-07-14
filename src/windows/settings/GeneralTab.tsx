@@ -178,6 +178,17 @@ export function GeneralTab() {
         settingsRef.current = nextSettings;
         setSettings(nextSettings);
       }),
+      // PR #185 Sentinel delta 🟡-3: the window was hidden mid-capture (it
+      // hides, not unmounts, so the effect-cleanup reset below never ran).
+      // The backend already force-restored the OS shortcut; drop out of
+      // capture mode and clear the stale suspend so the field isn't stuck
+      // swallowing keys when reopened.
+      onEvent("hotkey-capture-reset", () => {
+        if (cancelled) return;
+        activeSuspendGenRef.current = null;
+        setCapturing(false);
+        setHotkeyInput(settingsRef.current?.hotkey ?? "");
+      }),
     ];
     for (const subscription of subscriptions) {
       subscription
@@ -272,6 +283,28 @@ export function GeneralTab() {
       } catch (err) {
         setSaveStatus("idle");
         setSaveError(String(err));
+        // PR #185 delta 🔴: the optimistic write was applied before the
+        // await, so a rejection must roll it back or the rejected value
+        // lingers in `settingsRef` and rides into the next auto-apply.
+        if (settingsRef.current === next) {
+          // No later auto-apply built on this one — revert to the pre-patch
+          // snapshot (and the pre-patch hotkey display, if this was a
+          // hotkey change).
+          settingsRef.current = base;
+          setSettings(base);
+          if (patch.hotkey !== undefined) setHotkeyInput(base.hotkey);
+        } else {
+          // A later apply already built on `next`; a blind revert to `base`
+          // would clobber that newer change. Resync from the backend's
+          // actual persisted truth instead.
+          invoke("get_settings")
+            .then((loaded) => {
+              settingsRef.current = loaded;
+              setSettings(loaded);
+              setHotkeyInput(loaded.hotkey);
+            })
+            .catch((resyncErr) => setSaveError(String(resyncErr)));
+        }
         // PR #185 🔴-1: if a hotkey save failed, set_settings may have left
         // the shortcut unregistered — restore whatever was registered before
         // capture so it can't be left dead.
