@@ -267,7 +267,10 @@ describe("GeneralTab", () => {
     expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
   });
 
-  it("shows a save-error and does not update settings when set_settings rejects", async () => {
+  it("shows a save-error AND rolls the control back to its pre-change value when set_settings rejects", async () => {
+    // PR #185 delta 🔴: the optimistic write is applied before the awaited
+    // set_settings; on rejection it must be rolled back, not left showing
+    // the never-persisted value.
     setupInvoke({
       set_settings: () => Promise.reject(new Error("disk full")),
     });
@@ -278,12 +281,172 @@ describe("GeneralTab", () => {
     const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
       '[data-testid="sound-cues-checkbox"]',
     )!;
+    expect(soundCheckbox.checked).toBe(true);
     click(soundCheckbox);
     await flush();
 
     expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
       /disk full/i,
     );
+    // Reverted to the pre-change value rather than stuck on the rejected one.
+    expect(soundCheckbox.checked).toBe(true);
+  });
+
+  it("does not silently re-persist a rejected field on a later unrelated save", async () => {
+    // PR #185 delta 🔴: a rejected optimistic write must not linger in the
+    // settings ref and ride into the NEXT unrelated auto-apply.
+    let setCall = 0;
+    setupInvoke({
+      set_settings: () => {
+        setCall += 1;
+        return setCall === 1
+          ? Promise.reject(new Error("disk full"))
+          : Promise.resolve(undefined);
+      },
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+
+    click(launchCheckbox); // set_settings #1 rejects → must roll back
+    await flush();
+    expect(launchCheckbox.checked).toBe(false);
+
+    click(soundCheckbox); // set_settings #2 succeeds
+    await flush();
+
+    const setCalls = invoke.mock.calls.filter((c) => c[0] === "set_settings");
+    // The later save carries ONLY the sound-cues change — the rejected
+    // launch-at-login value is gone, not re-submitted.
+    expect(setCalls[setCalls.length - 1][1]).toEqual({
+      settings: { ...BASE_SETTINGS, sound_cues: false },
+    });
+  });
+
+  it("rolls back a rejected hotkey and does not re-persist the candidate chord later", async () => {
+    // PR #185 delta 🔴 (the worse case): a rejected hotkey save must revert
+    // the displayed field to the previously-registered chord and must not
+    // let the never-registered candidate ride into a later save.
+    let setCall = 0;
+    setupInvoke({
+      set_settings: () => {
+        setCall += 1;
+        return setCall === 1
+          ? Promise.reject(new Error("register failed"))
+          : Promise.resolve(undefined);
+      },
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // Control+Shift+D (changed)
+    await flush();
+
+    // Field reverted to the previously-registered hotkey, and the old
+    // shortcut was resumed.
+    expect(input.value).toBe("Control+Shift+Space");
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+
+    // A later unrelated save must carry the OLD hotkey, not the rejected
+    // candidate chord.
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+    click(soundCheckbox);
+    await flush();
+
+    const setCalls = invoke.mock.calls.filter((c) => c[0] === "set_settings");
+    expect((setCalls[setCalls.length - 1][1] as { settings: Settings }).settings.hotkey).toBe(
+      "Control+Shift+Space",
+    );
+  });
+
+  it("resyncs from the backend rather than clobbering a newer apply when an earlier one fails", async () => {
+    // PR #185 delta 🔴: when a later auto-apply already built on the failed
+    // one's optimistic value, the rollback must NOT blind-revert to the
+    // failed apply's stale base — it resyncs from get_settings (truth).
+    let getCall = 0;
+    let rejectFirst: (() => void) | undefined;
+    let setCall = 0;
+    setupInvoke({
+      get_settings: () => {
+        getCall += 1;
+        // Mount reads the base; the resync read reflects what actually
+        // persisted (the newer apply's launch-at-login + sound-cues).
+        return getCall === 1
+          ? BASE_SETTINGS
+          : { ...BASE_SETTINGS, launch_at_login: true, sound_cues: false };
+      },
+      set_settings: () => {
+        setCall += 1;
+        if (setCall === 1) {
+          return new Promise<void>((_resolve, reject) => {
+            rejectFirst = () => reject(new Error("boom"));
+          });
+        }
+        return Promise.resolve(undefined);
+      },
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const launchCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="launch-at-login-checkbox"]',
+    )!;
+    const soundCheckbox = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="sound-cues-checkbox"]',
+    )!;
+
+    click(launchCheckbox); // apply #1 (launch true) — pending
+    click(soundCheckbox); // apply #2 (sound false) built on #1 — resolves
+    await flush();
+
+    invoke.mockClear();
+    rejectFirst!(); // now #1 rejects, after #2 already built on it
+    await flush();
+
+    // Must resync from truth, not blind-revert to #1's base.
+    expect(invoke).toHaveBeenCalledWith("get_settings");
+    // The newer change survives (truth has launch true + sound false).
+    expect(launchCheckbox.checked).toBe(true);
+    expect(soundCheckbox.checked).toBe(false);
+  });
+
+  it("resets a stuck capture when the backend signals the window was hidden mid-capture", async () => {
+    // PR #185 delta 🟡-3: closing the settings window mid-capture hides (not
+    // destroys) it, so React never unmounts. The backend force-resumes the
+    // OS shortcut and emits `hotkey-capture-reset`; the field must leave
+    // capture mode so it isn't stuck swallowing keys on reopen.
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    await flush();
+    expect(input.value).toMatch(/press a key/i);
+
+    fire("hotkey-capture-reset", null);
+    await flush();
+
+    expect(input.value).toBe("Control+Shift+Space");
   });
 
   it("keeps listening (doesn't validate or auto-apply a chord) on a bare modifier keydown", async () => {
