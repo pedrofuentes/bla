@@ -13,11 +13,29 @@ import {
   type ModelStatus,
 } from "../../lib/status";
 import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
-import { applySettingsPatch } from "../../lib/settingsPatch";
+import { applySettingsPatch, revertPatchedFields } from "../../lib/settingsPatch";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
 
+/**
+ * Upper bound on how long an auto-apply's `set_settings` may take before it's
+ * treated as failed (PR #185 cycle-4 🟡-3). Without this a hung IPC would
+ * leave `applyInFlightRef` pinned above zero forever, silently disabling
+ * hotkey capture (the gate) for the rest of the session; the timeout instead
+ * rejects into the normal revert path.
+ */
+const SET_SETTINGS_TIMEOUT_MS = 15_000;
+
 type SaveStatus = "idle" | "saving" | "saved";
+
+/** Rejects if `promise` hasn't settled within `ms`; always clears its timer. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 /**
  * General settings tab (issue #126, M2 PR 2.5): hotkey capture, Whisper
@@ -280,14 +298,21 @@ export function GeneralTab() {
       setSaveError(null);
 
       try {
-        await invoke("set_settings", { settings: next });
+        // 🟡-3: a hung set_settings must not pin the in-flight gate forever.
+        await withTimeout(
+          invoke("set_settings", { settings: next }),
+          SET_SETTINGS_TIMEOUT_MS,
+          "Saving timed out",
+        );
         if (cancelledRef.current) return;
         setSaveStatus("saved");
-        // Single-owner registration: a committed hotkey change is
-        // re-registered by resume AFTER set_settings persisted it (set_settings
-        // no longer registers).
+        // 🔴-1 single registration point: a committed CHANGED hotkey is bound
+        // by set_settings itself (its register-before-persist gate) and the
+        // backend cleared the suspend generation — so do NOT resume (that
+        // would double-register). Consume the frontend suspend so the unmount
+        // net doesn't resume either.
         if (patch.hotkey !== undefined) {
-          resumeHotkey();
+          activeSuspendGenRef.current = null;
         }
         // Issue #91/#110 pattern reuse: after a preset change auto-applies,
         // re-check the newly-selected preset's on-disk status.
@@ -309,14 +334,20 @@ export function GeneralTab() {
         if (cancelledRef.current) return;
         setSaveStatus("idle");
         setSaveError(String(err));
-        // Serial queue → no later apply has run, so revert to THIS apply's
-        // captured base (and its pre-change hotkey display).
-        settingsRef.current = base;
-        setSettings(base);
+        // 🔴-2: revert ONLY the field(s) THIS apply patched, back onto the
+        // CURRENT settings — an out-of-band `output-mode-changed` write that
+        // landed while we were in flight must survive, not be clobbered by a
+        // blind revert-to-base.
+        const current = settingsRef.current ?? base;
+        const reverted = revertPatchedFields(current, base, patch);
+        settingsRef.current = reverted;
+        setSettings(reverted);
         if (patch.hotkey !== undefined) {
-          setHotkeyInput(base.hotkey);
-          // The save (and thus the resume-driven re-register) didn't happen —
-          // restore the previously-registered shortcut so it can't be dead.
+          setHotkeyInput(reverted.hotkey);
+          // 🔴-1: set_settings's register-before-persist unregistered the old
+          // chord before failing to bind the new one, so the shortcut is
+          // currently unbound — restore the prior binding (resume registers
+          // the persisted, i.e. old, hotkey) so it can't be left dead.
           resumeHotkey();
         }
       }
@@ -397,27 +428,47 @@ export function GeneralTab() {
 
       setCapturing(false);
       setHotkeyInput(chord);
+
+      // 🟡-4: hold the in-flight gate SYNCHRONOUSLY, from the moment capture
+      // ends — before the `validate_hotkey` round-trip — so a refocus during
+      // that async gap can't slip past `beginCapture` and mint a second
+      // suspend. Released in every branch below (the changed path hands the
+      // hold off to the queued apply so the gate stays continuous).
+      applyInFlightRef.current += 1;
+      let released = false;
+      const releaseCommitHold = () => {
+        if (!released) {
+          released = true;
+          applyInFlightRef.current -= 1;
+        }
+      };
+
       invoke("validate_hotkey", { accelerator: chord })
         .then(() => {
-          if (cancelledRef.current) return;
+          if (cancelledRef.current) {
+            releaseCommitHold();
+            return;
+          }
           setHotkeyError(null);
           const changed = chord !== (settingsRef.current?.hotkey ?? "");
           if (changed) {
-            // Persist via the serial queue; runApply's success resumes so the
-            // single owner re-registers the newly-persisted chord (ordered
-            // after the save). Don't resume here — that would register the
-            // OLD binding before the save lands.
-            void applySettingsChange({ hotkey: chord });
+            // Persist via the serial queue; set_settings binds the new chord
+            // (its register-before-persist gate) — don't resume here. Keep the
+            // gate held until that apply settles so the window stays covered.
+            applySettingsChange({ hotkey: chord }).finally(releaseCommitHold);
           } else {
             // Unchanged chord: nothing to persist — just restore the shortcut.
             resumeHotkey();
+            releaseCommitHold();
           }
         })
         .catch((err) => {
-          if (cancelledRef.current) return;
-          setHotkeyError(String(err));
-          // Invalid: keep the rejected chord + error visible; resume only.
-          endCapture();
+          if (!cancelledRef.current) {
+            setHotkeyError(String(err));
+            // Invalid: keep the rejected chord + error visible; resume only.
+            endCapture();
+          }
+          releaseCommitHold();
         });
     },
     [capturing, hotkeyInput, endCapture, applySettingsChange, resumeHotkey],
