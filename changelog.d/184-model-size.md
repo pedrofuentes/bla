@@ -1,0 +1,1 @@
+- Model download sizes in the settings picker (issue #184): the General tab's model `<select>` now shows each Whisper preset's download size (e.g. "Small — 488 MB"), sourced from a new `model_registry` command.
