@@ -513,6 +513,40 @@ mod mapping_tests {
             assert_eq!(spec.preset, preset);
         }
     }
+
+    // Issue #184: `commands::model_registry`'s pure data source — every
+    // preset's settings-safe id plus its exact download size, so the
+    // frontend model picker can render "Small — 488 MB" without duplicating
+    // `models::ModelSpec.size_bytes` anywhere.
+    #[test]
+    fn model_registry_entries_covers_every_preset_with_its_exact_size() {
+        let entries = model_registry_entries();
+        assert_eq!(entries.len(), 2);
+
+        let large = entries
+            .iter()
+            .find(|e| e.preset == settings::ModelPreset::LargeV3Turbo)
+            .expect("LargeV3Turbo entry present");
+        assert_eq!(large.size_bytes, 574_041_195);
+
+        let small = entries
+            .iter()
+            .find(|e| e.preset == settings::ModelPreset::Small)
+            .expect("Small entry present");
+        assert_eq!(small.size_bytes, 487_601_967);
+    }
+
+    #[test]
+    fn settings_preset_mapping_round_trips_every_variant() {
+        assert_eq!(
+            to_settings_preset(models::ModelPreset::LargeV3TurboQ5),
+            settings::ModelPreset::LargeV3Turbo
+        );
+        assert_eq!(
+            to_settings_preset(models::ModelPreset::Small),
+            settings::ModelPreset::Small
+        );
+    }
 }
 
 /// Loads persisted settings from the `tauri-plugin-store`-backed
