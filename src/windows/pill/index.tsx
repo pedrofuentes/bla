@@ -1,8 +1,10 @@
-import { useEffect, useReducer, useState, type ReactNode } from "react";
-import { onEvent } from "../../lib/ipc";
+import { useEffect, useReducer, useRef, useState, type ReactNode } from "react";
+import { invoke, onEvent } from "../../lib/ipc";
 import { pushLevel } from "../../lib/levelBuffer";
 import { initialPillState, pillLabel, pillReducer, type PillMode } from "../../lib/pillState";
-import { parsePipelineState } from "../../lib/status";
+import { cueForTransition, shouldPlayCue } from "../../lib/soundCue";
+import { playCue } from "../../lib/soundCuePlayer";
+import { parsePipelineState, type PipelineState } from "../../lib/status";
 import { toastForError, type Toast as ToastSpec } from "../../lib/toast";
 import { barsFromLevels } from "../../lib/waveform";
 import { PillWaveform } from "./PillWaveform";
@@ -43,6 +45,21 @@ import { PipelineErrorToast } from "./Toast";
  * succeed keep their unlisten cleanup on unmount. The pill's own event
  * access is granted by `src-tauri/capabilities/pill.json` (listen/unlisten
  * only).
+ *
+ * Issue #126, M2 PR 2.7: also plays a short synthesized sound cue on each
+ * `pipeline-state-changed` transition, gated by the `sound_cues` preference
+ * (`Settings`, persisted since PR 2.6). The *decision* of which cue (if any)
+ * fires -- `cueForTransition` -- and whether it's allowed to play --
+ * `shouldPlayCue` -- are pure, unit-tested helpers (`src/lib/soundCue.ts`);
+ * only the actual Web Audio synthesis (`playCue`,
+ * `src/lib/soundCuePlayer.ts`) is untested glue. `sound_cues` is read once
+ * via `get_settings` on mount (the same command the settings window's
+ * General tab already calls -- app commands aren't capability-gated, so no
+ * `pill.json` change is needed); unlike `output_mode`, there's no
+ * `settings-changed`-style event to stay live on, so a toggle in the
+ * settings window only takes effect for the pill's *next* mount (i.e. next
+ * app launch) rather than mid-session -- acceptable for a cosmetic
+ * preference, and documented here rather than adding a new event for it.
  */
 
 const BAR_COUNT = 24;
@@ -80,6 +97,32 @@ export function PillWindow() {
   const [levels, setLevels] = useState<number[]>([]);
   const [toast, setToast] = useState<ToastSpec | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
+  // Refs, not state: read inside the pipeline-state-changed handler without
+  // needing either value to trigger a re-render on its own.
+  const soundCuesEnabledRef = useRef(false);
+  const prevPipelineStateRef = useRef<PipelineState>("Unknown");
+
+  useEffect(() => {
+    let cancelled = false;
+    // Mount-time-only read (see the class doc above for why this doesn't
+    // stay live for a mid-session toggle). Left at its `false` initial value
+    // -- rather than defaulting true to match `Settings::default` -- if this
+    // fails or hasn't resolved yet, so a cue can never fire ahead of
+    // actually knowing the user's preference.
+    invoke("get_settings")
+      .then((settings) => {
+        if (!cancelled) soundCuesEnabledRef.current = settings.sound_cues;
+      })
+      .catch(() => {
+        // Sound cues are a cosmetic nicety, not core dictation
+        // functionality -- silently stay gated-off rather than surfacing a
+        // second, unrelated error state alongside `eventsError`.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,6 +136,9 @@ export function PillWindow() {
       onEvent("pipeline-state-changed", (payload) => {
         if (cancelled) return;
         const pipelineState = parsePipelineState(payload);
+        const cue = cueForTransition(prevPipelineStateRef.current, pipelineState);
+        prevPipelineStateRef.current = pipelineState;
+        if (cue && shouldPlayCue(cue, soundCuesEnabledRef.current)) playCue(cue);
         // Fresh bars for the next recording rather than a stale tail from
         // the previous one.
         if (pipelineState === "Active") setLevels([]);

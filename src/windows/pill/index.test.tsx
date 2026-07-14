@@ -14,21 +14,52 @@
  *   the `pill-window` capability (`src-tauri/capabilities/pill.json`) makes
  *   reachable at runtime — without that capability the listen call is
  *   ACL-rejected and no toast ever renders.
+ * - Sound cue playback (issue #126, M2 PR 2.7): `playCue` (the untested Web
+ *   Audio glue, mocked here) is invoked with the right `CueKind` for a real
+ *   `pipeline-state-changed` sequence, and — the gated-off case — is never
+ *   invoked at all when `get_settings` reports `sound_cues: false`. The cue
+ *   *decision* itself (`cueForTransition`/`shouldPlayCue`) is covered in
+ *   isolation by `src/lib/soundCue.test.ts`; these tests only guard that the
+ *   pill actually wires that decision to `playCue`.
  */
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PipelineErrorEvent } from "../../lib/ipc";
+import type { PipelineErrorEvent, Settings } from "../../lib/ipc";
 import { flush, mount, type Mounted } from "../../testUtils";
 import { PillWindow } from "./index";
 
 const onEvent = vi.fn();
+const invoke = vi.fn();
+const playCue = vi.fn();
 
 // `vi.mock` factories are hoisted above imports by vitest, so `PillWindow`
-// above resolves against this mocked `../../lib/ipc` — the component under
-// test never touches the real Tauri `listen`.
+// above resolves against these mocked modules — the component under test
+// never touches the real Tauri `invoke`/`listen` or Web Audio.
 vi.mock("../../lib/ipc", () => ({
+  invoke: (...args: unknown[]) => invoke(...args),
   onEvent: (...args: unknown[]) => onEvent(...args),
 }));
+vi.mock("../../lib/soundCuePlayer", () => ({
+  playCue: (...args: unknown[]) => playCue(...args),
+}));
+
+const BASE_SETTINGS: Settings = {
+  hotkey: "Control+Shift+Space",
+  recording_mode: "Hold",
+  model_preset: "LargeV3Turbo",
+  output_mode: "Cursor",
+  file_path_template: "{{date:YYYY-MM-DD}}.md",
+  launch_at_login: false,
+  sound_cues: true,
+};
+
+/** Resolves `get_settings` with `BASE_SETTINGS` overridden by `overrides`. */
+function setupInvoke(overrides: Partial<Settings> = {}): void {
+  invoke.mockImplementation((command: string) => {
+    if (command === "get_settings") return Promise.resolve({ ...BASE_SETTINGS, ...overrides });
+    return Promise.reject(new Error(`unmocked command ${command}`));
+  });
+}
 
 /**
  * Handlers/unlisten-spies captured by the default `onEvent` mock — so a test
@@ -50,6 +81,9 @@ let mounted: Mounted | undefined;
 beforeEach(() => {
   eventHandlers = {};
   unlistenSpies = {};
+  invoke.mockReset();
+  playCue.mockReset();
+  setupInvoke();
   onEvent.mockReset();
   onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
     eventHandlers[event] = handler;
@@ -163,5 +197,65 @@ describe("PillWindow pipeline-error toast", () => {
     // Blocking tone is styled distinctly (red), not the informational blue.
     expect(toast?.className).toContain("red");
     expect(toast?.className).not.toContain("blue");
+  });
+});
+
+describe("PillWindow sound cues", () => {
+  it("reads sound_cues via get_settings on mount", async () => {
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("get_settings");
+  });
+
+  it("plays the 'start' cue on an Idle -> Active transition when sound_cues is enabled", async () => {
+    setupInvoke({ sound_cues: true });
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-state-changed", "Active");
+    expect(playCue).toHaveBeenCalledWith("start");
+  });
+
+  it("plays the 'done' cue on a Busy -> Idle transition (a completed dictation)", async () => {
+    setupInvoke({ sound_cues: true });
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-state-changed", "Busy");
+    fire("pipeline-state-changed", "Idle");
+    expect(playCue).toHaveBeenCalledWith("done");
+  });
+
+  it("plays the 'error' cue on a transition into Error", async () => {
+    setupInvoke({ sound_cues: true });
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-state-changed", "Error");
+    expect(playCue).toHaveBeenCalledWith("error");
+  });
+
+  it("never plays a cue when sound_cues is disabled (the gated-off case)", async () => {
+    setupInvoke({ sound_cues: false });
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-state-changed", "Active");
+    fire("pipeline-state-changed", "Busy");
+    fire("pipeline-state-changed", "Idle");
+    fire("pipeline-state-changed", "Error");
+    expect(playCue).not.toHaveBeenCalled();
+  });
+
+  it("does not play a cue for a cancelled dictation (Active -> Idle)", async () => {
+    setupInvoke({ sound_cues: true });
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-state-changed", "Active");
+    playCue.mockClear();
+    fire("pipeline-state-changed", "Idle");
+    expect(playCue).not.toHaveBeenCalled();
   });
 });
