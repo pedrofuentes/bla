@@ -123,6 +123,18 @@ export function modelPresetLabel(preset: ModelPreset): string {
 }
 
 /**
+ * Formats a byte count as a whole-number decimal-megabyte string (issue
+ * #184), e.g. `574_041_195` -> `"574 MB"`. Decimal MB (1,000 x 1,000 bytes),
+ * matching how the model download sizes are advertised elsewhere (HF file
+ * metadata, `models::ModelSpec.size_bytes`'s doc) — not MiB. Rounds to the
+ * nearest whole MB; these are all ~500 MB Whisper models, so sub-MB
+ * precision isn't useful signal for the picker.
+ */
+export function formatBytes(bytes: number): string {
+  return `${Math.round(bytes / 1_000_000)} MB`;
+}
+
+/**
  * Status-line label for the selected model's on-disk state, e.g. "Ready",
  * "Downloading… 42%", "Download failed". `percent` (from the most recent
  * `DownloadProgress` event, if any) is only shown while `status ===
