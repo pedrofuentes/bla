@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   invoke,
   onEvent,
@@ -43,14 +43,21 @@ type SaveStatus = "idle" | "saving" | "saved";
  * Issue #181 (AC-7 smoke test): while the hotkey-capture field is focused,
  * the still-live global dictation shortcut used to keep firing (starting a
  * dictation) instead of the keypress being captured for rebinding. Focusing
- * the field now calls `suspend_hotkey` to unregister the global shortcut;
- * every way capture can end other than a successfully committed+auto-applied
- * chord (Escape, losing focus mid-capture, or a captured chord that fails
- * `validate_hotkey`) calls `resume_hotkey` to restore it —
- * `captureEndNeedsResume` (`src/lib/hotkeyCapture.ts`) is the pure decision
- * of which reasons need that explicit call; a committed chord's own
- * `set_settings` auto-apply already re-registers the (new) hotkey as part of
- * that save, so an extra resume there would be redundant.
+ * the field calls `suspend_hotkey` (minting a monotonic generation token);
+ * capture ending calls `resume_hotkey` with that same token unless a
+ * committed chord actually CHANGED the hotkey — in which case that save's
+ * `set_settings` re-registers the new binding itself. `captureEndNeedsResume`
+ * (`src/lib/hotkeyCapture.ts`) is the pure decision of which reasons need the
+ * explicit resume, including PR #185 Sentinel 🔴-1(a): re-pressing the
+ * CURRENT chord commits an *unchanged* hotkey, so `set_settings` re-registers
+ * nothing and the field must resume itself. Two more #185 safety nets keep
+ * the global hotkey from being left permanently dead: the effect cleanup
+ * resumes if the component unmounts mid-capture (🔴-1(b), React side; the
+ * hidden-not-destroyed window path is covered backend-side in `lib.rs`), and
+ * every `suspend_hotkey`/`resume_hotkey` invoke has a `.catch` that surfaces
+ * an OS rejection as a save error rather than swallowing it (🟡-3). The
+ * generation token (🔴-1(iii)) lets the backend reject a stale, out-of-order
+ * resume so it can't re-enable the shortcut during a newer capture.
  *
  * Issue #184: the model picker shows each preset's download size (e.g.
  * "Small — 488 MB"), fetched from the `model_registry` command
@@ -67,11 +74,15 @@ type SaveStatus = "idle" | "saving" | "saved";
  * unmount. The window's own event access is granted by
  * `src-tauri/capabilities/settings.json`.
  *
- * The `settings` snapshot tracks `output-mode-changed` (PR #134 Sentinel
- * 🔴-2, mirroring `App.tsx`): the tray menu / status window can flip the
- * output mode while this window is open, and every auto-apply merges its
- * patch into the latest snapshot rather than a stale mount-time one — so a
- * concurrent tray-triggered mode switch is never clobbered.
+ * The latest settings are held in a `useRef` (PR #185 Sentinel 🔴-2), not
+ * just React state: every auto-apply merges its patch against the ref and
+ * updates it *synchronously* before awaiting `set_settings`, so two controls
+ * toggled in quick succession each build on the prior change instead of a
+ * stale closed-over snapshot — otherwise the later, slower write would
+ * silently revert the earlier field (a lost update). The ref is also how the
+ * `output-mode-changed` subscription (PR #134 Sentinel 🔴-2, mirroring
+ * `App.tsx`) keeps a concurrent tray-/status-window mode switch from being
+ * clobbered by the next auto-apply.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -85,12 +96,24 @@ export function GeneralTab() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
 
+  // PR #185 Sentinel 🔴-2: the synchronously-updated source of truth every
+  // auto-apply builds its patch on (see the component doc comment). Kept in
+  // lock-step with the `settings` state.
+  const settingsRef = useRef<Settings | null>(null);
+  // PR #185 Sentinel 🔴-1(iii): the generation of the current outstanding
+  // hotkey-capture suspend (null when not suspended), and the monotonic
+  // counter that mints them. `resume_hotkey` echoes the active generation so
+  // the backend can reject a stale, out-of-order resume.
+  const suspendGenCounterRef = useRef(0);
+  const activeSuspendGenRef = useRef<number | null>(null);
+
   useEffect(() => {
     let cancelled = false;
 
     invoke("get_settings")
       .then((loaded) => {
         if (cancelled) return;
+        settingsRef.current = loaded;
         setSettings(loaded);
         setHotkeyInput(loaded.hotkey);
       })
@@ -145,11 +168,15 @@ export function GeneralTab() {
       }),
       // PR #134 Sentinel 🔴-2 (mirrors App.tsx): keep the snapshot every
       // auto-apply merges onto in sync with tray-/status-window-triggered
-      // mode switches.
+      // mode switches — updating the ref (PR #185 🔴-2) as well as state so
+      // the next auto-apply doesn't clobber the concurrent change.
       onEvent("output-mode-changed", (mode) => {
-        if (!cancelled) {
-          setSettings((prev) => (prev ? { ...prev, output_mode: mode } : prev));
-        }
+        if (cancelled) return;
+        const base = settingsRef.current;
+        if (!base) return;
+        const nextSettings = { ...base, output_mode: mode };
+        settingsRef.current = nextSettings;
+        setSettings(nextSettings);
       }),
     ];
     for (const subscription of subscriptions) {
@@ -168,23 +195,67 @@ export function GeneralTab() {
     return () => {
       cancelled = true;
       for (const unlisten of active) unlisten();
+      // PR #185 Sentinel 🔴-1(b): if the component unmounts while a capture
+      // suspend is still outstanding, restore the global shortcut so it
+      // can't be left dead. (The settings window is hidden — not destroyed —
+      // on close, so this rarely fires on a real close; that path is covered
+      // backend-side by `force_resume_hotkey` in lib.rs.)
+      const pendingGen = activeSuspendGenRef.current;
+      if (pendingGen !== null) {
+        activeSuspendGenRef.current = null;
+        void invoke("resume_hotkey", { generation: pendingGen }).catch(() => {
+          /* unmounting — nothing left to surface the error on */
+        });
+      }
     };
   }, []);
 
+  // Issue #181 / PR #185 🔴-1(iii): unregister the global shortcut and mint
+  // a fresh generation as the current outstanding suspend. 🟡-3: surface an
+  // OS rejection instead of swallowing it.
+  const suspendHotkey = useCallback(() => {
+    const generation = ++suspendGenCounterRef.current;
+    activeSuspendGenRef.current = generation;
+    void invoke("suspend_hotkey", { generation }).catch((err) => setSaveError(String(err)));
+  }, []);
+
+  // Issue #181 / PR #185 🔴-1(iii): restore the shortcut, echoing the active
+  // suspend's generation so the backend rejects it if a newer suspend has
+  // since superseded it. No-op if there's no outstanding suspend. 🟡-3:
+  // surface an OS rejection rather than leaving the hotkey silently dead.
+  const resumeHotkey = useCallback(() => {
+    const generation = activeSuspendGenRef.current;
+    activeSuspendGenRef.current = null;
+    if (generation === null) return;
+    void invoke("resume_hotkey", { generation }).catch((err) => setSaveError(String(err)));
+  }, []);
+
   // Issue #183: the single merge point every control's auto-apply goes
-  // through — see the component doc comment.
+  // through — see the component doc comment. Reads/writes `settingsRef`
+  // synchronously (PR #185 🔴-2) so overlapping auto-applies don't lose
+  // updates, so it needs no reactive deps.
   const applySettingsChange = useCallback(
     async (patch: Partial<Settings>) => {
-      if (!settings) return;
-      const next = applySettingsPatch(settings, patch);
+      const base = settingsRef.current;
+      if (!base) return;
+      const next = applySettingsPatch(base, patch);
+      // Synchronous: a second auto-apply firing before this one's IPC
+      // resolves builds on THIS change, not the pre-change snapshot.
+      settingsRef.current = next;
+      setSettings(next);
 
       setSaveStatus("saving");
       setSaveError(null);
 
       try {
         await invoke("set_settings", { settings: next });
-        setSettings(next);
         setSaveStatus("saved");
+        // A changed hotkey is re-registered by set_settings itself, so the
+        // capture suspend is now resolved — clear it so no later resume
+        // (or the unmount safety net) double-registers.
+        if (patch.hotkey !== undefined) {
+          activeSuspendGenRef.current = null;
+        }
         // Issue #91/#110 pattern reuse: after a preset change auto-applies,
         // re-check the newly-selected preset's on-disk status the same way
         // the initial mount does.
@@ -201,27 +272,36 @@ export function GeneralTab() {
       } catch (err) {
         setSaveStatus("idle");
         setSaveError(String(err));
+        // PR #185 🔴-1: if a hotkey save failed, set_settings may have left
+        // the shortcut unregistered — restore whatever was registered before
+        // capture so it can't be left dead.
+        if (patch.hotkey !== undefined) {
+          resumeHotkey();
+        }
       }
     },
-    [settings],
+    [resumeHotkey],
   );
 
   // Issue #181: ends hotkey capture, optionally reverting the field's
   // displayed value, and restores the global shortcut when
   // `captureEndNeedsResume` says this end reason needs it.
-  const endCapture = useCallback((reason: CaptureEndReason, revertTo?: string) => {
-    setCapturing(false);
-    if (revertTo !== undefined) setHotkeyInput(revertTo);
-    if (captureEndNeedsResume(reason)) {
-      void invoke("resume_hotkey");
-    }
-  }, []);
+  const endCapture = useCallback(
+    (reason: CaptureEndReason, revertTo?: string) => {
+      setCapturing(false);
+      if (revertTo !== undefined) setHotkeyInput(revertTo);
+      if (captureEndNeedsResume(reason)) {
+        resumeHotkey();
+      }
+    },
+    [resumeHotkey],
+  );
 
   const beginCapture = useCallback(() => {
     setCapturing(true);
     setHotkeyError(null);
-    void invoke("suspend_hotkey");
-  }, []);
+    suspendHotkey();
+  }, [suspendHotkey]);
 
   const handleHotkeyBlur = useCallback(() => {
     // Only a genuine "lost focus mid-capture" needs a resume — a blur
@@ -229,9 +309,9 @@ export function GeneralTab() {
     // false by then) must not re-suspend/resume against a save that may
     // still be in flight.
     if (capturing) {
-      endCapture("blur", settings?.hotkey ?? hotkeyInput);
+      endCapture("blur", settingsRef.current?.hotkey ?? hotkeyInput);
     }
-  }, [capturing, settings, hotkeyInput, endCapture]);
+  }, [capturing, hotkeyInput, endCapture]);
 
   const handleHotkeyKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -242,7 +322,7 @@ export function GeneralTab() {
       e.preventDefault();
 
       if (e.key === "Escape") {
-        endCapture("escape", settings?.hotkey ?? hotkeyInput);
+        endCapture("escape", settingsRef.current?.hotkey ?? hotkeyInput);
         return;
       }
 
@@ -258,15 +338,23 @@ export function GeneralTab() {
       invoke("validate_hotkey", { accelerator: chord })
         .then(() => {
           setHotkeyError(null);
-          endCapture("committed");
-          void applySettingsChange({ hotkey: chord });
+          const changed = chord !== (settingsRef.current?.hotkey ?? "");
+          if (changed) {
+            // set_settings re-registers the new binding as part of the save.
+            void applySettingsChange({ hotkey: chord });
+          }
+          // PR #185 🔴-1(a): an unchanged committed chord re-registers
+          // nothing via set_settings, so resume the suspend ourselves.
+          if (captureEndNeedsResume("committed", changed)) {
+            resumeHotkey();
+          }
         })
         .catch((err) => {
           setHotkeyError(String(err));
           endCapture("invalid");
         });
     },
-    [capturing, settings, hotkeyInput, endCapture, applySettingsChange],
+    [capturing, hotkeyInput, endCapture, applySettingsChange, resumeHotkey],
   );
 
   if (!settings) {
