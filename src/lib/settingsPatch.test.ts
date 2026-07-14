@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Settings } from "./ipc";
-import { applySettingsPatch } from "./settingsPatch";
+import { applySettingsPatch, revertPatchedFields } from "./settingsPatch";
 
 const BASE_SETTINGS: Settings = {
   hotkey: "Control+Shift+Space",
@@ -41,5 +41,48 @@ describe("applySettingsPatch", () => {
     const withFileMode: Settings = { ...BASE_SETTINGS, output_mode: "File" };
     const next = applySettingsPatch(withFileMode, { hotkey: "Control+Shift+D" });
     expect(next.output_mode).toBe("File");
+  });
+});
+
+describe("revertPatchedFields", () => {
+  // PR #185 cycle-4 🔴-2: rolling back a failed auto-apply must restore ONLY
+  // the field(s) that apply patched (back to their pre-apply base values) —
+  // laid onto the CURRENT settings, so a concurrent out-of-band write (e.g. a
+  // tray-driven output-mode change that landed while the apply was in flight)
+  // survives the rollback instead of being clobbered by a blind revert-to-base.
+
+  it("restores only the patched field to its base value, keeping other current fields", () => {
+    const base: Settings = { ...BASE_SETTINGS, sound_cues: true };
+    // The apply optimistically set sound_cues=false; meanwhile output_mode
+    // changed out of band to File.
+    const current: Settings = { ...BASE_SETTINGS, sound_cues: false, output_mode: "File" };
+    const reverted = revertPatchedFields(current, base, { sound_cues: false });
+    // sound_cues reverts to base (true); the concurrent output_mode survives.
+    expect(reverted).toEqual({ ...BASE_SETTINGS, sound_cues: true, output_mode: "File" });
+  });
+
+  it("restores every patched key and no others", () => {
+    const base: Settings = { ...BASE_SETTINGS, launch_at_login: false, model_preset: "LargeV3Turbo" };
+    const current: Settings = {
+      ...BASE_SETTINGS,
+      launch_at_login: true,
+      model_preset: "Small",
+      output_mode: "File",
+    };
+    const reverted = revertPatchedFields(current, base, {
+      launch_at_login: true,
+      model_preset: "Small",
+    });
+    expect(reverted.launch_at_login).toBe(false);
+    expect(reverted.model_preset).toBe("LargeV3Turbo");
+    expect(reverted.output_mode).toBe("File"); // untouched concurrent change
+  });
+
+  it("does not mutate the inputs", () => {
+    const base: Settings = { ...BASE_SETTINGS };
+    const current: Settings = { ...BASE_SETTINGS, sound_cues: false };
+    const currentCopy = { ...current };
+    revertPatchedFields(current, base, { sound_cues: false });
+    expect(current).toEqual(currentCopy);
   });
 });
