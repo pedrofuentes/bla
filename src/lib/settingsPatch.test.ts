@@ -62,7 +62,11 @@ describe("revertPatchedFields", () => {
   });
 
   it("restores every patched key and no others", () => {
-    const base: Settings = { ...BASE_SETTINGS, launch_at_login: false, model_preset: "LargeV3Turbo" };
+    const base: Settings = {
+      ...BASE_SETTINGS,
+      launch_at_login: false,
+      model_preset: "LargeV3Turbo",
+    };
     const current: Settings = {
       ...BASE_SETTINGS,
       launch_at_login: true,

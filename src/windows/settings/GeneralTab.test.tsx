@@ -718,7 +718,6 @@ describe("GeneralTab", () => {
     );
   });
 
-
   it("resumes the global hotkey on unmount while a capture suspend is still outstanding", async () => {
     // PR #185 Sentinel 🔴-1(b): the React-unmount safety net (the window's
     // hide path is covered backend-side in lib.rs). Focusing suspends; if
