@@ -502,6 +502,169 @@ describe("GeneralTab", () => {
     expect(input.value).toMatch(/press a key/i);
   });
 
+  // -------------------------------------------------------------------
+  // PR #185 cycle-6 🔴: ALL global-shortcut operations (capture suspend,
+  // capture resume, and the Apply's register via set_settings) run through
+  // the ONE serial applyQueueRef, so they can never execute concurrently.
+  // These restore the cycle-4 TOCTOU regressions in the Apply-button shape.
+  // -------------------------------------------------------------------
+
+  it("does not start a new capture's suspend while a hotkey Apply is in flight", async () => {
+    // 🔴-1: a refocus during an in-flight Apply must NOT fire suspend_hotkey
+    // (unregister_all) concurrently with the Apply's register — the suspend
+    // is queued behind the Apply's set_settings.
+    let resolveSet: (() => void) | undefined;
+    setupInvoke({
+      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
+    await flush();
+
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    click(applyButton); // set_settings(hotkey D) in flight
+    await flush();
+
+    invoke.mockClear();
+    focus(input); // new capture → suspend must be queued behind the Apply
+    await flush();
+    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
+
+    resolveSet!(); // Apply's register completes → suspend now runs
+    await flush();
+    expect(invoke).toHaveBeenCalledWith(
+      "suspend_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+  });
+
+  it("keeps the hotkey registered across a commit→refocus interleave (persist lands, no concurrent suspend)", async () => {
+    // 🔴-1 (the cycle-4 TOCTOU, restored): the Apply's persist still lands and
+    // the refocus's suspend never runs concurrently with it.
+    let resolveSet: (() => void) | undefined;
+    setupInvoke({
+      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
+    await flush();
+
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    click(applyButton);
+    await flush();
+
+    invoke.mockClear();
+    focus(input); // interleave: try to start a new capture mid-Apply
+    await flush();
+    expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
+
+    resolveSet!();
+    await flush();
+    // The persist landed with the new chord…
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
+    // …and the refocus's suspend ran only AFTER the Apply's set_settings.
+    const setIdx = invoke.mock.calls.findIndex((c) => c[0] === "set_settings");
+    const suspendIdx = invoke.mock.calls.findIndex((c) => c[0] === "suspend_hotkey");
+    expect(suspendIdx).toBeGreaterThan(setIdx);
+  });
+
+  it("does not run the Apply's register concurrently with the capture-end resume", async () => {
+    // 🔴-2: capture-end resume_hotkey and the Apply's register are serialized —
+    // the Apply's set_settings waits behind the resume in the queue.
+    let resolveResume: (() => void) | undefined;
+    setupInvoke({
+      resume_hotkey: () => new Promise<void>((resolve) => (resolveResume = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    await flush();
+    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // capture-end resume enqueued (pending)
+    await flush();
+
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    click(applyButton); // set_settings enqueued BEHIND the resume
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+    // The register hasn't run — it's queued behind the resume.
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
+    resolveResume!(); // resume settles → register runs
+    await flush();
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
+  });
+
+  it("does not discard a newer captured chord when an earlier Apply resolves", async () => {
+    // PR #185 cycle-6 🟡: an in-flight Apply's success must not blindly clear a
+    // pending chord the user captured AFTER clicking Apply.
+    let resolveSet: (() => void) | undefined;
+    setupInvoke({
+      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input);
+    keydown(input, "D", { ctrlKey: true, shiftKey: true }); // pending D
+    await flush();
+
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+    click(applyButton); // Apply D in flight
+    await flush();
+
+    // Capture a NEWER chord before D's apply resolves.
+    focus(input);
+    keydown(input, "E", { ctrlKey: true, shiftKey: true }); // pending E
+    await flush();
+    expect(input.value).toBe("Control+Shift+E");
+
+    resolveSet!(); // D's apply succeeds
+    await flush();
+
+    // The newer pending E survives — not discarded by D's success.
+    expect(input.value).toBe("Control+Shift+E");
+    expect(mounted.container.querySelector('[data-testid="hotkey-pending"]')).not.toBeNull();
+  });
+
   it("times out a hung Apply, reverts, then reconciles from the backend on late success", async () => {
     // PR #185 🟡: a hung Apply times out into the revert path; if the backend
     // later SUCCEEDS, the UI reconciles from get_settings so it can't diverge
