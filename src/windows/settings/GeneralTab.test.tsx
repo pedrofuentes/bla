@@ -900,6 +900,9 @@ describe("GeneralTab", () => {
     invoke.mockClear();
     mounted.unmount();
     mounted = undefined;
+    // The cleanup now enqueues the resume onto the serial queue (#185) rather
+    // than firing it synchronously, so draining it takes a microtask tick.
+    await flush();
 
     expect(invoke).toHaveBeenCalledWith(
       "resume_hotkey",

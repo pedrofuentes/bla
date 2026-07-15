@@ -139,6 +139,16 @@ export function GeneralTab() {
   // state on an unmounted tree.
   const cancelledRef = useRef(false);
 
+  // Append `task` to the single serial queue (PR #185 cycle-6). `task` must
+  // never reject (the callers catch); the second arg keeps the chain draining
+  // even if a prior link somehow did. Declared BEFORE the mount effect so the
+  // effect's unmount cleanup can route its resume through the queue without a
+  // use-before-declare (React-Compiler immutability guard, #185).
+  const enqueue = useCallback((task: () => Promise<void>) => {
+    applyQueueRef.current = applyQueueRef.current.then(task, task);
+    return applyQueueRef.current;
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -240,20 +250,16 @@ export function GeneralTab() {
       const pendingGen = activeSuspendGenRef.current;
       if (pendingGen !== null) {
         activeSuspendGenRef.current = null;
-        void invoke("resume_hotkey", { generation: pendingGen }).catch(() => {
-          /* unmounting — nothing left to surface the error on */
-        });
+        void enqueue(() =>
+          invoke("resume_hotkey", { generation: pendingGen }).catch(() => {
+            /* unmounting — nothing left to surface the error on */
+          }),
+        );
       }
     };
-  }, []);
-
-  // Append `task` to the single serial queue (PR #185 cycle-6). `task` must
-  // never reject (the callers catch); the second arg keeps the chain draining
-  // even if a prior link somehow did.
-  const enqueue = useCallback((task: () => Promise<void>) => {
-    applyQueueRef.current = applyQueueRef.current.then(task, task);
-    return applyQueueRef.current;
-  }, []);
+    // `enqueue` is referentially stable (useCallback []), so listing it keeps
+    // this a mount-once effect while satisfying exhaustive-deps (#185).
+  }, [enqueue]);
 
   // Issue #181: unregister the global shortcut and mint a fresh generation as
   // the current outstanding suspend. Routed through the serial queue (🔴-1) so
