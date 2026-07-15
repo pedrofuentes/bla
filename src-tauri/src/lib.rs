@@ -621,6 +621,100 @@ mod mapping_tests {
         assert!(!should_resume_hotkey(0, 0));
         assert!(!should_resume_hotkey(5, 0));
     }
+
+    // PR #185 cycle-6 🟡: the register-before-persist-with-rollback control
+    // flow of `commands::set_settings`, extracted as a pure, injectable seam
+    // (register/persist/rollback closures) so the three failure/success paths
+    // are unit-testable without an AppState/Wry runtime (#165).
+    #[test]
+    fn set_settings_with_rollback_success_registers_then_persists_no_rollback() {
+        let mut registers: Vec<String> = vec![];
+        let mut persists = 0;
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            true,
+            "Old",
+            "New",
+            |h| {
+                registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(registers, vec!["New".to_string()]);
+        assert_eq!(persists, 1);
+        assert!(rollbacks.is_empty());
+    }
+
+    #[test]
+    fn set_settings_with_rollback_register_failure_restores_prior_and_never_persists() {
+        let mut persists = 0;
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            true,
+            "Old",
+            "New",
+            |_h| Err("register failed".to_string()),
+            || {
+                persists += 1;
+                Ok(())
+            },
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Err("register failed".to_string()));
+        assert_eq!(persists, 0);
+        assert_eq!(rollbacks, vec!["Old".to_string()]);
+    }
+
+    #[test]
+    fn set_settings_with_rollback_persist_failure_after_register_restores_prior() {
+        let mut registers: Vec<String> = vec![];
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            true,
+            "Old",
+            "New",
+            |h| {
+                registers.push(h.to_string());
+                Ok(())
+            },
+            || Err("disk full".to_string()),
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Err("disk full".to_string()));
+        assert_eq!(registers, vec!["New".to_string()]);
+        assert_eq!(rollbacks, vec!["Old".to_string()]);
+    }
+
+    #[test]
+    fn set_settings_with_rollback_unchanged_hotkey_only_persists() {
+        let mut registers: Vec<String> = vec![];
+        let mut persists = 0;
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            false,
+            "Old",
+            "Old",
+            |h| {
+                registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(registers.is_empty());
+        assert_eq!(persists, 1);
+        assert!(rollbacks.is_empty());
+    }
 }
 
 /// Loads persisted settings from the `tauri-plugin-store`-backed
