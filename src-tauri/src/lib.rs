@@ -800,6 +800,45 @@ fn should_resume_hotkey(current_gen: u64, requested_gen: u64) -> bool {
     requested_gen != 0 && current_gen == requested_gen
 }
 
+/// The pure register-before-persist-with-rollback control flow of
+/// `commands::set_settings` (PR #185 cycle-6 🟡 / #91). Extracted with the
+/// three effects injected as closures so it's unit-testable without an
+/// `AppState`/`Wry` runtime (#165):
+/// - `register(new)` binds the new hotkey to the OS (only when `hotkey_changed`);
+/// - `persist()` writes settings.json;
+/// - `rollback(prior)` restores the previously-registered hotkey.
+///
+/// Ordering guarantees #91: the new chord is registered BEFORE persisting, so
+/// a chord the OS won't bind fails without being written; and the OS binding
+/// and settings.json can never disagree — a failure at EITHER step rolls the
+/// OS back to `prior_hotkey` before returning `Err`.
+pub(crate) fn set_settings_with_rollback(
+    hotkey_changed: bool,
+    prior_hotkey: &str,
+    new_hotkey: &str,
+    mut register: impl FnMut(&str) -> Result<(), String>,
+    mut persist: impl FnMut() -> Result<(), String>,
+    mut rollback: impl FnMut(&str),
+) -> Result<(), String> {
+    if hotkey_changed {
+        if let Err(err) = register(new_hotkey) {
+            // The new chord won't bind (register unregisters first, so the OS
+            // is now unbound) — restore the prior binding and reject.
+            rollback(prior_hotkey);
+            return Err(err);
+        }
+    }
+    if let Err(err) = persist() {
+        // Persist failed AFTER a successful register — roll the OS binding
+        // back to the prior hotkey so it matches the (unchanged) settings.json.
+        if hotkey_changed {
+            rollback(prior_hotkey);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Backend safety net (PR #185 Sentinel 🔴-1(b)): force-restore the global
 /// dictation hotkey if a capture suspend is still outstanding. The settings
 /// window is *hidden* (not destroyed) on close, so React never unmounts and

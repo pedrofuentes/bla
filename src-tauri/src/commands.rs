@@ -12,9 +12,9 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
     apply_settings_to_state, is_settings_window, model_registry_entries, output_mode_toggle_label,
-    react_to_transition, register_hotkey, save_settings_to_store, should_resume_hotkey,
-    spec_for_preset, to_models_preset, to_tray_output_mode, unregister_hotkey, AppState,
-    ModelRegistryEntry,
+    react_to_transition, register_hotkey, save_settings_to_store, set_settings_with_rollback,
+    should_resume_hotkey, spec_for_preset, to_models_preset, to_tray_output_mode,
+    unregister_hotkey, AppState, ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -71,36 +71,38 @@ pub fn set_settings(
     // therefore does NOT touch the generation at all — dissolving the
     // two-writer TOCTOU that earlier cycles fought.
     //
-    // Rollback keeps the OS binding and settings.json in agreement on failure:
-    // capture the currently-registered (prior) hotkey, register the new one,
-    // then persist — and if EITHER the register or the persist fails, restore
-    // the prior binding before returning `Err`, so the OS is never left bound
-    // to NEW while settings.json still says OLD (or vice-versa).
+    // Rollback keeps the OS binding and settings.json in agreement on failure.
+    // The control flow (register-before-persist; roll the OS back to the prior
+    // hotkey if EITHER the register or the persist fails) is the pure,
+    // unit-tested `set_settings_with_rollback` seam (PR #185 cycle-6 🟡); this
+    // command only injects the three OS effects. #91: validate BEFORE binding
+    // so a malformed chord is rejected without touching the OS.
     let prior_hotkey = if hotkey_changed {
-        Some(state.settings.lock().unwrap().hotkey.clone())
+        state.settings.lock().unwrap().hotkey.clone()
     } else {
-        None
+        String::new()
     };
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
-        if let Err(err) = register_hotkey(&app, &settings.hotkey) {
-            // The new chord won't bind (register_hotkey unregisters first, so
-            // the OS is now unbound) — restore the prior binding and reject.
-            if let Some(prior) = &prior_hotkey {
-                let _ = register_hotkey(&app, prior);
+    }
+    set_settings_with_rollback(
+        hotkey_changed,
+        &prior_hotkey,
+        &settings.hotkey,
+        |h| register_hotkey(&app, h).map_err(|e| e.to_string()),
+        || save_settings_to_store(&app, &settings),
+        |prior| {
+            // PR #185 cycle-6 🟢: a failed RESTORE must not be invisible — the
+            // OS could be left unbound. Surface it (per this file's eprintln
+            // convention) instead of silently swallowing it.
+            if let Err(err) = register_hotkey(&app, prior) {
+                eprintln!(
+                    "bla: failed to restore prior hotkey {prior:?} after a set_settings rollback; \
+                     the global dictation shortcut may be unbound until restart: {err}"
+                );
             }
-            return Err(err.to_string());
-        }
-    }
-
-    if let Err(err) = save_settings_to_store(&app, &settings) {
-        // Persist failed AFTER a successful register — roll the OS binding
-        // back to the prior hotkey so it matches the (unchanged) settings.json.
-        if let Some(prior) = &prior_hotkey {
-            let _ = register_hotkey(&app, prior);
-        }
-        return Err(err);
-    }
+        },
+    )?;
 
     // Issue #126: thin OS glue over `tauri-plugin-autostart`'s
     // `AutoLaunchManager` — the decision of WHETHER to call this already
