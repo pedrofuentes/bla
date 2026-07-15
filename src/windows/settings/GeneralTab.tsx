@@ -111,12 +111,24 @@ export function GeneralTab() {
 
   // The latest known settings, read by each queued apply when it RUNS.
   const settingsRef = useRef<Settings | null>(null);
-  // Serial apply queue: chains applies so exactly one runs at a time.
+  // Serial queue for EVERY OS-shortcut operation — auto-applies AND the
+  // hotkey capture suspend/resume (PR #185 cycle-6 🔴): routing all of them
+  // through one chain means the capture's suspend/resume can never run
+  // concurrently with a hotkey Apply's register (they execute in enqueue
+  // order). Non-shortcut auto-applies (checkboxes, model) still enqueue here
+  // too, but they never touch the shortcut so they don't block capture.
   const applyQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // Bumped at the START of each queued apply; the late-reconcile uses it to
+  // skip overwriting `settingsRef` if a newer apply superseded (🟡).
+  const applyEpochRef = useRef(0);
   // The generation of the current outstanding hotkey-capture suspend (null
   // when not suspended) + the monotonic counter that mints them.
   const suspendGenCounterRef = useRef(0);
   const activeSuspendGenRef = useRef<number | null>(null);
+  // Monotonic id bumped whenever a NEW capture starts or a chord is captured,
+  // so an async handler (validate probe, apply success, reconcile) only clears
+  // pending state if no newer/distinct capture has happened since (🟡).
+  const captureSeqRef = useRef(0);
   // Synchronous mirror of `capturing` (state updates are async) so the blur
   // handler can tell a "still capturing → cancel" blur from the programmatic
   // blur we fire right after capturing a chord. Also the field ref used to
@@ -235,46 +247,73 @@ export function GeneralTab() {
     };
   }, []);
 
+  // Append `task` to the single serial queue (PR #185 cycle-6). `task` must
+  // never reject (the callers catch); the second arg keeps the chain draining
+  // even if a prior link somehow did.
+  const enqueue = useCallback((task: () => Promise<void>) => {
+    applyQueueRef.current = applyQueueRef.current.then(task, task);
+    return applyQueueRef.current;
+  }, []);
+
   // Issue #181: unregister the global shortcut and mint a fresh generation as
-  // the current outstanding suspend. Surfaces an OS rejection (guarded so a
-  // post-unmount rejection is a no-op).
+  // the current outstanding suspend. Routed through the serial queue (🔴-1) so
+  // its `unregister_all` can't race a hotkey Apply's register. The generation
+  // is claimed SYNCHRONOUSLY so a paired resume echoes it regardless of when
+  // the queued invoke runs.
   const suspendHotkey = useCallback(() => {
     const generation = ++suspendGenCounterRef.current;
     activeSuspendGenRef.current = generation;
-    void invoke("suspend_hotkey", { generation }).catch((err) => {
-      if (!cancelledRef.current) setSaveError(String(err));
-    });
-  }, []);
+    void enqueue(() =>
+      invoke("suspend_hotkey", { generation }).catch((err) => {
+        if (!cancelledRef.current) setSaveError(String(err));
+      }),
+    );
+  }, [enqueue]);
 
   // Issue #181: restore the shortcut, echoing the active suspend's generation
   // so the backend rejects it if a newer suspend superseded it. No-op if
-  // there's no outstanding suspend. This is the ONLY registrar during capture
-  // (Apply's set_settings is the registrar for a persisted change).
+  // there's no outstanding suspend. Routed through the serial queue (🔴-2) so
+  // it can't race a hotkey Apply's register.
   const resumeHotkey = useCallback(() => {
     const generation = activeSuspendGenRef.current;
     activeSuspendGenRef.current = null;
     if (generation === null) return;
-    void invoke("resume_hotkey", { generation }).catch((err) => {
-      if (!cancelledRef.current) setSaveError(String(err));
-    });
-  }, []);
+    void enqueue(() =>
+      invoke("resume_hotkey", { generation }).catch((err) => {
+        if (!cancelledRef.current) setSaveError(String(err));
+      }),
+    );
+  }, [enqueue]);
 
   // Resync UI state from persisted truth (PR #185 🟡): used when a timed-out
   // set_settings later SUCCEEDS on the backend, so the reverted UI can't
-  // diverge from what actually persisted.
-  const reconcileFromBackend = useCallback(() => {
-    invoke("get_settings")
-      .then((loaded) => {
+  // diverge from what actually persisted. Routed through the serial queue with
+  // a supersession guard so it never overwrites a newer apply's result, and it
+  // only clears the pending chord if no newer capture happened (`captureSeq`).
+  const reconcileFromBackend = useCallback(
+    (captureSeq: number) => {
+      void enqueue(async () => {
+        const epoch = applyEpochRef.current;
+        let loaded: Settings;
+        try {
+          loaded = await invoke("get_settings");
+        } catch (err) {
+          if (!cancelledRef.current) setSaveError(String(err));
+          return;
+        }
         if (cancelledRef.current) return;
+        // A newer apply ran while we fetched — its result is the truth now.
+        if (applyEpochRef.current !== epoch) return;
         settingsRef.current = loaded;
         setSettings(loaded);
-        setPendingHotkey(null);
-        setHotkeyError(null);
-      })
-      .catch((err) => {
-        if (!cancelledRef.current) setSaveError(String(err));
+        if (captureSeqRef.current === captureSeq) {
+          setPendingHotkey(null);
+          setHotkeyError(null);
+        }
       });
-  }, []);
+    },
+    [enqueue],
+  );
 
   // The body of one queued apply. Runs serially — reads `settingsRef` when it
   // STARTS (up to date, since no other apply overlaps), so on rejection it
@@ -282,6 +321,10 @@ export function GeneralTab() {
   // draining).
   const runApply = useCallback(
     async (patch: Partial<Settings>) => {
+      applyEpochRef.current += 1;
+      // The capture id this apply was scheduled against — used so a stale
+      // async success can't clear a chord captured AFTER this apply (🟡).
+      const hotkeyCaptureSeq = captureSeqRef.current;
       const base = settingsRef.current;
       if (!base) return;
       const next = applySettingsPatch(base, patch);
@@ -296,8 +339,10 @@ export function GeneralTab() {
         await withTimeout(setPromise, SET_SETTINGS_TIMEOUT_MS, SET_SETTINGS_TIMEOUT_MESSAGE);
         if (cancelledRef.current) return;
         setSaveStatus("saved");
-        // Applied: the pending hotkey (if any) is now the persisted current.
-        if (patch.hotkey !== undefined) {
+        // Applied: clear the pending hotkey (if any) — but ONLY if no newer
+        // capture happened since (🟡), so a chord the user captured after
+        // clicking Apply isn't discarded.
+        if (patch.hotkey !== undefined && captureSeqRef.current === hotkeyCaptureSeq) {
           setPendingHotkey(null);
           setHotkeyError(null);
         }
@@ -322,15 +367,16 @@ export function GeneralTab() {
         setSaveStatus("idle");
         const message = String(err);
         setSaveError(message);
-        // 🔴-2: revert only the field(s) THIS apply patched, onto the CURRENT
-        // settings — an out-of-band output-mode change survives.
+        // 🔴-2 (cycle-4): revert only the field(s) THIS apply patched, onto the
+        // CURRENT settings — an out-of-band output-mode change survives.
         const current = settingsRef.current ?? base;
         settingsRef.current = revertPatchedFields(current, base, patch);
         setSettings(settingsRef.current);
-        if (patch.hotkey !== undefined) {
+        if (patch.hotkey !== undefined && captureSeqRef.current === hotkeyCaptureSeq) {
           // The register-before-persist gate on the core side rolled the OS
           // binding back to the prior hotkey; drop the pending value and show
-          // the failure inline. The old hotkey stays bound.
+          // the failure inline. The old hotkey stays bound. (Skip if a newer
+          // capture already replaced the pending chord.)
           setPendingHotkey(null);
           setHotkeyError(message);
         }
@@ -339,7 +385,7 @@ export function GeneralTab() {
         if (err instanceof Error && err.message === SET_SETTINGS_TIMEOUT_MESSAGE) {
           setPromise.then(
             () => {
-              if (!cancelledRef.current) reconcileFromBackend();
+              if (!cancelledRef.current) reconcileFromBackend(hotkeyCaptureSeq);
             },
             () => {
               /* a genuine failure: the revert already reflects it */
@@ -354,14 +400,8 @@ export function GeneralTab() {
   // Issue #183: every auto-apply (and the hotkey Apply button) enqueues onto
   // the serial queue.
   const applySettingsChange = useCallback(
-    (patch: Partial<Settings>) => {
-      const task = () => runApply(patch);
-      // `task` never rejects (runApply catches), so the chain stays alive; the
-      // second arg keeps it draining even if a prior link somehow did.
-      applyQueueRef.current = applyQueueRef.current.then(task, task);
-      return applyQueueRef.current;
-    },
-    [runApply],
+    (patch: Partial<Settings>) => enqueue(() => runApply(patch)),
+    [enqueue, runApply],
   );
 
   // ---- Hotkey capture (keystroke grabbing only — never persists) ----
@@ -369,6 +409,7 @@ export function GeneralTab() {
   const beginCapture = useCallback(() => {
     if (capturingRef.current) return; // already capturing (e.g. ref.focus re-entry)
     capturingRef.current = true;
+    captureSeqRef.current += 1; // a new capture supersedes any in-flight clear
     setCapturing(true);
     setPendingHotkey(null);
     setHotkeyError(null);
@@ -415,6 +456,8 @@ export function GeneralTab() {
       // inline error + Apply-button enablement; the authoritative
       // validate+register happens on Apply's set_settings.
       capturingRef.current = false;
+      captureSeqRef.current += 1; // a distinct captured chord supersedes prior probes/clears
+      const seq = captureSeqRef.current;
       setCapturing(false);
       setPendingHotkey(chord);
       resumeHotkey();
@@ -425,10 +468,11 @@ export function GeneralTab() {
         VALIDATE_TIMEOUT_MESSAGE,
       )
         .then(() => {
-          if (!cancelledRef.current) setHotkeyError(null);
+          // Only for THIS captured chord — a newer capture owns the error now.
+          if (!cancelledRef.current && captureSeqRef.current === seq) setHotkeyError(null);
         })
         .catch((err) => {
-          if (!cancelledRef.current) setHotkeyError(String(err));
+          if (!cancelledRef.current && captureSeqRef.current === seq) setHotkeyError(String(err));
         });
     },
     [cancelCapture, resumeHotkey],

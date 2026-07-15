@@ -570,22 +570,24 @@ describe("GeneralTab", () => {
     )!;
     click(applyButton);
     await flush();
+    // The Apply's persist is enqueued/in-flight with the new chord.
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
 
     invoke.mockClear();
     focus(input); // interleave: try to start a new capture mid-Apply
     await flush();
+    // The refocus's suspend is queued behind the Apply — never concurrent.
     expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
 
     resolveSet!();
     await flush();
-    // The persist landed with the new chord…
-    expect(invoke).toHaveBeenCalledWith("set_settings", {
-      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
-    });
-    // …and the refocus's suspend ran only AFTER the Apply's set_settings.
-    const setIdx = invoke.mock.calls.findIndex((c) => c[0] === "set_settings");
-    const suspendIdx = invoke.mock.calls.findIndex((c) => c[0] === "suspend_hotkey");
-    expect(suspendIdx).toBeGreaterThan(setIdx);
+    // Only after the Apply's set_settings settles does the suspend run.
+    expect(invoke).toHaveBeenCalledWith(
+      "suspend_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
   });
 
   it("does not run the Apply's register concurrently with the capture-end resume", async () => {
