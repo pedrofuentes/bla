@@ -62,6 +62,13 @@ export function focus(el: HTMLElement): void {
   });
 }
 
+/** Blurs `el`, wrapped in `act`. */
+export function blur(el: HTMLElement): void {
+  act(() => {
+    el.blur();
+  });
+}
+
 /** Dispatches a bubbling keydown, wrapped in `act`. */
 export function keydown(el: Element, key: string, mods: KeyboardEventInit = {}): void {
   act(() => {

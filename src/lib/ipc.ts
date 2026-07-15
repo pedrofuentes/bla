@@ -49,6 +49,17 @@ export interface DownloadProgress {
 export type DownloadStartResult = "already-present" | "downloading";
 
 /**
+ * Mirrors `ModelRegistryEntry` (src-tauri/src/lib.rs) — one entry of
+ * `commands::model_registry`'s per-preset size data (issue #184), used by
+ * the settings model picker to render e.g. "Small — 488 MB" via
+ * `formatBytes`.
+ */
+export interface ModelRegistryEntry {
+  preset: ModelPreset;
+  size_bytes: number;
+}
+
+/**
  * Mirrors `errors::PipelineErrorEvent` (src-tauri/src/errors.rs) — the
  * `pipeline-error` event payload. `kind` is one of `errors::ErrorKind`'s
  * discriminants (`"ModelMissing" | "OllamaUnreachable" |
@@ -74,6 +85,17 @@ export interface Commands {
   /** Mirrors `commands::validate_hotkey` — thin wrapper over `hotkeys::validate_hotkey`. */
   validate_hotkey: { args: { accelerator: string }; result: void };
   download_selected_model: { result: DownloadStartResult };
+  /** Mirrors `commands::model_registry` (issue #184). */
+  model_registry: { result: ModelRegistryEntry[] };
+  /**
+   * Mirrors `commands::suspend_hotkey` (issue #181). `generation` is a
+   * monotonic token minted by this window and echoed back on `resume_hotkey`
+   * so an out-of-order resume can't re-enable the shortcut during a newer
+   * capture (PR #185). See `GeneralTab.tsx`'s concurrency-model doc comment.
+   */
+  suspend_hotkey: { args: { generation: number }; result: void };
+  /** Mirrors `commands::resume_hotkey` (issue #181) — see `GeneralTab.tsx`. */
+  resume_hotkey: { args: { generation: number }; result: void };
 }
 
 /**
@@ -123,6 +145,14 @@ export interface Events {
    * leave the core as an event.
    */
   "audio-level": number;
+  /**
+   * PR #185 Sentinel delta 🟡-3: the settings window was hidden (not
+   * destroyed) while its hotkey-capture field was mid-capture. The backend
+   * force-restores the OS shortcut on close and emits this so the field
+   * leaves capture mode instead of staying stuck (`capturing === true`,
+   * swallowing keys) when the window is reopened. Unit payload (`null`).
+   */
+  "hotkey-capture-reset": null;
   /**
    * A typed pipeline error/notice (issue #126, M2 PR 2.4) — emitted from
    * `lib.rs`'s capture-start failure, `run_pipeline_in_background`'s error

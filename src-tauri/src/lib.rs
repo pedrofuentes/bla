@@ -32,6 +32,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -141,6 +142,14 @@ pub(crate) struct AppState {
     /// instead of hiding the pill out from under the second one's own still-
     /// live visible window.
     pill_visibility_epoch: AtomicU64,
+    /// PR #185 Sentinel 🔴-1: the generation of the latest outstanding
+    /// hotkey-capture suspend (`commands::suspend_hotkey`), or `0` when the
+    /// global dictation hotkey is not suspended. A monotonic token minted by
+    /// the settings window and echoed back on `commands::resume_hotkey` so
+    /// out-of-order IPC can't clobber a live capture (see
+    /// [`should_resume_hotkey`]); `force_resume_hotkey` resets it to `0` when
+    /// it restores the shortcut on window close.
+    hotkey_suspend_gen: Mutex<u64>,
     /// Issue #115: the cached Whisper engine, so it's loaded from disk (a
     /// ~574 MB read for the default preset) at most once per selected
     /// preset rather than on every dictation. `None` until the first build
@@ -260,6 +269,43 @@ fn spec_for_preset(preset: models::ModelPreset) -> models::ModelSpec {
         .into_iter()
         .find(|spec| spec.preset == preset)
         .expect("model_registry() covers every ModelPreset variant")
+}
+
+/// Translate the models downloader's registry [`models::ModelPreset`] back
+/// to the persisted [`settings::ModelPreset`] — the inverse of
+/// [`to_models_preset`], used by [`model_registry_entries`] to key each
+/// entry the same way `Settings.model_preset` already is on the frontend.
+fn to_settings_preset(preset: models::ModelPreset) -> settings::ModelPreset {
+    match preset {
+        models::ModelPreset::LargeV3TurboQ5 => settings::ModelPreset::LargeV3Turbo,
+        models::ModelPreset::Small => settings::ModelPreset::Small,
+    }
+}
+
+/// One entry of the model picker's registry, mirrored to the frontend via
+/// `commands::model_registry` (issue #184): a settings-safe preset id plus
+/// its exact download size in bytes, so the UI can render e.g. "Small — 488
+/// MB" using its own `formatBytes`/`modelPresetLabel` rather than
+/// duplicating that formatting on the Rust side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ModelRegistryEntry {
+    pub preset: settings::ModelPreset,
+    pub size_bytes: u64,
+}
+
+/// Pure data behind `commands::model_registry` (issue #184): every
+/// supported preset's settings-safe id and exact download size, sourced
+/// from `models::model_registry()` — the single source of truth for
+/// `size_bytes` — and translated so the frontend can key each entry
+/// directly against `Settings.model_preset`.
+pub(crate) fn model_registry_entries() -> Vec<ModelRegistryEntry> {
+    models::model_registry()
+        .into_iter()
+        .map(|spec| ModelRegistryEntry {
+            preset: to_settings_preset(spec.preset),
+            size_bytes: spec.size_bytes,
+        })
+        .collect()
 }
 
 /// Label for the tray menu's output-mode toggle line (issue #110): names
@@ -513,6 +559,162 @@ mod mapping_tests {
             assert_eq!(spec.preset, preset);
         }
     }
+
+    // Issue #184: `commands::model_registry`'s pure data source — every
+    // preset's settings-safe id plus its exact download size, so the
+    // frontend model picker can render "Small — 488 MB" without duplicating
+    // `models::ModelSpec.size_bytes` anywhere.
+    #[test]
+    fn model_registry_entries_covers_every_preset_with_its_exact_size() {
+        let entries = model_registry_entries();
+        assert_eq!(entries.len(), 2);
+
+        let large = entries
+            .iter()
+            .find(|e| e.preset == settings::ModelPreset::LargeV3Turbo)
+            .expect("LargeV3Turbo entry present");
+        assert_eq!(large.size_bytes, 574_041_195);
+
+        let small = entries
+            .iter()
+            .find(|e| e.preset == settings::ModelPreset::Small)
+            .expect("Small entry present");
+        assert_eq!(small.size_bytes, 487_601_967);
+    }
+
+    #[test]
+    fn settings_preset_mapping_round_trips_every_variant() {
+        assert_eq!(
+            to_settings_preset(models::ModelPreset::LargeV3TurboQ5),
+            settings::ModelPreset::LargeV3Turbo
+        );
+        assert_eq!(
+            to_settings_preset(models::ModelPreset::Small),
+            settings::ModelPreset::Small
+        );
+    }
+
+    // PR #185 Sentinel 🟡-4: suspend_hotkey/resume_hotkey are in the global
+    // invoke_handler, so any window's webview can call them. Only the
+    // settings window is allowed to suspend/resume the recording trigger —
+    // this pure predicate is the gate each command checks against
+    // `window.label()`.
+    #[test]
+    fn is_settings_window_only_accepts_the_settings_label() {
+        assert!(is_settings_window(SETTINGS_WINDOW_LABEL));
+        assert!(!is_settings_window("main"));
+        assert!(!is_settings_window("pill"));
+        assert!(!is_settings_window(""));
+    }
+
+    // PR #185 Sentinel 🔴-1(iii): a monotonic generation token makes
+    // suspend/resume idempotent under out-of-order IPC. A resume only
+    // restores the hotkey when its generation is still the latest suspend's
+    // — a stale resume (superseded by a newer suspend) or the zero sentinel
+    // (no suspend active) must be a no-op so it can't clobber a live capture.
+    #[test]
+    fn should_resume_hotkey_only_when_the_generation_is_the_current_suspend() {
+        assert!(should_resume_hotkey(5, 5));
+        // A stale resume from a capture superseded by a newer suspend.
+        assert!(!should_resume_hotkey(6, 5));
+        // The zero sentinel means "not suspended" — never resume.
+        assert!(!should_resume_hotkey(0, 0));
+        assert!(!should_resume_hotkey(5, 0));
+    }
+
+    // PR #185 cycle-6 🟡: the register-before-persist-with-rollback control
+    // flow of `commands::set_settings`, extracted as a pure, injectable seam
+    // (register/persist/rollback closures) so the three failure/success paths
+    // are unit-testable without an AppState/Wry runtime (#165).
+    #[test]
+    fn set_settings_with_rollback_success_registers_then_persists_no_rollback() {
+        let mut registers: Vec<String> = vec![];
+        let mut persists = 0;
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            true,
+            "Old",
+            "New",
+            |h| {
+                registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(registers, vec!["New".to_string()]);
+        assert_eq!(persists, 1);
+        assert!(rollbacks.is_empty());
+    }
+
+    #[test]
+    fn set_settings_with_rollback_register_failure_restores_prior_and_never_persists() {
+        let mut persists = 0;
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            true,
+            "Old",
+            "New",
+            |_h| Err("register failed".to_string()),
+            || {
+                persists += 1;
+                Ok(())
+            },
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Err("register failed".to_string()));
+        assert_eq!(persists, 0);
+        assert_eq!(rollbacks, vec!["Old".to_string()]);
+    }
+
+    #[test]
+    fn set_settings_with_rollback_persist_failure_after_register_restores_prior() {
+        let mut registers: Vec<String> = vec![];
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            true,
+            "Old",
+            "New",
+            |h| {
+                registers.push(h.to_string());
+                Ok(())
+            },
+            || Err("disk full".to_string()),
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Err("disk full".to_string()));
+        assert_eq!(registers, vec!["New".to_string()]);
+        assert_eq!(rollbacks, vec!["Old".to_string()]);
+    }
+
+    #[test]
+    fn set_settings_with_rollback_unchanged_hotkey_only_persists() {
+        let mut registers: Vec<String> = vec![];
+        let mut persists = 0;
+        let mut rollbacks: Vec<String> = vec![];
+        let result = set_settings_with_rollback(
+            false,
+            "Old",
+            "Old",
+            |h| {
+                registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+            |h| rollbacks.push(h.to_string()),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(registers.is_empty());
+        assert_eq!(persists, 1);
+        assert!(rollbacks.is_empty());
+    }
 }
 
 /// Loads persisted settings from the `tauri-plugin-store`-backed
@@ -565,6 +767,96 @@ fn register_hotkey(
         };
         handle_key_event(&handler_handle, key_event);
     })
+}
+
+/// Unregisters the global dictation hotkey without registering a new one
+/// (issue #181, `commands::suspend_hotkey`) — called while the settings
+/// window's hotkey-capture field is active so keypresses are captured for
+/// rebinding instead of also triggering a dictation via the still-live
+/// shortcut. [`register_hotkey`]/`commands::resume_hotkey` re-register when
+/// capture ends.
+fn unregister_hotkey(app: &tauri::AppHandle) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    app.global_shortcut().unregister_all()
+}
+
+/// Whether a window `label` is allowed to suspend/resume the global
+/// dictation hotkey (PR #185 Sentinel 🟡-4). Both commands live in the
+/// global `invoke_handler`, so without this gate any window's webview could
+/// call an unpaired `suspend_hotkey` and DoS the recording trigger — only
+/// the settings window (whose hotkey-capture field is the sole legitimate
+/// caller) may. Pure and window-runtime-free so it's unit-testable.
+fn is_settings_window(label: &str) -> bool {
+    label == SETTINGS_WINDOW_LABEL
+}
+
+/// Whether a `resume_hotkey` carrying `requested_gen` should actually
+/// re-register the shortcut, given the latest suspend's `current_gen` (PR
+/// #185 Sentinel 🔴-1(iii)). A monotonic generation token makes suspend/
+/// resume idempotent under out-of-order IPC: a resume only acts when its
+/// generation is still the current suspend's, so a stale resume (its
+/// suspend already superseded by a newer one) or the zero sentinel (no
+/// suspend outstanding) is a no-op and can't clobber a live capture. Pure.
+fn should_resume_hotkey(current_gen: u64, requested_gen: u64) -> bool {
+    requested_gen != 0 && current_gen == requested_gen
+}
+
+/// The pure register-before-persist-with-rollback control flow of
+/// `commands::set_settings` (PR #185 cycle-6 🟡 / #91). Extracted with the
+/// three effects injected as closures so it's unit-testable without an
+/// `AppState`/`Wry` runtime (#165):
+/// - `register(new)` binds the new hotkey to the OS (only when `hotkey_changed`);
+/// - `persist()` writes settings.json;
+/// - `rollback(prior)` restores the previously-registered hotkey.
+///
+/// Ordering guarantees #91: the new chord is registered BEFORE persisting, so
+/// a chord the OS won't bind fails without being written; and the OS binding
+/// and settings.json can never disagree — a failure at EITHER step rolls the
+/// OS back to `prior_hotkey` before returning `Err`.
+pub(crate) fn set_settings_with_rollback(
+    hotkey_changed: bool,
+    prior_hotkey: &str,
+    new_hotkey: &str,
+    mut register: impl FnMut(&str) -> Result<(), String>,
+    mut persist: impl FnMut() -> Result<(), String>,
+    mut rollback: impl FnMut(&str),
+) -> Result<(), String> {
+    if hotkey_changed {
+        if let Err(err) = register(new_hotkey) {
+            // The new chord won't bind (register unregisters first, so the OS
+            // is now unbound) — restore the prior binding and reject.
+            rollback(prior_hotkey);
+            return Err(err);
+        }
+    }
+    if let Err(err) = persist() {
+        // Persist failed AFTER a successful register — roll the OS binding
+        // back to the prior hotkey so it matches the (unchanged) settings.json.
+        if hotkey_changed {
+            rollback(prior_hotkey);
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Backend safety net (PR #185 Sentinel 🔴-1(b)): force-restore the global
+/// dictation hotkey if a capture suspend is still outstanding. The settings
+/// window is *hidden* (not destroyed) on close, so React never unmounts and
+/// a suspend from its hotkey-capture field would otherwise leave the global
+/// shortcut dead until app restart. Called from the settings window's
+/// close/hide handler. Idempotent — a no-op unless currently suspended
+/// (generation != 0), and it clears the generation so any later stale
+/// frontend resume is ignored by [`should_resume_hotkey`].
+fn force_resume_hotkey(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let hotkey = state.settings.lock().unwrap().hotkey.clone();
+    let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
+    if *gen_slot != 0 {
+        if let Err(err) = register_hotkey(app, &hotkey) {
+            eprintln!("bla: failed to restore global hotkey on settings-window close: {err}");
+        }
+        *gen_slot = 0;
+    }
 }
 
 /// Monotonic timestamp for the hotkey state machine: an opaque duration
@@ -1339,6 +1631,9 @@ pub fn run() {
             commands::set_output_mode,
             commands::validate_hotkey,
             commands::download_selected_model,
+            commands::model_registry,
+            commands::suspend_hotkey,
+            commands::resume_hotkey,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1431,6 +1726,7 @@ pub fn run() {
                 tray_state_item: Mutex::new(Some(tray_state_item)),
                 tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
                 pill_visibility_epoch: AtomicU64::new(0),
+                hotkey_suspend_gen: Mutex::new(0),
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
             };
@@ -1491,6 +1787,17 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
+                        // PR #185 Sentinel 🔴-1(b): the window hides (not
+                        // destroys), so React never unmounts — if the
+                        // hotkey-capture field had suspended the global
+                        // shortcut, restore it here or it stays dead until
+                        // app restart.
+                        force_resume_hotkey(&close_handle);
+                        // PR #185 Sentinel delta 🟡-3: tell the (still-alive)
+                        // settings webview to leave capture mode, so a field
+                        // that was mid-capture at close isn't stuck swallowing
+                        // keys when the window is reopened.
+                        let _ = close_handle.emit("hotkey-capture-reset", ());
                         if let Some(window) = close_handle.get_webview_window(SETTINGS_WINDOW_LABEL)
                         {
                             let _ = window.hide();

@@ -11,8 +11,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
-    apply_settings_to_state, output_mode_toggle_label, react_to_transition, register_hotkey,
-    save_settings_to_store, spec_for_preset, to_models_preset, to_tray_output_mode, AppState,
+    apply_settings_to_state, is_settings_window, model_registry_entries, output_mode_toggle_label,
+    react_to_transition, register_hotkey, save_settings_to_store, set_settings_with_rollback,
+    should_resume_hotkey, spec_for_preset, to_models_preset, to_tray_output_mode,
+    unregister_hotkey, AppState, ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -53,19 +55,54 @@ pub fn set_settings(
         )
     };
 
-    // Issue #91 (Sentinel 🔴): validate + register the new hotkey BEFORE
-    // persisting anything. A malformed/unregistrable hotkey is rejected at
-    // the IPC boundary (returns Err to the caller) and NEVER written to
-    // settings.json — a persisted bad hotkey would brick the next launch.
-    // `validate_hotkey` is the pure, unit-tested parse; `register_hotkey`
-    // uses the same parser, so a value that validates is the value that
-    // registers. Persisting happens only after both succeed.
+    // Issue #91 (Sentinel 🔴) — register-before-persist WITH rollback. A
+    // changed hotkey is validated AND actually bound to the OS BEFORE anything
+    // is persisted: a chord that parses but the OS refuses to register
+    // (already claimed by another app, or OS-reserved — a real failure mode on
+    // Windows; macOS's registrar returns Ok) is rejected here and NEVER
+    // written to settings.json, so it can't brick dictation across the next
+    // launch.
+    //
+    // PR #185 cycle-5 (#187, cofounder decision): the hotkey field now uses an
+    // explicit Apply button — capture (suspend/resume) fully ENDS and restores
+    // the prior binding before Apply's `set_settings` runs, so this command is
+    // the sole registrar of a persisted hotkey change and `hotkey_suspend_gen`
+    // is owned entirely by suspend/resume for the capture window. `set_settings`
+    // therefore does NOT touch the generation at all — dissolving the
+    // two-writer TOCTOU that earlier cycles fought.
+    //
+    // Rollback keeps the OS binding and settings.json in agreement on failure.
+    // The control flow (register-before-persist; roll the OS back to the prior
+    // hotkey if EITHER the register or the persist fails) is the pure,
+    // unit-tested `set_settings_with_rollback` seam (PR #185 cycle-6 🟡); this
+    // command only injects the three OS effects. #91: validate BEFORE binding
+    // so a malformed chord is rejected without touching the OS.
+    let prior_hotkey = if hotkey_changed {
+        state.settings.lock().unwrap().hotkey.clone()
+    } else {
+        String::new()
+    };
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
-        register_hotkey(&app, &settings.hotkey).map_err(|e| e.to_string())?;
     }
-
-    save_settings_to_store(&app, &settings)?;
+    set_settings_with_rollback(
+        hotkey_changed,
+        &prior_hotkey,
+        &settings.hotkey,
+        |h| register_hotkey(&app, h).map_err(|e| e.to_string()),
+        || save_settings_to_store(&app, &settings),
+        |prior| {
+            // PR #185 cycle-6 🟢: a failed RESTORE must not be invisible — the
+            // OS could be left unbound. Surface it (per this file's eprintln
+            // convention) instead of silently swallowing it.
+            if let Err(err) = register_hotkey(&app, prior) {
+                eprintln!(
+                    "bla: failed to restore prior hotkey {prior:?} after a set_settings rollback; \
+                     the global dictation shortcut may be unbound until restart: {err}"
+                );
+            }
+        },
+    )?;
 
     // Issue #126: thin OS glue over `tauri-plugin-autostart`'s
     // `AutoLaunchManager` — the decision of WHETHER to call this already
@@ -200,4 +237,72 @@ pub fn download_selected_model(
     });
 
     Ok("downloading".to_string())
+}
+
+/// Every supported Whisper model preset's settings-safe id and exact
+/// download size in bytes (issue #184), for the settings window's model
+/// picker to render e.g. "Small — 488 MB" — thin wrapper over the pure,
+/// unit-tested [`model_registry_entries`].
+#[tauri::command]
+pub fn model_registry() -> Vec<ModelRegistryEntry> {
+    model_registry_entries()
+}
+
+/// Temporarily unregisters the global dictation hotkey (issue #181): called
+/// when the settings window's hotkey-capture field gains focus, so the
+/// still-live shortcut doesn't fire a dictation while the user is pressing
+/// keys meant to be captured into the field instead. Paired with
+/// [`resume_hotkey`], which the field calls on every way capture can end.
+///
+/// `generation` is a monotonic token minted by the calling window (PR #185
+/// Sentinel 🔴-1(iii)): it's stored as the latest outstanding suspend so
+/// [`resume_hotkey`] can reject a stale, out-of-order resume. Rejected
+/// unless invoked from the settings window (🟡-4) — the commands are in the
+/// global `invoke_handler`, so an unpaired suspend from any other webview
+/// would otherwise DoS the recording trigger.
+#[tauri::command]
+pub fn suspend_hotkey(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<(), String> {
+    if !is_settings_window(window.label()) {
+        return Err("suspend_hotkey is only callable from the settings window".to_string());
+    }
+    unregister_hotkey(window.app_handle()).map_err(|e| e.to_string())?;
+    *state.hotkey_suspend_gen.lock().unwrap() = generation;
+    Ok(())
+}
+
+/// Re-registers the current (persisted) hotkey as the global dictation
+/// shortcut (issue #181) — called whenever hotkey capture ends without a
+/// newly-committed *changed* chord already re-registering it via
+/// `set_settings` (Escape, blur mid-capture, an invalid chord, or a
+/// committed chord equal to the current hotkey; see
+/// `src/lib/hotkeyCapture.ts`'s `captureEndNeedsResume`). Reads the hotkey
+/// from live state rather than taking one as an argument so a cancelled/
+/// invalid capture always restores whatever was actually registered before
+/// capture began, never a not-yet-persisted candidate.
+///
+/// Only re-registers when `generation` is still the latest outstanding
+/// suspend ([`should_resume_hotkey`], PR #185 Sentinel 🔴-1(iii)) so an
+/// out-of-order resume can't re-enable the shortcut during a newer capture;
+/// clears the generation once it does, so a duplicate resume is a no-op.
+/// Rejected unless invoked from the settings window (🟡-4).
+#[tauri::command]
+pub fn resume_hotkey(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    generation: u64,
+) -> Result<(), String> {
+    if !is_settings_window(window.label()) {
+        return Err("resume_hotkey is only callable from the settings window".to_string());
+    }
+    let hotkey = state.settings.lock().unwrap().hotkey.clone();
+    let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
+    if should_resume_hotkey(*gen_slot, generation) {
+        register_hotkey(window.app_handle(), &hotkey).map_err(|e| e.to_string())?;
+        *gen_slot = 0;
+    }
+    Ok(())
 }
