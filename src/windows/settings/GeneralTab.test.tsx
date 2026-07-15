@@ -907,6 +907,50 @@ describe("GeneralTab", () => {
     );
   });
 
+  it("enqueues the unmount-cleanup resume behind an in-flight capture suspend instead of racing it (#185)", async () => {
+    // Sentinel final review (#185): the unmount cleanup called resume_hotkey
+    // DIRECTLY, bypassing the serial queue — on macOS/WebKit a settings
+    // tab-switch unmounts GeneralTab (the window stays open, so the backend
+    // close-net never fires), and the direct resume could race a still
+    // in-flight suspend_hotkey from the capture that was live at unmount,
+    // leaving the global hotkey dead. The resume must be queued behind the
+    // suspend, not fired ahead of it.
+    let resolveSuspend: (() => void) | undefined;
+    setupInvoke({
+      suspend_hotkey: () => new Promise<void>((resolve) => (resolveSuspend = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    focus(input); // begins capture: suspend_hotkey enqueued, still in flight
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith(
+      "suspend_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+
+    invoke.mockClear();
+    mounted.unmount();
+    mounted = undefined;
+    await flush();
+
+    // The suspend is still in flight — the unmount's resume must be queued
+    // behind it, not dispatched directly ahead of it.
+    expect(invoke).not.toHaveBeenCalledWith("resume_hotkey", expect.anything());
+
+    resolveSuspend!(); // suspend settles → the queued resume now runs
+    await flush();
+    expect(invoke).toHaveBeenCalledWith(
+      "resume_hotkey",
+      expect.objectContaining({ generation: expect.any(Number) }),
+    );
+  });
+
   it("surfaces a resume_hotkey failure as a save error instead of swallowing it", async () => {
     // PR #185 Sentinel 🟡-3: a fire-and-forget resume that rejects would
     // otherwise leave the hotkey dead silently.
