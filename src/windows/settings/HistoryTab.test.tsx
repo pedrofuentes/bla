@@ -146,6 +146,46 @@ describe("HistoryTab (AC-32: search render + re-query)", () => {
     expect(mounted.container.querySelector('[data-testid="history-row-2"]')).not.toBeNull();
     expect(mounted.container.querySelector('[data-testid="history-row-1"]')).toBeNull();
   });
+
+  it("keeps the newest search result when an older response resolves after a newer one (#225, searchSeqRef guard)", async () => {
+    const resolvers: Array<(rows: HistoryRow[]) => void> = [];
+    setupInvoke({
+      search_history: () =>
+        new Promise<HistoryRow[]>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    });
+
+    mounted = mount(<HistoryTab />);
+    await flush();
+    // resolvers[0] is the mount-time search for query "". Settle it so the
+    // panel reaches its normal ready state before we drive the race below.
+    resolvers[0]([]);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="history-search-input"]',
+    )!;
+    // Two keystrokes issue two overlapping `search_history` calls:
+    // resolvers[1] for the OLDER query ("a"), resolvers[2] for the NEWER
+    // one ("al"). Neither has resolved yet — both are still in flight.
+    typeInto(input, "a");
+    typeInto(input, "al");
+    await flush();
+    expect(resolvers.length).toBe(3);
+
+    // Resolve OUT OF ORDER: the newer query's response lands first...
+    resolvers[2]([ROW_A]);
+    await flush();
+    // ...then the older, now-stale query's response arrives late. Without
+    // the searchSeqRef guard this stale response would clobber the newer
+    // one that already rendered.
+    resolvers[1]([ROW_B]);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="history-row-1"]')).not.toBeNull();
+    expect(mounted.container.querySelector('[data-testid="history-row-2"]')).toBeNull();
+  });
 });
 
 describe("HistoryTab (AC-33: copy/delete)", () => {
@@ -241,12 +281,62 @@ describe("HistoryTab (AC-34: retention-days round trip)", () => {
     )!;
     focus(input);
     typeInto(input, "30");
+    await flush();
+
+    // #224: typing alone (pre-blur) must not commit — this control is
+    // blur-commit, matching GeneralTab's file-mode fields (#209), not
+    // per-keystroke. The `await flush()` above is load-bearing: without
+    // it, this assertion would pass vacuously (no microtask has run yet)
+    // regardless of whether the guard exists.
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
     blur(input);
     await flush();
 
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, retention_days: 30 },
     });
+  });
+
+  it("reverts to the prior retention value and surfaces an inline error when set_settings rejects (#226)", async () => {
+    setupInvoke({
+      get_settings: () => ({ ...BASE_SETTINGS, retention_days: 14 }),
+      set_settings: () => Promise.reject(new Error("disk full")),
+    });
+
+    mounted = mount(<HistoryTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="history-retention-input"]',
+    )!;
+    expect(input.value).toBe("14");
+
+    focus(input);
+    typeInto(input, "30");
+    blur(input);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, retention_days: 30 },
+    });
+    // Reverted to the last known-persisted value rather than left stuck on
+    // the never-persisted "30".
+    expect(input.value).toBe("14");
+    expect(mounted.container.querySelector('[data-testid="history-retention-saved"]')).toBeNull();
+    const error = mounted.container.querySelector('[data-testid="history-retention-error"]');
+    expect(error).not.toBeNull();
+    expect(error?.textContent).toMatch(/disk full/i);
+
+    // A later, unrelated blur-commit (no draft change) must not re-attempt
+    // the rejected write — commitRetention's early-return-if-unchanged
+    // guard compares against the reverted `settingsRef.current`, not the
+    // stale pre-revert value.
+    invoke.mockClear();
+    focus(input);
+    blur(input);
+    await flush();
+    expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
   });
 
   it("round-trips the retention value across a simulated reload", async () => {
