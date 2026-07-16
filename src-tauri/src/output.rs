@@ -847,7 +847,10 @@ mod tests {
     #[test]
     fn resolve_base_dir_falls_back_to_app_data_dir_when_unset() {
         let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
-        assert_eq!(resolve_base_dir("", app_data_dir), app_data_dir.to_path_buf());
+        assert_eq!(
+            resolve_base_dir("", app_data_dir),
+            app_data_dir.to_path_buf()
+        );
     }
 
     #[test]

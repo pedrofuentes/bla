@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn pre_180_settings_json_without_file_base_dir_still_deserializes_with_a_default_empty_string()
-     {
+    {
         // Mirrors a real settings.json written by a pre-#180 build: every
         // field earlier M2 PRs introduced, but no `file_base_dir`.
         let old_json = r#"{
@@ -411,7 +411,10 @@ mod tests {
 
         let restored = from_json(old_json).unwrap();
 
-        assert_eq!(restored.file_path_template, "journal/{{date:YYYY-MM-DD}}.md");
+        assert_eq!(
+            restored.file_path_template,
+            "journal/{{date:YYYY-MM-DD}}.md"
+        );
         assert_eq!(restored.file_base_dir, Settings::default().file_base_dir);
     }
 
