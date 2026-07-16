@@ -207,7 +207,42 @@ pub fn clamp_level(level: f32) -> f32 {
 /// Write a captured window of 16 kHz mono `f32` samples out as a 16-bit PCM
 /// WAV file, so the pipeline and tests can round-trip a captured window
 /// (e.g. as an `stt` input fixture).
+///
+/// Issue #61: writes to a sibling temp file first and only [`std::fs::rename`]s
+/// it onto `path` once the WAV is fully written and finalized — mirroring the
+/// existing download-then-promote pattern in `models.rs`
+/// (`download_model_with_spec`'s `.partial` file). A mid-write error (disk
+/// full, permission change, a killed process) can therefore never leave a
+/// truncated/corrupt file at `path`: either the rename happens (a complete,
+/// valid WAV) or it doesn't (whatever was at `path` before, untouched). The
+/// temp file is best-effort cleaned up on any failure.
 pub fn write_wav_16k_mono(samples: &[f32], path: &std::path::Path) -> std::io::Result<()> {
+    let tmp_path = wav_tmp_path(path);
+    match write_wav_16k_mono_uncommitted(samples, &tmp_path) {
+        Ok(()) => std::fs::rename(&tmp_path, path),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(err)
+        }
+    }
+}
+
+/// Deterministic sibling temp path for [`write_wav_16k_mono`]'s
+/// write-then-rename: same directory as `path` (so the final `fs::rename`
+/// is same-filesystem and therefore atomic on both POSIX and Windows) with
+/// a `.tmp-<pid>` suffix appended to the full file name, so a leftover temp
+/// file from a killed process is trivially identifiable and never collides
+/// with `path` itself.
+fn wav_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".tmp-{}", std::process::id()));
+    std::path::PathBuf::from(name)
+}
+
+/// The actual WAV-writing logic (issue #61's original body, unchanged),
+/// factored out so [`write_wav_16k_mono`] can run it against a temp path
+/// before committing via rename.
+fn write_wav_16k_mono_uncommitted(samples: &[f32], path: &std::path::Path) -> std::io::Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: TARGET_SAMPLE_RATE,
