@@ -1423,9 +1423,7 @@ describe("GeneralTab", () => {
       typeInto(baseDirInput, "Obsidian/Vault");
       blur(baseDirInput);
       await flush();
-      expect(
-        mounted.container.querySelector('[data-testid="file-base-dir-error"]'),
-      ).not.toBeNull();
+      expect(mounted.container.querySelector('[data-testid="file-base-dir-error"]')).not.toBeNull();
 
       invoke.mockClear();
       focus(baseDirInput);
