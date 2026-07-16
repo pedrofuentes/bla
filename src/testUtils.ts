@@ -85,3 +85,17 @@ export function change(el: HTMLInputElement | HTMLSelectElement, value: string):
     el.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
+
+/**
+ * Sets a text `<input>`'s value and dispatches `input`, wrapped in `act`.
+ * React's `onChange` for text-like inputs listens to the native `input`
+ * event, not `change` (issue #180's path/folder text fields) — `change()`
+ * above works for `<select>`/checkbox/radio, but a text field's onChange
+ * handler never fires from a bare `change` event.
+ */
+export function typeInto(el: HTMLInputElement, value: string): void {
+  act(() => {
+    el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}

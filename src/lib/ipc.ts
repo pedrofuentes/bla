@@ -27,6 +27,16 @@ export interface Settings {
   model_preset: ModelPreset;
   output_mode: OutputModeSetting;
   file_path_template: string;
+  /**
+   * Issue #180: the settings-window picker's "base folder / vault" field
+   * for file-mode output (e.g. an Obsidian vault path) — `file_path_template`
+   * resolves against this. Optional here (rather than required, like the
+   * Rust side's `#[serde(default)]` `String`) purely so TS object literals
+   * built before this field existed keep type-checking; treat a missing or
+   * empty value as "use bla's app-data folder", mirroring
+   * `output::resolve_base_dir`.
+   */
+  file_base_dir?: string;
   /** Issue #126, M2 PR 2.6: opt-in OS login autostart. Defaults to `false`. */
   launch_at_login: boolean;
   /**

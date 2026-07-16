@@ -1,6 +1,16 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { blur, change, click, flush, focus, keydown, mount, type Mounted } from "../../testUtils";
+import {
+  blur,
+  change,
+  click,
+  flush,
+  focus,
+  keydown,
+  mount,
+  typeInto,
+  type Mounted,
+} from "../../testUtils";
 import type { ModelRegistryEntry, Settings } from "../../lib/ipc";
 import { GeneralTab } from "./GeneralTab";
 
@@ -36,6 +46,7 @@ const BASE_SETTINGS: Settings = {
   model_preset: "LargeV3Turbo",
   output_mode: "Cursor",
   file_path_template: "{{date:YYYY-MM-DD}}.md",
+  file_base_dir: "",
   launch_at_login: false,
   sound_cues: true,
 };
@@ -1209,5 +1220,234 @@ describe("GeneralTab", () => {
 
     expect(launchCheckbox.checked).toBe(true);
     expect(soundCheckbox.checked).toBe(false);
+  });
+
+  // -------------------------------------------------------------------
+  // Issue #180 (AC-3): the file-mode output-path/template picker — a base
+  // folder/vault field (e.g. an Obsidian vault path) and a {{date}}-style
+  // path-template field, shown only while File mode is selected, wired to
+  // the existing file-mode output router via file_base_dir/file_path_template.
+  // -------------------------------------------------------------------
+
+  describe("file-mode output picker", () => {
+    it("defaults to Cursor mode and hides the file-output fields", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const cursorRadio = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="output-mode-cursor"]',
+      )!;
+      const fileRadio = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="output-mode-file"]',
+      )!;
+      expect(cursorRadio.checked).toBe(true);
+      expect(fileRadio.checked).toBe(false);
+      expect(mounted.container.querySelector('[data-testid="file-output-fields"]')).toBeNull();
+    });
+
+    it("auto-applies switching to File mode via set_settings", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const fileRadio = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="output-mode-file"]',
+      )!;
+      invoke.mockClear();
+      click(fileRadio);
+      await flush();
+
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: { ...BASE_SETTINGS, output_mode: "File" },
+      });
+      expect(mounted.container.querySelector('[data-testid="file-output-fields"]')).not.toBeNull();
+    });
+
+    it("shows the base-folder and path-template fields prefilled from settings when File mode is already selected", async () => {
+      setupInvoke({
+        get_settings: () => ({
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "/Users/cofounder/Obsidian/Vault",
+          file_path_template: "daily/{{date:YYYY-MM-DD}}.md",
+        }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      const templateInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-path-template-input"]',
+      )!;
+      expect(baseDirInput.value).toBe("/Users/cofounder/Obsidian/Vault");
+      expect(templateInput.value).toBe("daily/{{date:YYYY-MM-DD}}.md");
+    });
+
+    it("persists a changed base folder on blur", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      typeInto(baseDirInput, "/Users/cofounder/Obsidian/Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "/Users/cofounder/Obsidian/Vault",
+        },
+      });
+    });
+
+    it("does not persist an unchanged base folder on blur", async () => {
+      setupInvoke({
+        get_settings: () => ({
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "/Users/cofounder/Obsidian/Vault",
+        }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      blur(baseDirInput);
+      await flush();
+
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+    });
+
+    it("persists a changed, valid path template on blur", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const templateInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-path-template-input"]',
+      )!;
+      invoke.mockClear();
+      typeInto(templateInput, "daily/{{date:YYYY-MM-DD}}.md");
+      blur(templateInput);
+      await flush();
+
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_path_template: "daily/{{date:YYYY-MM-DD}}.md",
+        },
+      });
+    });
+
+    it("shows an inline error and withholds persisting an absolute path template", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const templateInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-path-template-input"]',
+      )!;
+      invoke.mockClear();
+      typeInto(templateInput, "/etc/passwd");
+      blur(templateInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-path-template-error"]')?.textContent,
+      ).toMatch(/relative|absolute/i);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "set_settings",
+        expect.objectContaining({
+          settings: expect.objectContaining({ file_path_template: "/etc/passwd" }),
+        }),
+      );
+    });
+
+    it("shows an inline error and withholds persisting a path template that escapes the base folder", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const templateInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-path-template-input"]',
+      )!;
+      invoke.mockClear();
+      typeInto(templateInput, "../../etc/{{date:YYYY-MM-DD}}.md");
+      blur(templateInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-path-template-error"]')?.textContent,
+      ).toMatch(/escapes|base folder/i);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "set_settings",
+        expect.objectContaining({
+          settings: expect.objectContaining({
+            file_path_template: "../../etc/{{date:YYYY-MM-DD}}.md",
+          }),
+        }),
+      );
+    });
+
+    it("clears the error and persists once an invalid template is corrected", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const templateInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-path-template-input"]',
+      )!;
+      typeInto(templateInput, "/etc/passwd");
+      blur(templateInput);
+      await flush();
+      expect(
+        mounted.container.querySelector('[data-testid="file-path-template-error"]'),
+      ).not.toBeNull();
+
+      invoke.mockClear();
+      focus(templateInput);
+      typeInto(templateInput, "daily/{{date:YYYY-MM-DD}}.md");
+      blur(templateInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-path-template-error"]'),
+      ).toBeNull();
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_path_template: "daily/{{date:YYYY-MM-DD}}.md",
+        },
+      });
+    });
   });
 });
