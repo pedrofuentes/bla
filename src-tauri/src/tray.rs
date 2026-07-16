@@ -100,6 +100,52 @@ pub fn pill_visibility_for(state: &PipelineState) -> bool {
     !matches!(state, PipelineState::Idle)
 }
 
+/// The tray/pill's full display truth at a point in time: the pipeline
+/// state plus whether the pill should be visible for it. Bundled into one
+/// struct (issue #128) so `lib.rs::AppState` can guard both fields with a
+/// SINGLE mutex — `state` and `show_pill` are written together, atomically,
+/// every time (`apply_pipeline_state`'s `show_pill` parameter is not always
+/// `pill_visibility_for(&state)`; the AC-4 notice / issue-#151 done-settle
+/// paths pass `show_pill = true` for an `Idle` state so a toast/confirmation
+/// stays visible on a pill the plain rule would otherwise hide). Splitting
+/// them into two independently-locked fields would reopen exactly the kind
+/// of check-then-act gap this issue closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineDisplay {
+    pub state: PipelineState,
+    pub show_pill: bool,
+}
+
+/// What a `run_on_main_thread` closure should apply to the tray icon and
+/// pill visibility, given whatever [`PipelineDisplay`] is CURRENT in
+/// `AppState` at the moment the closure actually executes (issue #128).
+///
+/// **The race this closes:** `apply_pipeline_state` used to compute
+/// `show_pill`/the icon state ONCE, at enqueue time, and capture that local
+/// value in the `run_on_main_thread` closure. The state write (into
+/// `AppState`), that snapshot, and the `run_on_main_thread` enqueue were
+/// three separate steps — not atomic as a unit. Two same-generation
+/// `apply_pipeline_state` calls (e.g. one from the hotkey thread, one from
+/// the pipeline thread) could therefore enqueue closures whose CAPTURED
+/// snapshots reflect one chronological order while the main thread executes
+/// them in the other order: an older call's closure applying its stale
+/// snapshot strictly AFTER a newer call's closure already applied the
+/// current truth — leaving the pill stuck visible-while-`Idle`, or hidden
+/// while `Recording`, until the next unrelated transition happened to
+/// overwrite it.
+///
+/// The fix: closures no longer carry a captured snapshot at all. Every
+/// closure re-derives its `(TrayIconState, show_pill)` by calling this
+/// function against whatever `PipelineDisplay` `AppState`'s single mutex
+/// currently holds, read at execution time. However many closures end up
+/// running, in whatever order, each one applies the SAME current truth —
+/// so the on-screen result always matches the true current state the
+/// instant the last closure (of however many are in flight) runs, rather
+/// than depending on which stale closure happened to run last.
+pub fn resolve_display(current: &PipelineDisplay) -> (TrayIconState, bool) {
+    (tray_icon_state(&current.state), current.show_pill)
+}
+
 /// Whether an *elapsed* informational-notice period should now hide the pill
 /// (issue #126, M2 PR 2.4; Sentinel 🔴-2 on PR #135). The AC-4
 /// Ollama-unreachable toast is informational — the dictation still pasted —
@@ -496,6 +542,195 @@ mod tests {
 
         // The *next* dictation's route_target() call reflects the new mode.
         assert_eq!(switch.route_target(), OutputMode::File);
+    }
+
+    #[test]
+    fn resolve_display_derives_icon_and_pill_from_the_display_struct_issue_128() {
+        assert_eq!(
+            resolve_display(&PipelineDisplay {
+                state: PipelineState::Idle,
+                show_pill: false,
+            }),
+            (TrayIconState::Idle, false)
+        );
+        assert_eq!(
+            resolve_display(&PipelineDisplay {
+                state: PipelineState::Recording,
+                show_pill: true,
+            }),
+            (TrayIconState::Active, true)
+        );
+        // The notice/done-settle override: Idle state but show_pill forced
+        // true (issue #151 / Sentinel 🔴-2 on PR #135) — `resolve_display`
+        // must pass the stored `show_pill` through verbatim rather than
+        // re-deriving it from `pill_visibility_for(&state)`, since that
+        // override is exactly why `show_pill` is stored alongside `state`
+        // instead of always being computed from it.
+        assert_eq!(
+            resolve_display(&PipelineDisplay {
+                state: PipelineState::Idle,
+                show_pill: true,
+            }),
+            (TrayIconState::Idle, true)
+        );
+    }
+
+    // Issue #128 (Sentinel SNTL-20260716-bla-PR247-6c61cf4 🔴-2): an earlier
+    // version of this test asserted `resolve_display(&current) ==
+    // resolve_display(&current)` — the literal same expression evaluated
+    // twice, which cannot fail no matter what `resolve_display` does or
+    // whether the #128 fix is even in place (confirmed by mutation
+    // testing). This version instead builds actual Rust closures — the
+    // same idiom `apply_pipeline_state`'s `run_on_main_thread` argument
+    // uses — over a shared mutable slot (`std::cell::Cell<PipelineDisplay>`,
+    // standing in for `AppState::pipeline_display`'s mutex; plain std, not
+    // an `AppState` literal or `tauri::Wry` type, per the #165 Windows-CI
+    // rule) and exercises BOTH ways such a closure could obtain its
+    // `PipelineDisplay`:
+    //   - "captured" closures: `move || captured_value` — read the slot
+    //     ONCE, at the moment the closure is built (right when its own
+    //     write lands), then carry that value forward regardless of what
+    //     happens afterward. This is exactly what the PRE-#128-FIX
+    //     `apply_pipeline_state` did by closing over a local `show_pill`.
+    //   - "reread" closures: `|| slot.get()` — hold a reference to the
+    //     slot and read it FRESH every time they're called. This is what
+    //     the FIX does: `apply_pipeline_state`'s closure calls
+    //     `AppState::pipeline_display.lock()` itself, inside the closure
+    //     body, at whatever moment `run_on_main_thread` actually invokes
+    //     it.
+    // One closure of each kind is built per write in a same-generation
+    // sequence — mirroring one `apply_pipeline_state` call enqueuing one
+    // `run_on_main_thread` closure per transition — and every closure is
+    // invoked only AFTER every write in the sequence has landed, modeling
+    // the out-of-order scenario from #128: whichever closure happens to run
+    // last on the main thread does so strictly after every state write,
+    // regardless of which call originally enqueued it.
+    //
+    // Because `captured` and `reread` are genuinely different closures
+    // (one holds a value, the other holds a reference and re-derefs), this
+    // is not tautological: swapping which kind is used changes what the
+    // assertions below observe, so a real regression from "reread" back to
+    // "captured" in the production closure is the same code shape as this
+    // test's `captured` arm — which the assertions are built to catch.
+    // Discrimination verified by hand: temporarily building the "reread"
+    // closures as `captured` too (i.e. reverting the mechanism) turns the
+    // `reread`-side assertions red; restoring `|| slot.get()` turns them
+    // green again (see the PR's discrimination-proof transcript).
+    #[test]
+    fn closures_that_reread_the_slot_track_truth_while_captured_ones_go_stale_issue_128() {
+        struct Case {
+            label: &'static str,
+            // The sequence of writes landing into the shared slot, in the
+            // order they actually happen (chronological write order).
+            writes: &'static [PipelineDisplay],
+        }
+        let cases = [
+            Case {
+                label: "pill stuck visible-while-Idle: Recording(visible) then Idle(hidden) — \
+                        an older 'Recording' closure must not re-show the pill after a newer \
+                        'Idle' write has already landed",
+                writes: &[
+                    PipelineDisplay {
+                        state: PipelineState::Recording,
+                        show_pill: true,
+                    },
+                    PipelineDisplay {
+                        state: PipelineState::Idle,
+                        show_pill: false,
+                    },
+                ],
+            },
+            Case {
+                label: "pill stuck hidden-while-Recording: Idle(hidden) then Recording(visible) \
+                        — an older 'Idle' closure must not re-hide the pill after a newer \
+                        'Recording' write has already landed",
+                writes: &[
+                    PipelineDisplay {
+                        state: PipelineState::Idle,
+                        show_pill: false,
+                    },
+                    PipelineDisplay {
+                        state: PipelineState::Recording,
+                        show_pill: true,
+                    },
+                ],
+            },
+            Case {
+                label: "three-deep interleaving: Recording -> Transcribing -> Idle(notice, \
+                        forced visible)",
+                writes: &[
+                    PipelineDisplay {
+                        state: PipelineState::Recording,
+                        show_pill: true,
+                    },
+                    PipelineDisplay {
+                        state: PipelineState::Transcribing,
+                        show_pill: true,
+                    },
+                    PipelineDisplay {
+                        state: PipelineState::Idle,
+                        show_pill: true,
+                    },
+                ],
+            },
+        ];
+
+        for case in cases {
+            assert!(
+                case.writes.len() > 1,
+                "case '{}': needs at least two writes to exercise a stale-vs-fresh closure",
+                case.label
+            );
+
+            let slot = std::cell::Cell::new(case.writes[0]);
+
+            // Build one closure of each kind per write, at the moment that
+            // write lands — mirroring `apply_pipeline_state` enqueuing a
+            // `run_on_main_thread` closure on every transition.
+            let mut captured_closures: Vec<(PipelineDisplay, Box<dyn Fn() -> PipelineDisplay>)> =
+                Vec::new();
+            let mut reread_closures: Vec<Box<dyn Fn() -> PipelineDisplay + '_>> = Vec::new();
+            for write in case.writes {
+                slot.set(*write);
+                let captured_value = slot.get();
+                captured_closures.push((*write, Box::new(move || captured_value)));
+                reread_closures.push(Box::new(|| slot.get()));
+            }
+
+            let final_value = *case.writes.last().unwrap();
+            assert_eq!(
+                slot.get(),
+                final_value,
+                "case '{}': every write must have landed in the slot before any closure runs",
+                case.label
+            );
+            let expected = resolve_display(&final_value);
+
+            // Every closure "executes" now, strictly after every write —
+            // the out-of-order-relative-to-enqueue-time scenario from #128.
+            for (enqueuing_write, closure) in &captured_closures {
+                let applied = resolve_display(&closure());
+                if *enqueuing_write != final_value {
+                    assert_ne!(
+                        applied, expected,
+                        "case '{}': a captured closure enqueued by stale write {enqueuing_write:?} \
+                         must apply that stale value, diverging from the true final display \
+                         {final_value:?} — this is the #128 bug this closure kind reproduces",
+                        case.label
+                    );
+                }
+            }
+            for closure in &reread_closures {
+                let applied = resolve_display(&closure());
+                assert_eq!(
+                    applied, expected,
+                    "case '{}': a closure that re-reads the slot at execution time must always \
+                     match the true final display {final_value:?}, regardless of which write \
+                     originally enqueued it — this is the #128 fix",
+                    case.label
+                );
+            }
+        }
     }
 
     #[test]
