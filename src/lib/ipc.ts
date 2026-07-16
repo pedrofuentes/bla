@@ -10,6 +10,7 @@
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { RuntimePlatform } from "./baseDir";
 
 /** Mirrors `settings::RecordingMode` (src-tauri/src/settings.rs). */
 export type RecordingMode = "Hold" | "Toggle";
@@ -152,6 +153,18 @@ export interface ToneRule {
  */
 export interface Commands {
   get_settings: { result: Settings };
+  /**
+   * Mirrors `commands::get_platform` (issue #246) — the RUNTIME platform
+   * this Tauri binary is running on (`"windows"` or `"unix"`, matching
+   * `std::path::Path::is_absolute`'s two branches, not every OS name Rust
+   * itself distinguishes). `GeneralTab.tsx` fetches this once on mount and
+   * passes it to `validateBaseDir` (`src/lib/baseDir.ts`) so a
+   * foreign-platform absolute base-folder form (e.g. a synced
+   * `settings.json`'s `C:\...` on macOS) is rejected instead of silently
+   * accepted regardless of what `output::resolve_base_dir` — which runs
+   * Rust-side against THIS platform — will actually do with it.
+   */
+  get_platform: { result: RuntimePlatform };
   set_settings: { args: { settings: Settings }; result: void };
   set_output_mode: { args: { mode: OutputModeSetting }; result: void };
   /** Mirrors `commands::validate_hotkey` — thin wrapper over `hotkeys::validate_hotkey`. */

@@ -2543,6 +2543,7 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
+            commands::get_platform,
             commands::set_settings,
             commands::set_output_mode,
             commands::validate_hotkey,

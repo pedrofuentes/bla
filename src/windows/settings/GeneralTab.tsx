@@ -15,7 +15,7 @@ import {
 import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
 import { applySettingsPatch, revertPatchedFields } from "../../lib/settingsPatch";
 import { validatePathTemplate } from "../../lib/pathTemplate";
-import { validateBaseDir } from "../../lib/baseDir";
+import { validateBaseDir, type RuntimePlatform } from "../../lib/baseDir";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
 
@@ -122,6 +122,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
  * expanding `~`, never resolving relative to anything but the process's
  * CWD at write time), so a relative value here would silently write into
  * an unexpected — and inconsistent-across-launches — location.
+ *
+ * Issue #246 (Sentinel SNTL-20260716-bla-PR245-6936364 🟡 on PR #245):
+ * `validateBaseDir` takes the RUNTIME platform as a parameter now, so it
+ * can reject a foreign-platform absolute form (e.g. a synced
+ * `settings.json`'s `C:\...` on macOS) instead of accepting either
+ * platform's syntax regardless of what `resolve_base_dir` — which runs
+ * Rust-side against THIS machine — will do with it. The platform is
+ * fetched once on mount via `invoke("get_platform")`
+ * (`commands::get_platform`, a thin wrapper over a pure `cfg!(windows)`
+ * branch) into `baseDirPlatform`; a failed fetch (only realistically
+ * possible in a test/harness environment that hasn't mocked the command —
+ * the real command is a local, infallible compile-time check) falls back
+ * to `"unix"`, matching this app's primary target (MISSION §2: macOS
+ * daily driver, Windows a supported secondary target).
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -141,6 +155,12 @@ export function GeneralTab() {
   // from the first loaded `settings` (see `fileFieldsInitializedRef` below).
   const [baseDirDraft, setBaseDirDraft] = useState("");
   const [baseDirError, setBaseDirError] = useState<string | null>(null);
+  // Issue #246: the runtime platform `validateBaseDir` checks the base-dir
+  // draft against — fetched once on mount (see the mount effect below).
+  // Defaults to "unix" (this app's primary target) until that resolves;
+  // in practice `get_platform` is a local, infallible compile-time check,
+  // so the default is only ever visible for a single microtask.
+  const [baseDirPlatform, setBaseDirPlatform] = useState<RuntimePlatform>("unix");
   const [templateDraft, setTemplateDraft] = useState("");
   const [templateError, setTemplateError] = useState<string | null>(null);
 
@@ -230,6 +250,19 @@ export function GeneralTab() {
       })
       .catch(() => {
         /* picker falls back to plain labels; nothing else depends on this */
+      });
+
+    // Issue #246: best-effort, like the two fetches above — a real
+    // `get_platform` call is a local, infallible compile-time check, so a
+    // rejection only realistically happens in a test/harness environment
+    // that hasn't mocked the command; the base-dir validator's "unix"
+    // default (see `baseDirPlatform`'s declaration) covers that case.
+    invoke("get_platform")
+      .then((platform) => {
+        if (!cancelled) setBaseDirPlatform(platform);
+      })
+      .catch(() => {
+        /* falls back to the "unix" default set at declaration */
       });
 
     // PR #134 Sentinel 🔴-1: NOT a single Promise.all — one rejected
@@ -549,17 +582,20 @@ export function GeneralTab() {
 
   // ---- Issue #180: file-mode output picker (base folder + path template) ----
 
-  const handleBaseDirChange = useCallback((value: string) => {
-    setBaseDirDraft(value);
-    const result = validateBaseDir(value);
-    setBaseDirError(result.valid ? null : result.reason);
-  }, []);
+  const handleBaseDirChange = useCallback(
+    (value: string) => {
+      setBaseDirDraft(value);
+      const result = validateBaseDir(value, baseDirPlatform);
+      setBaseDirError(result.valid ? null : result.reason);
+    },
+    [baseDirPlatform],
+  );
 
   const commitBaseDir = useCallback(() => {
     const current = settingsRef.current;
     if (!current) return;
     const value = baseDirDraft.trim();
-    const result = validateBaseDir(value);
+    const result = validateBaseDir(value, baseDirPlatform);
     if (!result.valid) {
       // Invalid: show the error, and withhold persisting it — mirrors
       // `commitTemplate`'s withhold-on-invalid behavior (issue #210).
@@ -568,7 +604,7 @@ export function GeneralTab() {
     }
     if (value === (current.file_base_dir ?? "")) return;
     void applySettingsChange({ file_base_dir: value });
-  }, [baseDirDraft, applySettingsChange]);
+  }, [baseDirDraft, baseDirPlatform, applySettingsChange]);
 
   const handleTemplateChange = useCallback((value: string) => {
     setTemplateDraft(value);

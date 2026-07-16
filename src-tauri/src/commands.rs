@@ -25,6 +25,37 @@ pub fn get_settings(state: State<'_, AppState>) -> crate::settings::Settings {
     state.settings.lock().unwrap().clone()
 }
 
+/// Issue #246 (Sentinel SNTL-20260716-bla-PR245-6936364 🟡 on PR #245):
+/// exposes the RUNTIME platform this Tauri binary is running on to the
+/// frontend, so `validateBaseDir` (`src/lib/baseDir.ts`) can reject a
+/// foreign-platform absolute base-folder form (e.g. a synced
+/// `settings.json`'s `C:\...` on macOS, or a bare `/foo` on Windows — which
+/// `Path::is_absolute` treats as drive-relative there, NOT absolute)
+/// instead of accepting either platform's syntax regardless of what
+/// `output::resolve_base_dir` (which runs Rust-side and uses
+/// `std::path::Path`'s per-platform absoluteness rule) will actually do
+/// with the value. No args, so it's outside the #239 wire-key
+/// `rename_all = "snake_case"` guard, which only bites multi-word
+/// snake_case *argument* names.
+#[tauri::command]
+pub fn get_platform() -> &'static str {
+    runtime_platform()
+}
+
+/// Pure decision behind [`get_platform`], extracted so it's callable from a
+/// unit test without an `AppHandle`/`Wry` runtime (#165's pattern). Mirrors
+/// exactly the two branches `std::path::Path::is_absolute` uses: `"windows"`
+/// (drive-letter prefix or UNC root) vs. every other target bla ships on
+/// (`"unix"` — leading `/`). Tauri never cross-compiles at runtime, so this
+/// is a pure compile-time `cfg!(windows)` branch, not an OS syscall.
+fn runtime_platform() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else {
+        "unix"
+    }
+}
+
 /// Replace the persisted + in-memory settings wholesale. Re-registers the
 /// global hotkey if it changed, flips the live hotkeys state machine's
 /// recording mode (issue #126 / PR #134 Sentinel 🔴-3 — a saved Hold↔Toggle
@@ -699,6 +730,32 @@ mod wire_key_contract_tests {
              `rename_all = \"snake_case\"` — tauri-macros' default camelCase-on-the-wire naming \
              will mismatch whatever the frontend actually sends (the #237 bug's class, issue \
              #239): {offenders:?}"
+        );
+    }
+}
+
+// -------------------------------------------------------------------------
+// Issue #246: `get_platform`'s pure decision, exercised without a Wry
+// runtime (#165's pattern). Deliberately NOT a `#[cfg(windows)]`-gated pair
+// of tests (the Windows-CI rule this brief calls out) — the whole point of
+// the fix is that `validateBaseDir` (`src/lib/baseDir.ts`) takes the
+// platform as a parameter and is exercised for BOTH "windows" and "unix" in
+// one Vitest run on any host OS; that's where the real two-branch coverage
+// lives. This single assertion runs unconditionally on every CI OS and
+// compares `runtime_platform()` against the same `cfg!(windows)` constant
+// the function itself branches on, so it can never disagree with the
+// function under test — a compile-sanity/regression guard, not a stand-in
+// for the platform matrix.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod runtime_platform_tests {
+    use super::runtime_platform;
+
+    #[test]
+    fn runtime_platform_matches_this_build_s_cfg_windows() {
+        assert_eq!(
+            runtime_platform(),
+            if cfg!(windows) { "windows" } else { "unix" }
         );
     }
 }
