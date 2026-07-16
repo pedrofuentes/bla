@@ -14,6 +14,18 @@ describe("toastForError", () => {
     });
   });
 
+  it("treats HistoryPersistFailed as informational (issue #220 — the dictation already pasted)", () => {
+    expect(
+      toastForError({
+        kind: "HistoryPersistFailed",
+        message: "Couldn't save this dictation to history.",
+      }),
+    ).toEqual({
+      tone: "informational",
+      message: "Couldn't save this dictation to history.",
+    });
+  });
+
   it("treats ModelMissing as blocking", () => {
     expect(toastForError({ kind: "ModelMissing", message: "x" }).tone).toBe("blocking");
   });
