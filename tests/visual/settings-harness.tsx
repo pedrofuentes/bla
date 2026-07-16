@@ -156,7 +156,7 @@ const TONE_RULES: ToneRule[] = [
   },
   {
     id: 3,
-    app_pattern: "*Terminal",
+    app_pattern: "*SynthTerm",
     tone: "verbatim",
     created_at_ms: Date.parse("2026-07-15T09:41:00Z"),
   },
