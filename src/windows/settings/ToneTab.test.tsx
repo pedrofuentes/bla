@@ -58,9 +58,13 @@ afterEach(() => {
 });
 
 async function addRule(container: HTMLElement, pattern: string, tone = "casual") {
-  const input = container.querySelector<HTMLInputElement>('[data-testid="tone-add-pattern-input"]')!;
+  const input = container.querySelector<HTMLInputElement>(
+    '[data-testid="tone-add-pattern-input"]',
+  )!;
   typeInto(input, pattern);
-  const select = container.querySelector<HTMLSelectElement>('[data-testid="tone-add-tone-select"]')!;
+  const select = container.querySelector<HTMLSelectElement>(
+    '[data-testid="tone-add-tone-select"]',
+  )!;
   change(select, tone);
   click(container.querySelector('[data-testid="tone-add-button"]')!);
   await flush();
@@ -203,9 +207,9 @@ describe("ToneTab (AC-45: add a rule)", () => {
     const error = mounted.container.querySelector('[data-testid="tone-add-error"]');
     expect(error).not.toBeNull();
     expect(error?.textContent).toMatch(/already/i);
-    expect(
-      mounted.container.querySelectorAll('[data-testid^="tone-rule-pattern-"]').length,
-    ).toBe(2);
+    expect(mounted.container.querySelectorAll('[data-testid^="tone-rule-pattern-"]').length).toBe(
+      2,
+    );
   });
 
   it("disables the add button while the add call is in flight and re-enables it after", async () => {

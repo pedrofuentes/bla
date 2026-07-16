@@ -188,41 +188,38 @@ export function ToneTab() {
       });
   }, []);
 
-  const handleToneChange = useCallback(
-    (rule: ToneRule, nextTone: ToneProfile) => {
-      const previousTone = rule.tone;
-      const generation = (editGenRef.current.get(rule.id) ?? 0) + 1;
-      editGenRef.current.set(rule.id, generation);
+  const handleToneChange = useCallback((rule: ToneRule, nextTone: ToneProfile) => {
+    const previousTone = rule.tone;
+    const generation = (editGenRef.current.get(rule.id) ?? 0) + 1;
+    editGenRef.current.set(rule.id, generation);
 
-      setEditErrorId((prev) => (prev === rule.id ? null : prev));
-      setSavingToneId(rule.id);
-      // Optimistic: reflect the change immediately (AC-44), reverted on
-      // failure or superseded by a newer edit's own optimistic update.
-      setRules((prev) =>
-        prev ? prev.map((r) => (r.id === rule.id ? { ...r, tone: nextTone } : r)) : prev,
-      );
+    setEditErrorId((prev) => (prev === rule.id ? null : prev));
+    setSavingToneId(rule.id);
+    // Optimistic: reflect the change immediately (AC-44), reverted on
+    // failure or superseded by a newer edit's own optimistic update.
+    setRules((prev) =>
+      prev ? prev.map((r) => (r.id === rule.id ? { ...r, tone: nextTone } : r)) : prev,
+    );
 
-      invoke("upsert_tone_rule", { app_pattern: rule.app_pattern, tone: nextTone })
-        .then(() => {
-          if (cancelledRef.current) return;
-          // Stale response guard: a newer edit to this same row has already
-          // started — its own optimistic update / eventual settle owns the
-          // row's displayed value now.
-          if (editGenRef.current.get(rule.id) !== generation) return;
-          setSavingToneId((prev) => (prev === rule.id ? null : prev));
-        })
-        .catch(() => {
-          if (cancelledRef.current) return;
-          if (editGenRef.current.get(rule.id) !== generation) return;
-          setRules((prev) =>
-            prev ? prev.map((r) => (r.id === rule.id ? { ...r, tone: previousTone } : r)) : prev,
-          );
-          setEditErrorId(rule.id);
-          setSavingToneId((prev) => (prev === rule.id ? null : prev));
-        });
-    },
-    [],
-  );
+    invoke("upsert_tone_rule", { app_pattern: rule.app_pattern, tone: nextTone })
+      .then(() => {
+        if (cancelledRef.current) return;
+        // Stale response guard: a newer edit to this same row has already
+        // started — its own optimistic update / eventual settle owns the
+        // row's displayed value now.
+        if (editGenRef.current.get(rule.id) !== generation) return;
+        setSavingToneId((prev) => (prev === rule.id ? null : prev));
+      })
+      .catch(() => {
+        if (cancelledRef.current) return;
+        if (editGenRef.current.get(rule.id) !== generation) return;
+        setRules((prev) =>
+          prev ? prev.map((r) => (r.id === rule.id ? { ...r, tone: previousTone } : r)) : prev,
+        );
+        setEditErrorId(rule.id);
+        setSavingToneId((prev) => (prev === rule.id ? null : prev));
+      });
+  }, []);
 
   const isLoading = loadState === "loading" && rules === null;
   const isEmpty = loadState === "ready" && rules !== null && rules.length === 0;
@@ -262,8 +259,8 @@ export function ToneTab() {
           </button>
         </form>
         <p className="text-xs text-neutral-500 dark:text-neutral-400">
-          An app-name pattern (supports <code>*</code>/<code>?</code> wildcards,
-          case-insensitive) and the tone bla should apply while dictating into that app.
+          An app-name pattern (supports <code>*</code>/<code>?</code> wildcards, case-insensitive)
+          and the tone bla should apply while dictating into that app.
         </p>
         {addError && (
           <p data-testid="tone-add-error" className="text-xs text-red-600 dark:text-red-400">
