@@ -780,6 +780,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // -----------------------------------------------------------------
+    // Issue #61: write_wav_16k_mono must never leave a truncated/partial
+    // WAV at its destination path if the write fails partway through.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_wav_16k_mono_leaves_existing_destination_untouched_on_write_failure_issue_61() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "bla_audio_test_atomic_wav_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("out.wav");
+
+        // Pre-populate the destination with known "prior good" bytes -- the
+        // realistic scenario issue #61 is about: overwriting a previous
+        // recording that a failed write must not corrupt or truncate.
+        std::fs::write(&path, b"PRIOR-GOOD-WAV-BYTES").expect("seed prior file");
+
+        // Make the directory read-only so creating any NEW file inside it
+        // (the temp file an atomic write-then-rename needs) fails with
+        // permission denied -- deterministically forcing the write path to
+        // fail without needing to actually fill the disk.
+        let original_perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+
+        // Sanity-check the environment actually enforces permission bits
+        // (it won't running as root) -- skip rather than flake if not.
+        let canary = dir.join("canary");
+        if std::fs::write(&canary, b"x").is_ok() {
+            let _ = std::fs::remove_file(&canary);
+            let _ = std::fs::set_permissions(&dir, original_perms);
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!(
+                "skipping write_wav_16k_mono_leaves_existing_destination_untouched_on_write_failure_issue_61: \
+                 directory permissions aren't enforced in this environment (likely running as root)"
+            );
+            return;
+        }
+
+        let samples = vec![0.1_f32; 100];
+        let result = write_wav_16k_mono(&samples, &path);
+
+        // Restore permissions before asserting/cleaning up so a failing
+        // assertion can't leak a read-only temp dir.
+        std::fs::set_permissions(&dir, original_perms).expect("restore dir permissions");
+
+        assert!(
+            result.is_err(),
+            "expected the write to fail while the destination directory is read-only"
+        );
+
+        let leftover = std::fs::read(&path).expect("destination path must still exist");
+        assert_eq!(
+            leftover, b"PRIOR-GOOD-WAV-BYTES",
+            "issue #61: a failed write must never touch the existing destination file \
+             (no truncated/partial WAV left behind)"
+        );
+
+        let stray: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|name| name != std::ffi::OsStr::new("out.wav"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "no leftover temp file should remain after a failed write, found {stray:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn new_buffer_is_empty() {
         let rb = RingBuffer::new(4);
