@@ -1408,6 +1408,137 @@ describe("GeneralTab", () => {
       );
     });
 
+    // -------------------------------------------------------------------
+    // Issue #246 (Sentinel SNTL-20260716-bla-PR245-6936364 🟡 on PR #245):
+    // `validateBaseDir` now validates against the RUNTIME platform
+    // (`baseDirPlatform`, fetched via `get_platform` on mount) instead of
+    // accepting either platform's absolute syntax unconditionally.
+    // -------------------------------------------------------------------
+
+    it("fetches the runtime platform on mount (issue #246)", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      expect(invoke).toHaveBeenCalledWith("get_platform");
+    });
+
+    it("rejects a Windows absolute base folder as a foreign-platform form when get_platform reports unix", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+        get_platform: () => "unix",
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "C:\\Users\\cofounder\\Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-base-dir-error"]')?.textContent,
+      ).toMatch(/not an absolute path on this system/i);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "set_settings",
+        expect.objectContaining({
+          settings: expect.objectContaining({ file_base_dir: "C:\\Users\\cofounder\\Vault" }),
+        }),
+      );
+    });
+
+    it("accepts and persists a Windows absolute base folder when get_platform reports windows", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+        get_platform: () => "windows",
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "C:\\Users\\cofounder\\Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(mounted.container.querySelector('[data-testid="file-base-dir-error"]')).toBeNull();
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "C:\\Users\\cofounder\\Vault",
+        },
+      });
+    });
+
+    it("rejects a POSIX absolute base folder as drive-relative, not absolute, when get_platform reports windows", async () => {
+      // The brief's explicit edge case: a bare leading "/" is NOT absolute
+      // on Windows (Rust's Path::is_absolute agrees — it's drive-relative),
+      // so #245's old cross-platform accept must NOT resurface here.
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+        get_platform: () => "windows",
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "/Users/cofounder/Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-base-dir-error"]')?.textContent,
+      ).toMatch(/not an absolute path on this system/i);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "set_settings",
+        expect.objectContaining({
+          settings: expect.objectContaining({ file_base_dir: "/Users/cofounder/Vault" }),
+        }),
+      );
+    });
+
+    it("falls back to unix base-dir validation when get_platform's fetch fails", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+        get_platform: () => Promise.reject(new Error("unmocked in this test")),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "/Users/cofounder/Obsidian/Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(mounted.container.querySelector('[data-testid="file-base-dir-error"]')).toBeNull();
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "/Users/cofounder/Obsidian/Vault",
+        },
+      });
+    });
+
     it("clears the base-folder error and persists once an invalid value is corrected to an absolute path", async () => {
       setupInvoke({
         get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
