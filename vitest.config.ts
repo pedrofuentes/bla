@@ -14,6 +14,16 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
+    // Issue #213: a spy (e.g. `vi.spyOn(console, "error")`) that's only
+    // restored on a test's happy path can leak into later tests in the same
+    // file if an assertion throws first — silencing their real error output
+    // during a red run. `restoreMocks` calls `vi.restoreAllMocks()`
+    // automatically before every test, so restoration no longer depends on
+    // a test body reaching its own `mockRestore()` call. Verified against
+    // the full suite (13 files / 196 tests, all still green) — the other
+    // spy/mock users (`GeneralTab.test.tsx`, `settings/index.test.tsx`) only
+    // ever set behavior via `beforeEach`, which reruns after this hook.
+    restoreMocks: true,
     // Scaffold has no behavior-bearing components yet (AGENTS.md scaffolding
     // exemption); drop this once the first real `*.test.tsx` lands.
     passWithNoTests: true,
