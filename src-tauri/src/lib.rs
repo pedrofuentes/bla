@@ -460,6 +460,22 @@ fn prune_history_for_retention(
     }
 }
 
+/// Reads the user's personal dictionary as the plain `Vec<String>` both
+/// `stt::TranscribeOpts::dictionary` and `cleanup::OllamaCleanup::with_dictionary`
+/// expect (issue #200, PRD AC-21) — `Store::list_terms`'s own
+/// most-recently-added-first order (the issue #70 tie-break policy) passes
+/// straight through unchanged. Pure/injectable — takes `store` directly
+/// rather than reading `AppState`, so it's unit-testable via
+/// `Store::open_in_memory()` without constructing an `AppState`. Called
+/// from `run_pipeline_in_background` on every dictation.
+fn dictionary_terms_for_pipeline(store: &store::Store) -> rusqlite::Result<Vec<String>> {
+    Ok(store
+        .list_terms()?
+        .into_iter()
+        .map(|term| term.term)
+        .collect())
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch — the one
 /// place `record_history_entry`/`prune_history_for_retention`'s real
 /// call sites read the system clock (mirrors `real_clock`'s module-doc
@@ -1203,11 +1219,13 @@ mod dictionary_wiring_tests {
                 |_: Duration| {},
             );
             pipeline.run(&[0.0_f32; 16_000], &opts).unwrap();
-            spy.captured
+            let prompt = spy
+                .captured
                 .borrow()
                 .clone()
                 .expect("Stt::transcribe must have been called")
-                .initial_prompt()
+                .initial_prompt();
+            prompt
         };
 
         let without_dictionary = run_with(empty_dictionary);
@@ -2020,11 +2038,27 @@ fn spawn_stt_cache_warm(
 /// from `Settings` (AC-14).
 fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generation: u64) {
     std::thread::spawn(move || {
-        let (settings, route_target) = {
+        let (settings, route_target, dictionary) = {
             let state = app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
             let route_target = state.output_switch.lock().unwrap().route_target();
-            (settings, route_target)
+            // Issue #200 (PRD AC-21): read the personal dictionary once per
+            // dictation and feed it into both sides of the pipeline below —
+            // Whisper's initial_prompt (via TranscribeOpts) and the
+            // cleanup_v2 rewrite prompt (via OllamaCleanup::with_dictionary).
+            // Best-effort: a read failure must not fail the dictation itself
+            // (mirrors the settings/route-target reads just above, which
+            // don't handle a poisoned-lock panic differently either).
+            let dictionary = {
+                let store = state.store.lock().unwrap();
+                dictionary_terms_for_pipeline(&store).unwrap_or_else(|err| {
+                    eprintln!(
+                        "bla: failed to read personal dictionary, proceeding with none: {err}"
+                    );
+                    Vec::new()
+                })
+            };
+            (settings, route_target, dictionary)
         };
 
         let app_data_dir = app
@@ -2049,7 +2083,9 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
         };
 
         let opts = pipeline::PipelineOpts {
-            transcribe: stt::TranscribeOpts::default(),
+            transcribe: stt::TranscribeOpts {
+                dictionary: dictionary.clone(),
+            },
             tone: cleanup::Tone::Neutral,
             output_mode,
             clock: real_clock(),
@@ -2059,7 +2095,8 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
         let cleanup = cleanup::OllamaCleanup::with_default_base_url(
             "llama3",
             cleanup::UreqTransport::default(),
-        );
+        )
+        .with_dictionary(dictionary);
 
         // Issue #115: `build_stt`'s two bodies differ only in whether they
         // consult/populate `AppState::stt_cache` (whisper feature) — the
@@ -2272,6 +2309,9 @@ pub fn run() {
             commands::copy_history_entry,
             commands::delete_history_entry,
             commands::clear_history,
+            commands::list_dictionary_terms,
+            commands::add_dictionary_term,
+            commands::remove_dictionary_term,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
