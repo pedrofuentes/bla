@@ -340,6 +340,25 @@ impl PasteSynthesizer for EnigoPaste {
     }
 }
 
+/// Resolve the file-mode base directory a dictation's templated path
+/// should be confined to (issue #180's settings-window picker — the "base
+/// folder / vault" field, e.g. an Obsidian vault path). A blank
+/// `configured` value (the pre-#180 default, or a user who cleared the
+/// field) falls back to `app_data_dir`, preserving the previous hard-coded
+/// behavior; a non-blank value is the user's chosen folder, used verbatim
+/// (surrounding whitespace trimmed). Pure so the decision is unit-testable
+/// without a live `tauri::AppHandle` —
+/// `lib.rs::run_pipeline_in_background` (OS-integration glue) is the sole
+/// real caller.
+pub fn resolve_base_dir(configured: &str, app_data_dir: &Path) -> PathBuf {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        app_data_dir.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
 /// Selects which output target a finished dictation is routed to (AC-14
 /// switches this per-dictation from settings-derived state).
 pub enum OutputMode {
