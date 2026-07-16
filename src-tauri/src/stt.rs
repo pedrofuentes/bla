@@ -282,11 +282,30 @@ impl Stt for WhisperStt {
             .full(params, samples)
             .map_err(|e| SttError::Transcription(e.to_string()))?;
 
+        // Issue #71: `to_str()` (strict UTF-8) used to silently drop any
+        // segment it couldn't decode, truncating the transcript with no
+        // signal. `to_str_lossy()` never fails to produce text (it replaces
+        // invalid byte sequences rather than erroring on them) — the only
+        // remaining `Err` is the rare case where the segment's raw text
+        // pointer itself couldn't be read. `accumulate_segment_text` is the
+        // pure core of this decision (unit-tested above without the
+        // `whisper` feature); this loop is the thin, TDD-exempt glue that
+        // feeds it real segments.
         let mut text = String::new();
+        let mut lossy_segments = 0u32;
         for segment in state.as_iter() {
-            if let Ok(s) = segment.to_str() {
-                text.push_str(s);
+            let decoded = segment.to_str_lossy().map_err(|_| ());
+            if accumulate_segment_text(&mut text, decoded) {
+                lossy_segments += 1;
             }
+        }
+        if lossy_segments > 0 {
+            // Data-loss SIGNAL only — never the decoded text itself
+            // (MISSION §5/§7: transcript content must never be logged).
+            eprintln!(
+                "bla[stt]: {lossy_segments} whisper segment(s) contained invalid UTF-8 \
+                 and were decoded lossily"
+            );
         }
         perf_log(&format!(
             "transcribed {} samples (~{:.1}s audio) in {} ms on {} threads",
@@ -296,6 +315,30 @@ impl Stt for WhisperStt {
             n_threads
         ));
         Ok(text.trim().to_string())
+    }
+}
+
+/// Accumulates one whisper.cpp segment's decoded text into `text` and
+/// reports whether that segment required lossy handling (issue #71): a
+/// segment whose raw bytes weren't valid UTF-8 (lossily replaced —
+/// `Ok(Cow::Owned(_))`) or that couldn't be read at all (`Err`). Previously
+/// `WhisperStt::transcribe` used `Segment::to_str()` (strict UTF-8) and
+/// silently dropped any segment it returned `Err` for — the transcript was
+/// truncated with no signal at all. This is the pure core of the fix: it
+/// always contributes whatever text is available (lossily decoded rather
+/// than dropped) and returns a bool the caller uses to count/warn, so the
+/// fix is unit-tested without needing the `whisper` feature or a real
+/// model — `decoded` mirrors exactly what `Segment::to_str_lossy()`
+/// returns, minus whisper-rs's own error type, which this module has no
+/// reason to depend on outside the feature gate.
+fn accumulate_segment_text(text: &mut String, decoded: Result<std::borrow::Cow<'_, str>, ()>) -> bool {
+    match decoded {
+        Ok(s) => {
+            let was_lossy = matches!(s, std::borrow::Cow::Owned(_));
+            text.push_str(&s);
+            was_lossy
+        }
+        Err(()) => true,
     }
 }
 
