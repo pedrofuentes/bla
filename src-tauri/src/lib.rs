@@ -738,6 +738,169 @@ mod mapping_tests {
     }
 }
 
+/// Issue #198 tests for the AppState-free history-capture pure functions
+/// (AC-29/AC-30/AC-31): `record_history_entry`, `copy_history_entry_text`,
+/// `prune_history_for_retention`. Mirrors `apply_settings_tests`'s pattern
+/// (issue #165) — real `store::Store::open_in_memory()` (no fake needed,
+/// same as `store.rs`'s own tests) plus a local fake `output::Clipboard`,
+/// never a constructed `AppState`.
+#[cfg(test)]
+mod history_wiring_tests {
+    use super::*;
+    use crate::output::Clipboard as _;
+    use std::cell::RefCell;
+
+    /// Fake clipboard for `copy_history_entry_text` tests — mirrors
+    /// `output.rs`'s own private `FakeClipboard` (not reachable from here:
+    /// it's under `output`'s `#[cfg(test)] mod tests`), an in-memory cell
+    /// with no real OS clipboard access.
+    struct FakeClipboard {
+        contents: RefCell<String>,
+    }
+
+    impl FakeClipboard {
+        fn new(initial: &str) -> Self {
+            Self {
+                contents: RefCell::new(initial.to_string()),
+            }
+        }
+    }
+
+    impl output::Clipboard for FakeClipboard {
+        fn get(&self) -> std::io::Result<String> {
+            Ok(self.contents.borrow().clone())
+        }
+
+        fn set(&self, contents: &str) -> std::io::Result<()> {
+            *self.contents.borrow_mut() = contents.to_string();
+            Ok(())
+        }
+    }
+
+    fn synthetic_outcome(raw: &str, cleaned: &str) -> pipeline::Outcome {
+        pipeline::Outcome {
+            raw_transcript: raw.to_string(),
+            cleaned_transcript: cleaned.to_string(),
+            cleanup_fell_back: false,
+            output: output::OutputOutcome::Pasted,
+        }
+    }
+
+    // -------------------------------------------------------------
+    // AC-29: record_history_entry — exactly one Store::insert_history call
+    // per completed pipeline run, carrying raw + cleaned transcript.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn record_history_entry_persists_the_outcomes_raw_and_cleaned_transcript_ac29() {
+        let store = store::Store::open_in_memory().unwrap();
+        let outcome = synthetic_outcome("raw synthetic dictation", "Cleaned synthetic dictation.");
+
+        let id = record_history_entry(&store, 1_000, &outcome, None).unwrap();
+
+        let rows = store.search_history("synthetic", 10).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one row must be inserted");
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].created_at_ms, 1_000);
+        assert_eq!(rows[0].raw, "raw synthetic dictation");
+        assert_eq!(rows[0].cleaned, "Cleaned synthetic dictation.");
+    }
+
+    #[test]
+    fn record_history_entry_carries_the_app_name_when_given_ac29() {
+        let store = store::Store::open_in_memory().unwrap();
+        let outcome = synthetic_outcome("raw", "cleaned");
+
+        record_history_entry(&store, 1_000, &outcome, Some("Notes")).unwrap();
+
+        let rows = store.search_history("raw", 10).unwrap();
+        assert_eq!(rows[0].app_name.as_deref(), Some("Notes"));
+    }
+
+    #[test]
+    fn record_history_entry_called_once_per_outcome_never_double_inserts_ac29() {
+        let store = store::Store::open_in_memory().unwrap();
+        let outcome = synthetic_outcome("raw once", "cleaned once");
+
+        record_history_entry(&store, 1_000, &outcome, None).unwrap();
+
+        let rows = store.search_history("once", 10).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single completed run must produce exactly one history row"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // AC-30: copy_history_entry_text — routes the entry's cleaned text
+    // through the Clipboard/ClipboardPayload seam, never a bare String that
+    // could be logged.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn copy_history_entry_text_sets_the_clipboard_to_the_entrys_cleaned_text_ac30() {
+        let store = store::Store::open_in_memory().unwrap();
+        let id = store
+            .insert_history(1_000, "raw synthetic", "Cleaned synthetic.", None)
+            .unwrap();
+        let clipboard = FakeClipboard::new("");
+
+        copy_history_entry_text(&store, &clipboard, id).unwrap();
+
+        assert_eq!(clipboard.get().unwrap(), "Cleaned synthetic.");
+    }
+
+    #[test]
+    fn copy_history_entry_text_errors_for_an_unknown_id_without_touching_the_clipboard_ac30() {
+        let store = store::Store::open_in_memory().unwrap();
+        let clipboard = FakeClipboard::new("untouched");
+
+        let result = copy_history_entry_text(&store, &clipboard, 999);
+
+        assert!(result.is_err());
+        assert_eq!(clipboard.get().unwrap(), "untouched");
+    }
+
+    // -------------------------------------------------------------
+    // AC-31: prune_history_for_retention — computes the cutoff and prunes
+    // only when retention_days > 0; a no-op (never touches rows) at 0.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn prune_history_for_retention_prunes_rows_older_than_the_cutoff_ac31() {
+        let store = store::Store::open_in_memory().unwrap();
+        let day_ms: i64 = 24 * 60 * 60 * 1000;
+        let now_ms = 10 * day_ms;
+        store
+            .insert_history(1 * day_ms, "too old", "too old.", None)
+            .unwrap();
+        store
+            .insert_history(9 * day_ms, "recent enough", "recent enough.", None)
+            .unwrap();
+
+        let deleted = prune_history_for_retention(&store, now_ms, 3).unwrap();
+
+        assert_eq!(deleted, 1);
+        let remaining = store.search_history("", 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].raw, "recent enough");
+    }
+
+    #[test]
+    fn prune_history_for_retention_is_a_no_op_when_retention_days_is_zero_ac31() {
+        let store = store::Store::open_in_memory().unwrap();
+        store
+            .insert_history(0, "keep forever", "keep forever.", None)
+            .unwrap();
+
+        let deleted = prune_history_for_retention(&store, 999_999_999_999, 0).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(store.search_history("", 10).unwrap().len(), 1);
+    }
+}
+
 /// Loads persisted settings from the `tauri-plugin-store`-backed
 /// `settings.json`, translating a missing store/key to
 /// [`settings::SettingsLoadError::NotFound`] and a present-but-unparsable
