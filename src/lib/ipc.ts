@@ -122,6 +122,31 @@ export interface DictionaryTerm {
 }
 
 /**
+ * Mirrors `store::ToneProfile` (src-tauri/src/store.rs) — deliberately
+ * narrower than the pipeline's own tone enum (no `neutral`; the *absence* of
+ * a matching rule is what dispatches neutral, never a value stored here).
+ * Lowercase on the wire (`#[serde(rename_all = "lowercase")]` on the Rust
+ * side) — do not PascalCase these like `RecordingMode`/`ModelPreset`.
+ */
+export type ToneProfile = "casual" | "formal" | "verbatim";
+
+/**
+ * Mirrors `store::ToneRule` (src-tauri/src/store.rs) — one per-app tone
+ * override returned by `list_tone_rules`, in insertion order (`id` ASC),
+ * which is also first-match-wins match order (`context::resolve_tone_for_app`
+ * walks this same order). Carries `app_pattern`: user-environment data (an
+ * installed app's identifier/glob pattern), not transcript/clipboard
+ * content, but still never `console.log`/persisted anywhere outside the
+ * Tone tab (#203) that renders it.
+ */
+export interface ToneRule {
+  id: number;
+  app_pattern: string;
+  tone: ToneProfile;
+  created_at_ms: number;
+}
+
+/**
  * Command name → { args, result } typing. Extend this map as `commands.rs`
  * grows; each key must match a `#[tauri::command]` name exactly.
  */
@@ -176,6 +201,27 @@ export interface Commands {
   add_dictionary_term: { args: { term: string }; result: number };
   /** Mirrors `commands::remove_dictionary_term` (issue #200/#201). */
   remove_dictionary_term: { args: { id: number }; result: void };
+  /**
+   * Mirrors `commands::list_tone_rules` (issue #202/#203) — every per-app
+   * tone rule, in insertion order (`id` ASC), which the Tone tab (#203)
+   * renders as-is since that order is also first-match-wins match order.
+   */
+  list_tone_rules: { result: ToneRule[] };
+  /**
+   * Mirrors `commands::upsert_tone_rule` (issue #202/#203, PRD AC-22/AC-41).
+   * Re-submitting an existing `app_pattern` (case-insensitively) UPDATES
+   * that rule's tone in place rather than adding a second row — this is how
+   * the Tone tab implements "edit a rule's tone" (AC-44), reusing the same
+   * call rather than a separate update-by-id command, which doesn't exist.
+   * Returns the rule's row id either way. Because a duplicate pattern is a
+   * silent update rather than a rejected call, the Tone tab checks for a
+   * case-insensitive duplicate against its already-loaded list itself
+   * before calling this for an *add* (see `ToneTab.tsx`'s doc comment) —
+   * the same pattern `DictionaryTab.tsx` uses for `add_dictionary_term`.
+   */
+  upsert_tone_rule: { args: { app_pattern: string; tone: ToneProfile }; result: number };
+  /** Mirrors `commands::delete_tone_rule` (issue #202/#203). */
+  delete_tone_rule: { args: { id: number }; result: void };
 }
 
 /**
