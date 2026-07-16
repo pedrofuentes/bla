@@ -398,6 +398,67 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    // -------------------------------------------------------------
+    // Issue #71: WhisperStt::transcribe used to silently drop a segment
+    // whose raw bytes weren't valid UTF-8 (`if let Ok(s) = segment.to_str()`
+    // -- the `Err` branch just skipped it, with no signal at all). These
+    // tests cover accumulate_segment_text, the pure core of the fix: it
+    // always contributes whatever text is available -- lossily decoded
+    // rather than dropped -- and reports whether that segment needed lossy
+    // handling. `decoded` mirrors exactly what whisper-rs's
+    // `Segment::to_str_lossy()` returns (`Ok(Cow::Borrowed)` for clean
+    // UTF-8, `Ok(Cow::Owned)` when replacement was needed), minus
+    // whisper-rs's own error type -- so this is fully unit-tested without
+    // the `whisper` feature or a real model.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn accumulate_segment_text_appends_lossily_decoded_text_instead_of_dropping_it_issue_71() {
+        let mut text = String::new();
+        let decoded: Result<std::borrow::Cow<'_, str>, ()> =
+            Ok(std::borrow::Cow::Owned("recovered \u{FFFD}text".to_string()));
+        let was_lossy = accumulate_segment_text(&mut text, decoded);
+        assert!(
+            was_lossy,
+            "an owned (lossily-decoded) Cow must be flagged as lossy"
+        );
+        assert_eq!(
+            text, "recovered \u{FFFD}text",
+            "issue #71: a lossily-decoded segment's text must still be appended, not dropped"
+        );
+    }
+
+    #[test]
+    fn accumulate_segment_text_flags_but_does_not_panic_on_an_unreadable_segment() {
+        let mut text = String::new();
+        let was_lossy = accumulate_segment_text(&mut text, Err(()));
+        assert!(
+            was_lossy,
+            "a segment that couldn't be read at all must still be flagged as a loss"
+        );
+        assert_eq!(
+            text, "",
+            "nothing to append when the segment couldn't be read at all"
+        );
+    }
+
+    #[test]
+    fn accumulate_segment_text_does_not_flag_clean_utf8_segments() {
+        let mut text = String::new();
+        let was_lossy =
+            accumulate_segment_text(&mut text, Ok(std::borrow::Cow::Borrowed("clean")));
+        assert!(!was_lossy);
+        assert_eq!(text, "clean");
+    }
+
+    #[test]
+    fn accumulate_segment_text_appends_across_multiple_segments_in_order() {
+        let mut text = String::new();
+        accumulate_segment_text(&mut text, Ok(std::borrow::Cow::Borrowed("hello ")));
+        accumulate_segment_text(&mut text, Ok(std::borrow::Cow::Owned("world".to_string())));
+        assert_eq!(text, "hello world");
+    }
+
     #[test]
     fn perf_logging_is_off_when_unset_or_explicitly_disabled() {
         // Default posture: a normal run (no BLA_PERF_LOG) stays silent, and
