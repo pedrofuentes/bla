@@ -399,6 +399,56 @@ pub fn remove_dictionary_term(state: State<'_, AppState>, id: i64) -> Result<(),
         .map_err(|e| e.to_string())
 }
 
+/// List every per-app tone rule (issue #202, PRD AC-22), in insertion
+/// order. Thin wrapper over `store::Store::list_tone_rules`; `ToneRule`
+/// derives `Serialize` (see its doc comment) specifically so this command
+/// can hand rows to the frontend over Tauri IPC — the Tone tab (#203, not
+/// this PR).
+#[tauri::command]
+pub fn list_tone_rules(state: State<'_, AppState>) -> Result<Vec<crate::store::ToneRule>, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .list_tone_rules()
+        .map_err(|e| e.to_string())
+}
+
+/// Insert or update a per-app tone rule (issue #202, PRD AC-22, AC-41).
+/// Thin wrapper over `store::Store::upsert_tone_rule` — re-submitting the
+/// same `app_pattern` (case-insensitively) UPDATES that rule's tone in
+/// place rather than adding a second row, so an edited rule takes effect on
+/// the very next dictation with no restart required (the next
+/// `run_pipeline_in_background` call reads `list_tone_rules` fresh; there
+/// is no cache to invalidate). Returns the rule's row id either way.
+#[tauri::command]
+pub fn upsert_tone_rule(
+    state: State<'_, AppState>,
+    app_pattern: String,
+    tone: crate::store::ToneProfile,
+) -> Result<i64, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .upsert_tone_rule(&app_pattern, tone, now_ms())
+        .map_err(|e| e.to_string())
+}
+
+/// Remove a single tone rule by id (issue #202, PRD AC-22). Thin wrapper
+/// over `store::Store::delete_tone_rule` — removing an id that doesn't
+/// exist is a no-op, not an error (matches `Store::remove_term`'s own
+/// contract).
+#[tauri::command]
+pub fn delete_tone_rule(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .delete_tone_rule(id)
+        .map_err(|e| e.to_string())
+}
+
 /// Re-registers the current (persisted) hotkey as the global dictation
 /// shortcut (issue #181) — called whenever hotkey capture ends without a
 /// newly-committed *changed* chord already re-registering it via

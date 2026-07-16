@@ -186,6 +186,16 @@ pub(crate) struct AppState {
     /// handlers and the background pipeline thread
     /// (`run_pipeline_in_background`) need to reach it.
     store: Mutex<store::Store>,
+    /// Issue #202 (M3 PR 3.6): the active app detected at the START of the
+    /// current/most recent dictation (`react_to_transition`'s
+    /// `StartRecording` arm — "matched at hotkey-press time" per #202's
+    /// plan, since the user may have already switched focus, e.g. to the
+    /// recording pill itself, by the time `StopRecording` fires). Read by
+    /// `run_pipeline_in_background` to resolve the dictation's `Tone` via
+    /// `context::resolve_tone_for_app` and to tag the persisted history row.
+    /// `None` when detection failed (no active window, permission denied)
+    /// or before the very first dictation.
+    active_app_name: Mutex<Option<context::ActiveAppName>>,
 }
 
 /// Max capacity of the capture ring buffer: a generous 5 minutes at 16 kHz
@@ -386,9 +396,11 @@ fn should_reuse_cached_stt(
 /// only UI-visible effects (event emits, pill state writes, settle spawns —
 /// see `run_pipeline_in_background`'s own comments on that gate); it must
 /// NOT drop the history row, or a dictation whose text was genuinely pasted
-/// would silently be missing from history. `app_name` is `None` for now —
-/// `context.rs`'s active-app detection is still a stub, not wired into the
-/// pipeline; a later PR threads a real value through once it lands.
+/// would silently be missing from history. Issue #202: `app_name` is now
+/// threaded through from `context::detect_active_app_name`'s hotkey-press-
+/// time detection (see `run_pipeline_in_background`'s call site) rather
+/// than always `None` — still `None` whenever detection failed or on a
+/// platform/session with no active window.
 fn record_history_entry(
     store: &store::Store,
     created_at_ms: i64,
@@ -1237,6 +1249,170 @@ mod dictionary_wiring_tests {
     }
 }
 
+/// Issue #202 (PRD AC-22, M3 per-app tone): wiring-level proof that once
+/// tone dispatch is wired through `run_pipeline_in_background`,
+/// `Tone::Verbatim` still bypasses `OllamaCleanup`'s transport entirely
+/// end-to-end (AC-42) — mirrors `cleanup.rs`'s own
+/// `ollama_cleanup_verbatim_tone_bypasses_the_transport_entirely`, but at
+/// THIS layer (through a real `pipeline::Pipeline`, not just a bare
+/// `OllamaCleanup::clean` call), per AC-42's explicit "not just within
+/// cleanup.rs" requirement. Never a constructed `AppState` (Windows-CI hard
+/// rule, issue #165) — pure/injected collaborators only, mirroring
+/// `dictionary_wiring_tests` right above.
+#[cfg(test)]
+mod tone_wiring_tests {
+    use super::*;
+    use crate::output::{Clipboard, PasteSynthesizer};
+    use std::cell::Cell;
+    use std::io;
+    use std::time::Duration;
+
+    struct NoopClipboard;
+    impl Clipboard for NoopClipboard {
+        fn get(&self) -> io::Result<String> {
+            Ok(String::new())
+        }
+        fn set(&self, _contents: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    struct NoopPaste;
+    impl PasteSynthesizer for NoopPaste {
+        fn synthesize_paste(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fixed_clock() -> output::Clock {
+        output::Clock {
+            year: 2026,
+            month: 7,
+            day: 15,
+            hour: 9,
+            minute: 0,
+        }
+    }
+
+    fn file_output_mode(dir: &tempfile::TempDir) -> output::OutputMode {
+        output::OutputMode::File {
+            base_dir: dir.path().to_path_buf(),
+            config: output::FileConfig {
+                path_template: "dictation.md".to_string(),
+                timestamp_prefix_template: None,
+            },
+        }
+    }
+
+    /// An `OllamaTransport` that counts how many times it was called and
+    /// always fails — if `Tone::Verbatim` ever reached it, the pipeline
+    /// would either surface `cleanup_fell_back` (wrong: Verbatim must never
+    /// even ask) or the call count would be nonzero either way.
+    struct CountingTransport {
+        calls: Cell<u32>,
+    }
+    impl CountingTransport {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+            }
+        }
+    }
+    impl cleanup::OllamaTransport for CountingTransport {
+        fn post(&self, _url: &str, _body: &str) -> Result<String, cleanup::TransportError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(cleanup::TransportError::ConnectionFailed)
+        }
+    }
+    /// Mirrors `dictionary_wiring_tests::SpyStt`'s `Rc`-sharing pattern: the
+    /// test keeps its own handle to inspect `calls` after `Pipeline::run`
+    /// moves an owned copy into the pipeline.
+    impl cleanup::OllamaTransport for std::rc::Rc<CountingTransport> {
+        fn post(&self, url: &str, body: &str) -> Result<String, cleanup::TransportError> {
+            self.as_ref().post(url, body)
+        }
+    }
+
+    #[test]
+    fn verbatim_tone_bypasses_ollama_transport_end_to_end_through_the_pipeline_ac42() {
+        let transport = std::rc::Rc::new(CountingTransport::new());
+        let cleanup = cleanup::OllamaCleanup::new(
+            "http://localhost:11434",
+            "llama3",
+            std::rc::Rc::clone(&transport),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let opts = pipeline::PipelineOpts {
+            transcribe: stt::TranscribeOpts { dictionary: vec![] },
+            tone: cleanup::Tone::Verbatim,
+            output_mode: file_output_mode(&dir),
+            clock: fixed_clock(),
+            restore_delay: Duration::from_millis(0),
+        };
+        let raw = "  um, hello   world, uh, messy";
+        let pipeline = pipeline::Pipeline::new(
+            stt::FakeStt::new(raw),
+            cleanup,
+            NoopClipboard,
+            NoopPaste,
+            |_: Duration| {},
+        );
+
+        let outcome = pipeline.run(&[0.0_f32; 16_000], &opts).unwrap();
+
+        assert_eq!(
+            transport.calls.get(),
+            0,
+            "Verbatim must never reach the OllamaTransport, even through the full pipeline"
+        );
+        assert_eq!(
+            outcome.cleaned_transcript, outcome.raw_transcript,
+            "Verbatim must return the raw transcript essentially untouched"
+        );
+        assert!(
+            !outcome.cleanup_fell_back,
+            "Verbatim bypasses cleanup entirely — it never even tries the transport, so there \
+             is nothing to fall back FROM"
+        );
+    }
+
+    #[test]
+    fn casual_tone_does_reach_the_ollama_transport_end_to_end_through_the_pipeline_ac42() {
+        // Contrast case: unlike Verbatim, Casual is an LLM-rewritten tone
+        // and MUST reach the transport — proves the wiring-level test above
+        // is actually discriminating (a pipeline that never calls the
+        // transport for ANY tone would pass the Verbatim assertion for the
+        // wrong reason).
+        let transport = std::rc::Rc::new(CountingTransport::new());
+        let cleanup = cleanup::OllamaCleanup::new(
+            "http://localhost:11434",
+            "llama3",
+            std::rc::Rc::clone(&transport),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let opts = pipeline::PipelineOpts {
+            transcribe: stt::TranscribeOpts { dictionary: vec![] },
+            tone: cleanup::Tone::Casual,
+            output_mode: file_output_mode(&dir),
+            clock: fixed_clock(),
+            restore_delay: Duration::from_millis(0),
+        };
+        let pipeline = pipeline::Pipeline::new(
+            stt::FakeStt::default(),
+            cleanup,
+            NoopClipboard,
+            NoopPaste,
+            |_: Duration| {},
+        );
+
+        let outcome = pipeline.run(&[0.0_f32; 16_000], &opts).unwrap();
+
+        assert_eq!(transport.calls.get(), 1, "Casual must reach the transport");
+        // The stub transport always fails, so AC-4's fallback fires — that
+        // is expected here (this test isn't about a successful response).
+        assert!(outcome.cleanup_fell_back);
+    }
+}
+
 /// Loads persisted settings from the `tauri-plugin-store`-backed
 /// `settings.json`, translating a missing store/key to
 /// [`settings::SettingsLoadError::NotFound`] and a present-but-unparsable
@@ -1418,6 +1594,16 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             // immediately recognized as stale the moment this dictation
             // begins, rather than only once ITS OWN state write lands.
             state.dictation_generation.fetch_add(1, Ordering::SeqCst);
+            // Issue #202: detect the active app HERE — at hotkey-press
+            // time, before capture starts — not on StopRecording, since the
+            // user may have already switched focus (e.g. to the recording
+            // pill itself) by the time they release/re-tap the hotkey.
+            // `detect_active_app_name` degrades to `None` silently on any
+            // failure (no active window, permission denied); `None` simply
+            // means this dictation resolves to `Tone::Neutral` below,
+            // matching the "detection failure never surfaces an error"
+            // contract.
+            *state.active_app_name.lock().unwrap() = context::detect_active_app_name();
             // Drop any stale samples and any error recorded by a previous
             // session before starting a fresh capture window, so the
             // degraded-capture check on StopRecording reflects only THIS
@@ -2038,7 +2224,7 @@ fn spawn_stt_cache_warm(
 /// from `Settings` (AC-14).
 fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generation: u64) {
     std::thread::spawn(move || {
-        let (settings, route_target, dictionary) = {
+        let (settings, route_target, dictionary, tone, active_app_name) = {
             let state = app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
             let route_target = state.output_switch.lock().unwrap().route_target();
@@ -2058,7 +2244,26 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                     Vec::new()
                 })
             };
-            (settings, route_target, dictionary)
+            // Issue #202 (PRD AC-22): resolve this dictation's Tone from
+            // the app `react_to_transition`'s StartRecording arm detected
+            // at hotkey-press time, against whatever tone_rules are live
+            // RIGHT NOW (never cached) — so a rule edited between
+            // dictations takes effect on the very next one, no restart
+            // required (AC-41). Best-effort, same pattern as the
+            // dictionary read just above: a rules-read failure must not
+            // fail the dictation, it just resolves to Tone::Neutral.
+            let active_app_name = state.active_app_name.lock().unwrap().clone();
+            let tone = {
+                let store = state.store.lock().unwrap();
+                let tone_rules = store.list_tone_rules().unwrap_or_else(|err| {
+                    eprintln!(
+                        "bla: failed to read tone rules, proceeding with Tone::Neutral: {err}"
+                    );
+                    Vec::new()
+                });
+                context::resolve_tone_for_app(active_app_name.as_ref(), &tone_rules)
+            };
+            (settings, route_target, dictionary, tone, active_app_name)
         };
 
         let app_data_dir = app
@@ -2086,7 +2291,7 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
             transcribe: stt::TranscribeOpts {
                 dictionary: dictionary.clone(),
             },
-            tone: cleanup::Tone::Neutral,
+            tone,
             output_mode,
             clock: real_clock(),
             restore_delay: output::DEFAULT_RESTORE_DELAY,
@@ -2140,7 +2345,14 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                         {
                             let app_state = app.state::<AppState>();
                             let store = app_state.store.lock().unwrap();
-                            if let Err(err) = record_history_entry(&store, now_ms(), &outcome, None)
+                            // Issue #202: `active_app_name` is the same
+                            // hotkey-press-time detection this dictation's
+                            // Tone was resolved from above — now threaded
+                            // through to the history row too (app NAME
+                            // only, never a window title — AC-43).
+                            let app_name = active_app_name.as_ref().map(|a| a.0.as_str());
+                            if let Err(err) =
+                                record_history_entry(&store, now_ms(), &outcome, app_name)
                             {
                                 eprintln!("bla: failed to persist history entry: {err}");
                             }
@@ -2312,6 +2524,9 @@ pub fn run() {
             commands::list_dictionary_terms,
             commands::add_dictionary_term,
             commands::remove_dictionary_term,
+            commands::list_tone_rules,
+            commands::upsert_tone_rule,
+            commands::delete_tone_rule,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -2438,6 +2653,7 @@ pub fn run() {
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
                 store: Mutex::new(history_store),
+                active_app_name: Mutex::new(None),
             };
             app.manage(state);
 
