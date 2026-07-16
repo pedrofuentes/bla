@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { DictionaryTab } from "./DictionaryTab";
 import { GeneralTab } from "./GeneralTab";
 import { HistoryTab } from "./HistoryTab";
 import { TABS, type TabId } from "./tabs";
@@ -12,10 +13,11 @@ import { TABS, type TabId } from "./tabs";
  * Playwright visual verification.
  *
  * General tab lands in issue #126 (M2 PR 2.5); History lands in issue #199
- * (M3 PR 3.3). The rest (Dictionary/Tone/Snippets) are later M3+
- * increments — clicking one shows a placeholder rather than being
- * disabled, so the tab bar's final shape (and switching between tabs) is
- * exercised now without pulling forward content that doesn't exist yet.
+ * (M3 PR 3.3); Dictionary lands in issue #201 (M3 PR 3.5). The rest
+ * (Tone/Snippets) are later M3+ increments — clicking one shows a
+ * placeholder rather than being disabled, so the tab bar's final shape
+ * (and switching between tabs) is exercised now without pulling forward
+ * content that doesn't exist yet.
  */
 export function SettingsWindow() {
   const [active, setActive] = useState<TabId>("general");
@@ -52,6 +54,8 @@ export function SettingsWindow() {
           <GeneralTab />
         ) : active === "history" ? (
           <HistoryTab />
+        ) : active === "dictionary" ? (
+          <DictionaryTab />
         ) : (
           <p
             data-testid="placeholder-panel"
