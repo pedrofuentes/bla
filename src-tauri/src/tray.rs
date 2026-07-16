@@ -148,16 +148,60 @@ pub fn should_keep_pill_visible_for_done(previous: &PipelineState) -> bool {
 /// checks that the pipeline is still `Idle`, which is also (coincidentally)
 /// true once a *second*, newer settle has itself already applied `Idle` —
 /// so the stale first settle would wrongly hide the pill out from under the
-/// newer one's still-live visible window. Hiding now requires BOTH that no
-/// newer settle has started since (`epoch_at_settle == current_epoch`) AND
-/// that `should_hide_pill_after_notice` still holds. Pure/total; the actual
-/// epoch bump/load and `window.hide()` stay thin OS glue in `lib.rs`.
+/// newer one's still-live visible window. Hiding now requires ALL of:
+/// no newer settle has started since (`epoch_at_settle == current_epoch`),
+/// no newer *dictation* has started since (`generation_at_settle ==
+/// current_generation` — issues #174/#175/#176: a settle started by
+/// dictation #1 must stand down once dictation #2 is underway, the same way
+/// it stands down for a newer settle of #1's own dictation), and
+/// `should_hide_pill_after_notice` still holds. Pure/total; the actual
+/// epoch/generation bump/load and `window.hide()` stay thin OS glue in
+/// `lib.rs` — including #174's fix of locking `pipeline_state` BEFORE
+/// loading the epoch/generation atomics, which this function's signature
+/// doesn't (and can't) enforce, only its caller can.
 pub fn should_hide_pill_for_settle(
     epoch_at_settle: u64,
     current_epoch: u64,
+    generation_at_settle: u64,
+    current_generation: u64,
     state: &PipelineState,
 ) -> bool {
-    epoch_at_settle == current_epoch && should_hide_pill_after_notice(state)
+    generation_at_settle == current_generation
+        && epoch_at_settle == current_epoch
+        && should_hide_pill_after_notice(state)
+}
+
+/// Whether a background dictation's completion — a `run_pipeline_in_background`
+/// result arriving, or one of the settle helpers it calls
+/// (`settle_idle_keeping_pill_for_notice`/`_for_done`) applying its
+/// immediate `Idle`+visible write — should still be applied to shared
+/// state, given the per-dictation generation it was minted with
+/// (`generation_at_start`, captured once at `StartRecording`) vs. the
+/// current live generation (issues #174/#175/#176).
+///
+/// **Mechanism:** the hotkeys `StateMachine` resets to `Phase::Idle`
+/// synchronously on `StopRecording`, before the transcription thread that
+/// `StopRecording` kicked off has returned — so a second dictation can
+/// already be recording/transcribing by the time the first one's background
+/// thread completes. Without a per-dictation identity, that stale
+/// completion reads/writes the single shared `AppState.pipeline_state`
+/// slot, clobbering the live dictation's state (dropping its waveform,
+/// showing the wrong pill chrome, or emitting a stray event) for anywhere
+/// from an instant up to the completion's full settle-visibility window
+/// (1.5s for the "done" confirmation).
+///
+/// A generation minted at the START of a dictation is bumped by the NEXT
+/// `StartRecording`, so `generation_at_start == current_generation` means
+/// no newer dictation has begun — this completion is still the live one.
+/// `false` means a stale completion: the caller must no-op entirely (no
+/// state write, no event emit, no settle thread spawned) rather than apply
+/// any part of its result. Pure/total; the atomic bump/load stays thin OS
+/// glue in `lib.rs`.
+pub fn should_apply_dictation_completion(
+    generation_at_start: u64,
+    current_generation: u64,
+) -> bool {
+    generation_at_start == current_generation
 }
 
 #[cfg(test)]
@@ -203,11 +247,18 @@ mod tests {
     }
 
     #[test]
-    fn should_hide_pill_for_settle_hides_only_when_idle_and_epoch_unchanged_issue_155() {
-        // The normal case: the epoch captured at settle-start is still
-        // current (no newer settle has started) and the pipeline is still
-        // Idle by the time the delayed hide wakes up.
-        assert!(should_hide_pill_for_settle(1, 1, &PipelineState::Idle));
+    fn should_hide_pill_for_settle_hides_only_when_idle_and_epoch_and_generation_unchanged_issue_155(
+    ) {
+        // The normal case: the epoch AND generation captured at settle-start
+        // are still current (no newer settle, no newer dictation) and the
+        // pipeline is still Idle by the time the delayed hide wakes up.
+        assert!(should_hide_pill_for_settle(
+            1,
+            1,
+            1,
+            1,
+            &PipelineState::Idle
+        ));
     }
 
     #[test]
@@ -217,12 +268,16 @@ mod tests {
         // bumping it (2) before the first settle's delayed hide wakes up.
         // Even though the pipeline is (coincidentally) still/again Idle, the
         // stale settle must stand down rather than hide the pill out from
-        // under the newer settle's own still-live visible window.
+        // under the newer settle's own still-live visible window. Same
+        // dictation generation throughout (1) — this is purely an
+        // overlapping-settle race, not a new dictation.
         let epoch_at_settle = 1;
         let current_epoch = 2;
         assert!(!should_hide_pill_for_settle(
             epoch_at_settle,
             current_epoch,
+            1,
+            1,
             &PipelineState::Idle
         ));
     }
@@ -234,14 +289,141 @@ mod tests {
         assert!(!should_hide_pill_for_settle(
             1,
             1,
+            1,
+            1,
             &PipelineState::Recording
         ));
         assert!(!should_hide_pill_for_settle(
             1,
             1,
+            1,
+            1,
             &PipelineState::Transcribing
         ));
-        assert!(!should_hide_pill_for_settle(1, 1, &PipelineState::Error));
+        assert!(!should_hide_pill_for_settle(
+            1,
+            1,
+            1,
+            1,
+            &PipelineState::Error
+        ));
+    }
+
+    // Issues #174/#175/#176: a settle started by dictation #1 must stand
+    // down once dictation #2 has already started, even when #1's own epoch
+    // is still current (no *overlapping settle* raced it) and the pipeline
+    // instantaneously reads back as Idle (a stale read, or a narrow window
+    // before #2's own StartRecording write lands) — the generation check is
+    // the one guard that catches a stale dictation's completion where the
+    // epoch/state checks alone would not.
+    #[test]
+    fn should_hide_pill_for_settle_stands_down_when_a_newer_dictation_started_issues_174_175_176() {
+        let epoch_at_settle = 1;
+        let current_epoch = 1; // no overlapping settle
+        let generation_at_settle = 1;
+        let current_generation = 2; // a newer dictation has begun
+        assert!(!should_hide_pill_for_settle(
+            epoch_at_settle,
+            current_epoch,
+            generation_at_settle,
+            current_generation,
+            &PipelineState::Idle
+        ));
+    }
+
+    // Table test covering the interleavings called out in #174/#175/#176:
+    // hides iff idle AND epoch current AND generation current — any single
+    // guard failing must stand the settle down.
+    #[test]
+    fn should_hide_pill_for_settle_table_issues_174_175_176() {
+        struct Case {
+            epoch_at_settle: u64,
+            current_epoch: u64,
+            generation_at_settle: u64,
+            current_generation: u64,
+            state: PipelineState,
+            expected: bool,
+            label: &'static str,
+        }
+        let cases = [
+            Case {
+                epoch_at_settle: 1,
+                current_epoch: 1,
+                generation_at_settle: 1,
+                current_generation: 1,
+                state: PipelineState::Idle,
+                expected: true,
+                label: "all current, idle -> hides",
+            },
+            Case {
+                epoch_at_settle: 1,
+                current_epoch: 2,
+                generation_at_settle: 1,
+                current_generation: 1,
+                state: PipelineState::Idle,
+                expected: false,
+                label: "stale epoch (overlapping settle) -> stands down",
+            },
+            Case {
+                epoch_at_settle: 1,
+                current_epoch: 1,
+                generation_at_settle: 1,
+                current_generation: 2,
+                state: PipelineState::Idle,
+                expected: false,
+                label: "stale generation (newer dictation) -> stands down",
+            },
+            Case {
+                epoch_at_settle: 1,
+                current_epoch: 1,
+                generation_at_settle: 1,
+                current_generation: 1,
+                state: PipelineState::Recording,
+                expected: false,
+                label: "actively dictating -> never hides",
+            },
+            Case {
+                epoch_at_settle: 1,
+                current_epoch: 2,
+                generation_at_settle: 1,
+                current_generation: 2,
+                state: PipelineState::Idle,
+                expected: false,
+                label: "both stale (overlapping settle AND newer dictation) -> stands down",
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                should_hide_pill_for_settle(
+                    case.epoch_at_settle,
+                    case.current_epoch,
+                    case.generation_at_settle,
+                    case.current_generation,
+                    &case.state,
+                ),
+                case.expected,
+                "case: {}",
+                case.label
+            );
+        }
+    }
+
+    // Issues #174/#175/#176: the gate `run_pipeline_in_background` (and the
+    // settle helpers it calls) checks before ANY state write / event emit /
+    // settle spawn — a stale completion (an earlier dictation superseded by
+    // a newer one already in flight) must no-op entirely.
+    #[test]
+    fn should_apply_dictation_completion_only_when_generation_is_still_live_issues_174_175_176() {
+        assert!(should_apply_dictation_completion(1, 1));
+        assert!(should_apply_dictation_completion(42, 42));
+        // A completion from an earlier dictation (generation 1) arriving
+        // after a newer one (generation 2) has already started.
+        assert!(!should_apply_dictation_completion(1, 2));
+        // Defensive: a generation "from the future" relative to current
+        // (shouldn't happen — generations only move forward — but the
+        // predicate is exact equality, not <=, so this is naturally false
+        // too and never accidentally treated as live).
+        assert!(!should_apply_dictation_completion(2, 1));
     }
 
     #[test]
