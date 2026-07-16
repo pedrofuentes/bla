@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { GeneralTab } from "./GeneralTab";
+import { HistoryTab } from "./HistoryTab";
 import { TABS, type TabId } from "./tabs";
 
 /**
@@ -10,11 +11,11 @@ import { TABS, type TabId } from "./tabs";
  * component), so this window renders in a plain browser (mocked IPC) for
  * Playwright visual verification.
  *
- * General tab lands in this increment (issue #126, M2 PR 2.5); the rest
- * (History/Dictionary/Tone/Snippets) are later M2 increments — clicking one
- * shows a placeholder rather than being disabled, so the tab bar's final
- * shape (and switching between tabs) is exercised now without pulling
- * forward content that doesn't exist yet.
+ * General tab lands in issue #126 (M2 PR 2.5); History lands in issue #199
+ * (M3 PR 3.3). The rest (Dictionary/Tone/Snippets) are later M3+
+ * increments — clicking one shows a placeholder rather than being
+ * disabled, so the tab bar's final shape (and switching between tabs) is
+ * exercised now without pulling forward content that doesn't exist yet.
  */
 export function SettingsWindow() {
   const [active, setActive] = useState<TabId>("general");
@@ -49,12 +50,14 @@ export function SettingsWindow() {
         <h1 className="mb-4 text-lg font-semibold">Settings</h1>
         {active === "general" ? (
           <GeneralTab />
+        ) : active === "history" ? (
+          <HistoryTab />
         ) : (
           <p
             data-testid="placeholder-panel"
             className="text-sm text-neutral-500 dark:text-neutral-400"
           >
-            {activeLabel} settings are coming in a later M2 increment.
+            {activeLabel} settings are coming in a later M3 increment.
           </p>
         )}
       </section>
