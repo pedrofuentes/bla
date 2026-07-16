@@ -104,20 +104,31 @@ pub const INITIAL_PROMPT_MAX_CHARS: usize = 1024;
 /// Renders dictionary terms into the comma-separated string used as
 /// Whisper's `initial_prompt` (AC-21 / ADR-0004). Pure and deterministic:
 ///
+/// - NUL bytes inside a term are stripped (issue #69 — Rust `String`s can
+///   contain interior NULs, but a NUL surviving to whisper-rs's
+///   `set_initial_prompt` makes its internal `CString::new` reject it and
+///   panic; a term left empty by stripping is dropped like any other blank
+///   term).
 /// - Blank/whitespace-only terms are dropped.
 /// - Internal whitespace (including newlines/tabs) in each term collapses to
 ///   single spaces, so the prompt stays one line.
 /// - Terms are joined in the order given (callers control precedence) with
-///   `", "` as the separator.
+///   `", "` as the separator. Callers that want a specific tie-break under
+///   the length cap below control it by ordering `terms` accordingly (see
+///   `Store::list_terms`'s newest-first policy, issue #70).
 /// - A literal `\` or `,` inside a term is escaped (`\\`, `\,`) so the join
 ///   stays unambiguous.
-/// - The result is capped at [`INITIAL_PROMPT_MAX_CHARS`] bytes, dropping
-///   whole trailing terms rather than truncating one mid-term.
+/// - The result is capped at [`INITIAL_PROMPT_MAX_CHARS`] bytes. A term that
+///   doesn't fit is *skipped*, not treated as an end-of-input signal (issue
+///   #70) — an earlier oversized term no longer silently drops every term
+///   that follows it; whatever combination of terms fits, in the given
+///   order, is what's rendered.
 pub fn build_initial_prompt(terms: &[String]) -> String {
     let mut rendered = String::new();
 
     for term in terms {
-        let collapsed = term.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sanitized: String = term.chars().filter(|&c| c != '\0').collect();
+        let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
         if collapsed.is_empty() {
             continue;
         }
@@ -125,7 +136,7 @@ pub fn build_initial_prompt(terms: &[String]) -> String {
 
         let separator_len = if rendered.is_empty() { 0 } else { 2 };
         if rendered.len() + separator_len + escaped.len() > INITIAL_PROMPT_MAX_CHARS {
-            break;
+            continue;
         }
 
         if !rendered.is_empty() {
