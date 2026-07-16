@@ -254,6 +254,60 @@ pub fn should_restore_clipboard(set_to: &str, observed: &str) -> bool {
     observed == set_to
 }
 
+/// Shared clipboard-swap machinery (issue #257 refactor, factored out of
+/// this pair's originally-duplicated bodies): write `payload` to the
+/// clipboard, synthesize the paste keystroke, wait `restore_delay`, then
+/// restore `restore_to` unless [`should_restore_clipboard`] detects that
+/// something else changed the clipboard meanwhile.
+///
+/// The two public entry points below differ only in *what* `restore_to` is:
+/// [`paste_via_clipboard_swap`] reads it fresh off the clipboard at the top
+/// of its own call (correct for plain dictation — nothing else has touched
+/// the clipboard yet); [`replace_selection`] is handed it by the caller,
+/// carrying the pre-copy value [`capture_selection`] saved earlier, because
+/// by the time replace runs the clipboard already holds the mid-flow
+/// captured-selection value instead.
+fn clipboard_swap_write_and_restore(
+    clipboard: &impl Clipboard,
+    paste: &impl PasteSynthesizer,
+    sleep: impl FnOnce(Duration),
+    payload: ClipboardPayload,
+    restore_to: &str,
+    restore_delay: Duration,
+) -> io::Result<()> {
+    let text = payload.into_inner();
+    clipboard.set(&text)?;
+
+    // Issue #65 (Sentinel 🔴-when-wired): from this point on, the clipboard
+    // holds `text`, not the value it's meant to end up holding again. Every
+    // exit path below — the paste synthesizer failing (e.g. enigo failing
+    // on first-run macOS before Accessibility is granted) or the final
+    // observation read failing — must restore `restore_to` before
+    // returning, rather than propagating the error via `?` and leaving
+    // `text` permanently on the clipboard. The restore itself is
+    // best-effort: its own failure must never mask the original error being
+    // propagated.
+    if let Err(paste_err) = paste.synthesize_paste() {
+        let _ = clipboard.set(restore_to);
+        return Err(paste_err);
+    }
+
+    sleep(restore_delay);
+
+    match clipboard.get() {
+        Ok(observed) => {
+            if should_restore_clipboard(&text, &observed) {
+                clipboard.set(restore_to)?;
+            }
+            Ok(())
+        }
+        Err(observe_err) => {
+            let _ = clipboard.set(restore_to);
+            Err(observe_err)
+        }
+    }
+}
+
 /// Clipboard-swap paste (AC-9, ADR-0003): save the current clipboard, write
 /// the transcript, synthesize the paste keystroke, wait `restore_delay`,
 /// then restore the saved clipboard unless [`should_restore_clipboard`]
@@ -271,36 +325,7 @@ pub fn paste_via_clipboard_swap(
     restore_delay: Duration,
 ) -> io::Result<()> {
     let saved = clipboard.get()?;
-    let transcript = payload.into_inner();
-    clipboard.set(&transcript)?;
-
-    // Issue #65 (Sentinel 🔴-when-wired): from this point on, the clipboard
-    // holds the transcript, not the user's pre-dictation contents. Every
-    // exit path below — the paste synthesizer failing (e.g. enigo failing
-    // on first-run macOS before Accessibility is granted) or the final
-    // observation read failing — must restore `saved` before returning,
-    // rather than propagating the error via `?` and leaving the transcript
-    // permanently on the clipboard. The restore itself is best-effort: its
-    // own failure must never mask the original error being propagated.
-    if let Err(paste_err) = paste.synthesize_paste() {
-        let _ = clipboard.set(&saved);
-        return Err(paste_err);
-    }
-
-    sleep(restore_delay);
-
-    match clipboard.get() {
-        Ok(observed) => {
-            if should_restore_clipboard(&transcript, &observed) {
-                clipboard.set(&saved)?;
-            }
-            Ok(())
-        }
-        Err(observe_err) => {
-            let _ = clipboard.set(&saved);
-            Err(observe_err)
-        }
-    }
+    clipboard_swap_write_and_restore(clipboard, paste, sleep, payload, &saved, restore_delay)
 }
 
 /// The result of [`capture_selection`] (issue #257, AC-48): the captured
@@ -379,7 +404,10 @@ pub fn capture_selection(
 /// mid-flow captured-selection value, not the user's original contents — so
 /// the restore target has to be the value [`capture_selection`] saved
 /// earlier, passed in explicitly, not whatever `clipboard.get()` would
-/// return right now.
+/// return right now. Shares the actual write/paste/wait/restore-or-skip
+/// mechanics with `paste_via_clipboard_swap` via
+/// [`clipboard_swap_write_and_restore`] — this is the only difference
+/// between the two.
 pub fn replace_selection(
     clipboard: &impl Clipboard,
     paste: &impl PasteSynthesizer,
@@ -389,28 +417,14 @@ pub fn replace_selection(
     restore_delay: Duration,
 ) -> io::Result<()> {
     let restore_to = pre_copy_clipboard.into_inner();
-    let text = transformed.into_inner();
-    clipboard.set(&text)?;
-
-    if let Err(paste_err) = paste.synthesize_paste() {
-        let _ = clipboard.set(&restore_to);
-        return Err(paste_err);
-    }
-
-    sleep(restore_delay);
-
-    match clipboard.get() {
-        Ok(observed) => {
-            if should_restore_clipboard(&text, &observed) {
-                clipboard.set(&restore_to)?;
-            }
-            Ok(())
-        }
-        Err(observe_err) => {
-            let _ = clipboard.set(&restore_to);
-            Err(observe_err)
-        }
-    }
+    clipboard_swap_write_and_restore(
+        clipboard,
+        paste,
+        sleep,
+        transformed,
+        &restore_to,
+        restore_delay,
+    )
 }
 
 /// Real system clipboard via `arboard`. Thin OS glue (AGENTS.md
