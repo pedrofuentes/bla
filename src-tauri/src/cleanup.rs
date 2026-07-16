@@ -532,18 +532,39 @@ impl OllamaTransport for UreqTransport {
 /// invalid response; a timeout is surfaced distinctly; anything else is a
 /// connection failure. All three map to [`CleanupError::Unreachable`]
 /// upstream, so this only affects diagnostics, never the fallback decision.
+///
+/// Issue #74: previously classified `Transport` errors by substring-matching
+/// ("timed out"/"timeout") the error's *rendered Display message* — fragile
+/// to `ureq`/OS wording changes, and, as the added tests demonstrate,
+/// actively wrong in both directions (a real timeout with unexpected
+/// wording misses; an unrelated error whose message happens to mention
+/// "timeout" false-positives). [`transport_timed_out`] instead checks the
+/// typed `std::io::ErrorKind::TimedOut` on the transport's wrapped source
+/// error, which every timeout path in `ureq` 2.12 (connect timeout,
+/// per-read/write deadline checks — see `ureq::stream::io_err_timeout`)
+/// ultimately produces, regardless of which outer `ureq::ErrorKind` it gets
+/// wrapped in.
 fn classify_ureq_error(err: ureq::Error) -> TransportError {
     match err {
         ureq::Error::Status(_, _) => TransportError::InvalidResponse,
         ureq::Error::Transport(transport) => {
-            let msg = transport.to_string().to_lowercase();
-            if msg.contains("timed out") || msg.contains("timeout") {
+            if transport_timed_out(&transport) {
                 TransportError::Timeout
             } else {
                 TransportError::ConnectionFailed
             }
         }
     }
+}
+
+/// Whether a `ureq::Transport` error's underlying cause was a timeout,
+/// checked via the typed `io::ErrorKind::TimedOut` on its wrapped source
+/// error (issue #74) rather than substring-matching the error's rendered
+/// message. Pure and independent of any real socket.
+fn transport_timed_out(transport: &ureq::Transport) -> bool {
+    std::error::Error::source(transport)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut)
 }
 
 mod sealed {
