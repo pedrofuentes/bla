@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { click, flush, mount, typeInto, type Mounted } from "../../testUtils";
+import { blur, click, flush, focus, mount, typeInto, type Mounted } from "../../testUtils";
 import type { HistoryRow, Settings } from "../../lib/ipc";
 import { HistoryTab } from "./HistoryTab";
 
@@ -82,9 +82,9 @@ describe("HistoryTab (AC-32: search render + re-query)", () => {
     expect(invoke).toHaveBeenCalledWith("search_history", { query: "", limit: expect.any(Number) });
     expect(mounted.container.querySelector('[data-testid="history-row-1"]')).not.toBeNull();
     expect(mounted.container.querySelector('[data-testid="history-row-2"]')).not.toBeNull();
-    expect(
-      mounted.container.querySelector('[data-testid="history-preview-1"]')?.textContent,
-    ).toBe(ROW_A.cleaned);
+    expect(mounted.container.querySelector('[data-testid="history-preview-1"]')?.textContent).toBe(
+      ROW_A.cleaned,
+    );
   });
 
   it("shows a loading state before the first search resolves", async () => {
@@ -239,8 +239,9 @@ describe("HistoryTab (AC-34: retention-days round trip)", () => {
     const input = mounted.container.querySelector<HTMLInputElement>(
       '[data-testid="history-retention-input"]',
     )!;
+    focus(input);
     typeInto(input, "30");
-    input.dispatchEvent(new Event("blur", { bubbles: true }));
+    blur(input);
     await flush();
 
     expect(invoke).toHaveBeenCalledWith("set_settings", {
@@ -255,8 +256,9 @@ describe("HistoryTab (AC-34: retention-days round trip)", () => {
     const input = mounted.container.querySelector<HTMLInputElement>(
       '[data-testid="history-retention-input"]',
     )!;
+    focus(input);
     typeInto(input, "7");
-    input.dispatchEvent(new Event("blur", { bubbles: true }));
+    blur(input);
     await flush();
 
     // Simulate a reload: unmount, point get_settings at the now-persisted
