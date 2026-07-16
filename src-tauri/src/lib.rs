@@ -2057,6 +2057,10 @@ pub fn run() {
             commands::model_registry,
             commands::suspend_hotkey,
             commands::resume_hotkey,
+            commands::search_history,
+            commands::copy_history_entry,
+            commands::delete_history_entry,
+            commands::clear_history,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
