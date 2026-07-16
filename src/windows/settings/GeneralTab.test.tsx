@@ -126,6 +126,45 @@ describe("GeneralTab", () => {
   });
 
   // -------------------------------------------------------------------
+  // Issue #147 (Sentinel SNTL-20260713-bla-PR134-fe641e0): the mount effect's
+  // `get_settings` and `download_selected_model` catch arms were uncovered —
+  // "A test here would have caught the Loading-forever 🟡."
+  // -------------------------------------------------------------------
+
+  it("stays in the loading state without crashing when the initial get_settings fetch rejects (#147)", async () => {
+    // `settings` never gets set on this path, so the component never leaves
+    // its `if (!settings) return <p>Loading…</p>` gate — the discriminating
+    // property of the `.catch` here is that the rejection is actually
+    // caught (never left unhandled, which `pnpm test` treats as a run
+    // failure) rather than that anything renders differently.
+    setupInvoke({
+      get_settings: () => Promise.reject(new Error("settings file corrupted")),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    expect(mounted.container.textContent).toMatch(/loading/i);
+    expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
+  });
+
+  it("shows an error status and a save-error message when the initial model-download check rejects (#147)", async () => {
+    setupInvoke({
+      download_selected_model: () => Promise.reject(new Error("network unreachable")),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="model-status"]')?.textContent).toBe(
+      "Download failed",
+    );
+    expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
+      /network unreachable/i,
+    );
+  });
+
+  // -------------------------------------------------------------------
   // Issue #183: auto-apply on change — each control calls set_settings
   // immediately, with a brief "Saved" confirmation, rather than requiring a
   // separate Save click the cofounder never found in the AC-7 smoke test.
@@ -164,6 +203,38 @@ describe("GeneralTab", () => {
     expect(invoke).toHaveBeenCalledWith("set_settings", {
       settings: { ...BASE_SETTINGS, model_preset: "Small" },
     });
+    expect(invoke).toHaveBeenCalledWith("download_selected_model");
+  });
+
+  it("re-checks model download status only AFTER set_settings resolves, not before (post-save recheck, #148)", async () => {
+    // Sentinel SNTL-20260713-bla-PR134-fe641e0 (issue #148): `runApply`
+    // re-checks the newly-selected preset's on-disk status only inside the
+    // success branch, AFTER the `set_settings` await — a genuine post-save
+    // recheck, not a fire-and-forget alongside it. Proven by holding
+    // `set_settings` open and observing `download_selected_model` has NOT
+    // been called yet, then resolving it and observing that it has.
+    let resolveSet: (() => void) | undefined;
+    setupInvoke({
+      set_settings: () => new Promise<void>((resolve) => (resolveSet = () => resolve())),
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const modelSelect = mounted.container.querySelector<HTMLSelectElement>(
+      '[data-testid="model-preset-select"]',
+    )!;
+    invoke.mockClear();
+    change(modelSelect, "Small");
+    await flush();
+
+    // set_settings is still in flight — the recheck must not have fired yet.
+    expect(invoke).toHaveBeenCalledWith("set_settings", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("download_selected_model");
+
+    resolveSet!();
+    await flush();
+
     expect(invoke).toHaveBeenCalledWith("download_selected_model");
   });
 
@@ -370,6 +441,70 @@ describe("GeneralTab", () => {
     )!;
     expect(applyButton.disabled).toBe(true);
     expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+  });
+
+  it("clears an invalid-capture's error on a valid recapture, letting Apply proceed (#146)", async () => {
+    // Sentinel SNTL-20260713-bla-PR134-fe641e0 (issue #146): a missed
+    // `setHotkeyError(null)` regression would leave the stale error from an
+    // earlier invalid capture stuck, permanently disabling Apply even for a
+    // later, genuinely valid chord — with no test signal. `beginCapture`
+    // clears `hotkeyError` the instant a NEW capture starts (refocus), before
+    // the new chord's own `validate_hotkey` probe has had a chance to
+    // resolve — asserted here by controlling that second probe so it hasn't
+    // settled yet when Apply is checked.
+    let validateCall = 0;
+    let resolveSecondValidate: (() => void) | undefined;
+    setupInvoke({
+      validate_hotkey: () => {
+        validateCall += 1;
+        if (validateCall === 1) return Promise.reject(new Error("bad accelerator"));
+        return new Promise<void>((resolve) => (resolveSecondValidate = () => resolve()));
+      },
+    });
+
+    mounted = mount(<GeneralTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="hotkey-input"]',
+    )!;
+    const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="hotkey-apply-button"]',
+    )!;
+
+    // Invalid capture #1: error shown, Apply disabled.
+    focus(input);
+    keydown(input, "Z", { ctrlKey: true });
+    await flush();
+    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')?.textContent).toMatch(
+      /bad accelerator/i,
+    );
+    expect(applyButton.disabled).toBe(true);
+
+    // Refocusing to recapture clears the stale error immediately, before any
+    // keystroke of the new capture.
+    focus(input);
+    await flush();
+    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')).toBeNull();
+
+    // Valid recapture: its own validate_hotkey probe is still pending, yet
+    // Apply is already enabled — the earlier error didn't linger.
+    keydown(input, "D", { ctrlKey: true, shiftKey: true });
+    await flush();
+    expect(mounted.container.querySelector('[data-testid="hotkey-error"]')).toBeNull();
+    expect(applyButton.disabled).toBe(false);
+
+    invoke.mockClear();
+    click(applyButton);
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("set_settings", {
+      settings: { ...BASE_SETTINGS, hotkey: "Control+Shift+D" },
+    });
+    expect(mounted.container.querySelector('[data-testid="hotkey-pending"]')).toBeNull();
+
+    resolveSecondValidate?.(); // drain the still-outstanding probe
+    await flush();
   });
 
   it("shows a save-error AND rolls the control back to its pre-change value when set_settings rejects", async () => {
