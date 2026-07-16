@@ -93,7 +93,9 @@ Your speech is transcribed on-device, cleaned up (filler words removed, punctuat
 **Output modes:**
 
 - **Cursor-paste mode** (default): the cleaned text is pasted directly at your cursor position in whatever app is currently focused — notes, email, chat, browser forms, anything.
-- **File-output mode**: instead of pasting, the cleaned text is appended to a Markdown file, regardless of which app has focus. This is designed for a frictionless "dictate straight into today's note" workflow — e.g. an Obsidian daily note. The output path supports templating like `{{date:YYYY-MM-DD}}`, so each day's dictation lands in the right daily-note file automatically, with optional timestamps per entry, creating the file if it doesn't already exist.
+- **File-output mode**: instead of pasting, the cleaned text is appended to a Markdown file, regardless of which app has focus. This is designed for a frictionless "dictate straight into today's note" workflow — e.g. an Obsidian daily note. It's configured under **Settings → Output**, once "Append to a file" is selected:
+  - **Base folder (vault)** — the folder dictations are appended into, e.g. your Obsidian vault's path. Leave it blank to use bla's app-data folder.
+  - **Path template** — where, relative to the base folder, each dictation lands. Supports `{{date:YYYY-MM-DD}}` and `{{time:HH:mm}}` tokens, e.g. `daily/{{date:YYYY-MM-DD}}.md`, so each day's dictation lands in the right daily-note file automatically. The file is created if it doesn't already exist, with optional timestamps per entry.
 
 ## Status
 
