@@ -846,13 +846,109 @@ mod tests {
 
     #[test]
     fn retention_cutoff_ms_of_zero_days_means_keep_forever() {
-        assert_eq!(retention_cutoff_ms(1_000_000, 0), None);
+        assert_eq!(retention_cutoff_ms(1_000_000, 0, None), None);
     }
 
     #[test]
     fn retention_cutoff_ms_of_positive_days_subtracts_the_injected_now() {
         let now_ms: i64 = 10 * 24 * 60 * 60 * 1000; // day 10
-        let cutoff = retention_cutoff_ms(now_ms, 3).unwrap();
+        let cutoff = retention_cutoff_ms(now_ms, 3, None).unwrap();
         assert_eq!(cutoff, 7 * 24 * 60 * 60 * 1000); // day 7
+    }
+
+    // -------------------------------------------------------------
+    // Issue #219 (SNTL-20260715-bla-PR218-cc04f8b): clock-skew hardening.
+    // Without a guard, a backward clock jump (or bad system time) can make
+    // the retention cutoff computed from wall-clock `now_ms` land in the
+    // apparent future relative to every row that actually exists, and
+    // `prune_history` would then delete all of history. `retention_cutoff_ms`
+    // takes the newest recorded row's timestamp as a sanity check and
+    // applies clamp/skip semantics against it.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn retention_cutoff_ms_is_unaffected_by_the_guard_when_the_clock_is_sane() {
+        // Normal case: `now` is safely after the newest row, and the
+        // computed cutoff doesn't exceed it either — the guard must be a
+        // complete no-op here, identical to passing `None`.
+        let now_ms: i64 = 10 * 24 * 60 * 60 * 1000; // day 10
+        let newest_row_ms = 9 * 24 * 60 * 60 * 1000; // day 9
+        let cutoff = retention_cutoff_ms(now_ms, 3, Some(newest_row_ms)).unwrap();
+        assert_eq!(cutoff, 7 * 24 * 60 * 60 * 1000); // day 7, same as the unguarded case
+    }
+
+    #[test]
+    fn retention_cutoff_ms_skips_pruning_when_now_is_before_the_newest_recorded_row_issue_219() {
+        // Direct proof of a backward clock skew: `now` can never
+        // legitimately read earlier than a timestamp that was already
+        // recorded (rows are inserted at `now` at the time). When it does,
+        // "now" cannot be trusted to compute any cutoff at all, so pruning
+        // must be skipped entirely (`None`) rather than compute a
+        // plausible-looking but untrustworthy value.
+        let now_ms = 1_000;
+        let newest_row_ms = 5_000;
+        assert_eq!(retention_cutoff_ms(now_ms, 1, Some(newest_row_ms)), None);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_clamps_to_the_newest_row_rather_than_exceeding_it_issue_219() {
+        // A `now_ms` far enough in the future (bad system time, or a
+        // corrected clock jump) can push the raw cutoff past every row
+        // that exists, which would otherwise prune all of history. The
+        // cutoff must never exceed the newest row's own timestamp, so that
+        // row (the most recent one) can never be pruned by a
+        // miscalculated cutoff.
+        let now_ms: i64 = 100_000_000;
+        let retention_days = 1; // 86_400_000 ms
+        let newest_row_ms = 5_000;
+        let raw_cutoff = now_ms - i64::from(retention_days) * 24 * 60 * 60 * 1000;
+        assert!(
+            raw_cutoff > newest_row_ms,
+            "test setup must actually exercise the clamp"
+        );
+
+        assert_eq!(
+            retention_cutoff_ms(now_ms, retention_days, Some(newest_row_ms)),
+            Some(newest_row_ms)
+        );
+    }
+
+    #[test]
+    fn newest_history_timestamp_is_none_for_an_empty_store() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.newest_history_timestamp().unwrap(), None);
+    }
+
+    #[test]
+    fn newest_history_timestamp_returns_the_max_created_at_ms() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_history(1_000, "a", "a.", None).unwrap();
+        store.insert_history(3_000, "b", "b.", None).unwrap();
+        store.insert_history(2_000, "c", "c.", None).unwrap();
+
+        assert_eq!(store.newest_history_timestamp().unwrap(), Some(3_000));
+    }
+
+    #[test]
+    fn clock_skew_backwards_jump_cannot_mass_delete_history_issue_219() {
+        // End-to-end discriminating test at the Store level: rows recorded
+        // with a correct clock, then a "now" that reads BEFORE those rows
+        // (simulating the clock having jumped backward since) must not
+        // delete anything, however large `retention_days` is.
+        let store = Store::open_in_memory().unwrap();
+        store.insert_history(10_000, "a", "a.", None).unwrap();
+        store.insert_history(20_000, "b", "b.", None).unwrap();
+        store.insert_history(30_000, "c", "c.", None).unwrap();
+
+        let skewed_now_ms = 5_000; // before every row above
+        let newest = store.newest_history_timestamp().unwrap();
+        let cutoff = retention_cutoff_ms(skewed_now_ms, 365, newest);
+        let deleted = match cutoff {
+            Some(cutoff_ms) => store.prune_history(cutoff_ms).unwrap(),
+            None => 0,
+        };
+
+        assert_eq!(deleted, 0, "a clock-skewed `now` must not prune anything");
+        assert_eq!(store.search_history("", 10).unwrap().len(), 3);
     }
 }
