@@ -278,6 +278,7 @@ mod tests {
             file_base_dir: "/Users/cofounder/Obsidian/Vault".to_string(),
             launch_at_login: true,
             sound_cues: false,
+            retention_days: 30,
         }
     }
 
@@ -308,6 +309,7 @@ mod tests {
         assert_ne!(default.file_base_dir, non_default.file_base_dir);
         assert_ne!(default.launch_at_login, non_default.launch_at_login);
         assert_ne!(default.sound_cues, non_default.sound_cues);
+        assert_ne!(default.retention_days, non_default.retention_days);
     }
 
     #[test]
@@ -331,6 +333,7 @@ mod tests {
         assert_eq!(partial.file_base_dir, Settings::default().file_base_dir);
         assert_eq!(partial.launch_at_login, Settings::default().launch_at_login);
         assert_eq!(partial.sound_cues, Settings::default().sound_cues);
+        assert_eq!(partial.retention_days, Settings::default().retention_days);
     }
 
     // -------------------------------------------------------------
@@ -416,6 +419,44 @@ mod tests {
             "journal/{{date:YYYY-MM-DD}}.md"
         );
         assert_eq!(restored.file_base_dir, Settings::default().file_base_dir);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #198 (AC-31): `retention_days` (0 = keep forever, matching
+    // `store::retention_cutoff_ms`'s existing contract) defaults to 0 so a
+    // settings.json persisted by a pre-#198 build (which never pruned
+    // history at all) keeps that same unbounded-history behavior after
+    // upgrading, rather than silently starting to delete history the user
+    // never asked to have pruned.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn retention_days_defaults_to_zero_meaning_keep_forever() {
+        assert_eq!(Settings::default().retention_days, 0);
+    }
+
+    #[test]
+    fn pre_198_settings_json_without_retention_days_still_deserializes_with_a_default_of_zero() {
+        // Mirrors a real settings.json written by a pre-#198 build: every
+        // field earlier PRs introduced, but no `retention_days`.
+        let old_json = r#"{
+            "hotkey": "Control+Shift+D",
+            "recording_mode": "Toggle",
+            "model_preset": "Small",
+            "output_mode": "File",
+            "file_path_template": "journal/{{date:YYYY-MM-DD}}.md",
+            "file_base_dir": "/Users/cofounder/Obsidian/Vault",
+            "launch_at_login": true,
+            "sound_cues": false
+        }"#;
+
+        let restored = from_json(old_json).unwrap();
+
+        assert_eq!(
+            restored.file_path_template,
+            "journal/{{date:YYYY-MM-DD}}.md"
+        );
+        assert_eq!(restored.retention_days, 0);
     }
 
     // -------------------------------------------------------------
