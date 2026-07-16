@@ -207,7 +207,42 @@ pub fn clamp_level(level: f32) -> f32 {
 /// Write a captured window of 16 kHz mono `f32` samples out as a 16-bit PCM
 /// WAV file, so the pipeline and tests can round-trip a captured window
 /// (e.g. as an `stt` input fixture).
+///
+/// Issue #61: writes to a sibling temp file first and only [`std::fs::rename`]s
+/// it onto `path` once the WAV is fully written and finalized — mirroring the
+/// existing download-then-promote pattern in `models.rs`
+/// (`download_model_with_spec`'s `.partial` file). A mid-write error (disk
+/// full, permission change, a killed process) can therefore never leave a
+/// truncated/corrupt file at `path`: either the rename happens (a complete,
+/// valid WAV) or it doesn't (whatever was at `path` before, untouched). The
+/// temp file is best-effort cleaned up on any failure.
 pub fn write_wav_16k_mono(samples: &[f32], path: &std::path::Path) -> std::io::Result<()> {
+    let tmp_path = wav_tmp_path(path);
+    match write_wav_16k_mono_uncommitted(samples, &tmp_path) {
+        Ok(()) => std::fs::rename(&tmp_path, path),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(err)
+        }
+    }
+}
+
+/// Deterministic sibling temp path for [`write_wav_16k_mono`]'s
+/// write-then-rename: same directory as `path` (so the final `fs::rename`
+/// is same-filesystem and therefore atomic on both POSIX and Windows) with
+/// a `.tmp-<pid>` suffix appended to the full file name, so a leftover temp
+/// file from a killed process is trivially identifiable and never collides
+/// with `path` itself.
+fn wav_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".tmp-{}", std::process::id()));
+    std::path::PathBuf::from(name)
+}
+
+/// The actual WAV-writing logic (issue #61's original body, unchanged),
+/// factored out so [`write_wav_16k_mono`] can run it against a temp path
+/// before committing via rename.
+fn write_wav_16k_mono_uncommitted(samples: &[f32], path: &std::path::Path) -> std::io::Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: TARGET_SAMPLE_RATE,
@@ -778,6 +813,88 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #61: write_wav_16k_mono must never leave a truncated/partial
+    // WAV at its destination path if the write fails partway through.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn write_wav_16k_mono_leaves_existing_destination_untouched_on_write_failure_issue_61() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "bla_audio_test_atomic_wav_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("out.wav");
+
+        // Pre-populate the destination with known "prior good" bytes -- the
+        // realistic scenario issue #61 is about: overwriting a previous
+        // recording that a failed write must not corrupt or truncate.
+        std::fs::write(&path, b"PRIOR-GOOD-WAV-BYTES").expect("seed prior file");
+
+        // Make the directory read-only so creating any NEW file inside it
+        // (the temp file an atomic write-then-rename needs) fails with
+        // permission denied -- deterministically forcing the write path to
+        // fail without needing to actually fill the disk.
+        let original_perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+
+        // Sanity-check the environment actually enforces permission bits
+        // (it won't running as root) -- skip rather than flake if not.
+        let canary = dir.join("canary");
+        if std::fs::write(&canary, b"x").is_ok() {
+            let _ = std::fs::remove_file(&canary);
+            let _ = std::fs::set_permissions(&dir, original_perms);
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!(
+                "skipping write_wav_16k_mono_leaves_existing_destination_untouched_on_write_failure_issue_61: \
+                 directory permissions aren't enforced in this environment (likely running as root)"
+            );
+            return;
+        }
+
+        let samples = vec![0.1_f32; 100];
+        let result = write_wav_16k_mono(&samples, &path);
+
+        // Restore permissions before asserting/cleaning up so a failing
+        // assertion can't leak a read-only temp dir.
+        std::fs::set_permissions(&dir, original_perms).expect("restore dir permissions");
+
+        assert!(
+            result.is_err(),
+            "expected the write to fail while the destination directory is read-only"
+        );
+
+        let leftover = std::fs::read(&path).expect("destination path must still exist");
+        assert_eq!(
+            leftover, b"PRIOR-GOOD-WAV-BYTES",
+            "issue #61: a failed write must never touch the existing destination file \
+             (no truncated/partial WAV left behind)"
+        );
+
+        let stray: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|name| name != std::ffi::OsStr::new("out.wav"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "no leftover temp file should remain after a failed write, found {stray:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
