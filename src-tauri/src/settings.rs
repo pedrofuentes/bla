@@ -78,6 +78,18 @@ pub struct Settings {
     /// in this PR — actual cue playback is wired up in PR 2.7, which reads
     /// this flag.
     pub sound_cues: bool,
+    /// How many days of dictation history to keep before it's eligible for
+    /// pruning (issue #198, AC-31). `0` means "keep forever" — matching
+    /// `store::retention_cutoff_ms`'s existing contract, where
+    /// `retention_days == 0` returns `None` (no cutoff) rather than a
+    /// cutoff of "now" that would prune everything. Defaults to `0` so a
+    /// settings.json from before this field existed (which never pruned
+    /// history) keeps that same unbounded-history behavior after
+    /// upgrading. The actual prune (`store::retention_cutoff_ms` +
+    /// `Store::prune_history`) runs on startup and on every settings save
+    /// — thin OS glue in `lib.rs`/`commands::set_settings`; this field is
+    /// only the durable preference.
+    pub retention_days: u32,
 }
 
 impl Default for Settings {
@@ -102,6 +114,7 @@ impl Default for Settings {
             file_base_dir: String::new(),
             launch_at_login: false,
             sound_cues: true,
+            retention_days: 0,
         }
     }
 }
