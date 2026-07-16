@@ -9,9 +9,10 @@ import type { PipelineErrorEvent } from "./ipc";
 
 /**
  * How a toast is styled: `"informational"` for the AC-4 Ollama-unreachable
- * fallback (the dictation still completed and pasted — this is a heads-up,
- * not a failure); `"blocking"` for everything else, where the pipeline
- * could not complete this dictation at all.
+ * fallback and issue #220's history-persist-failure notice (both cases
+ * where the dictation still completed and pasted — a heads-up, not a
+ * failure); `"blocking"` for everything else, where the pipeline could not
+ * complete this dictation at all.
  */
 export type ToastTone = "informational" | "blocking";
 
@@ -20,18 +21,20 @@ export interface Toast {
   message: string;
 }
 
+/** Kinds `toastForError` renders as an `"informational"` toast (mirrors `errors::ErrorKind::is_blocking` on the Rust side). */
+const INFORMATIONAL_KINDS = new Set(["OllamaUnreachable", "HistoryPersistFailed"]);
+
 /**
  * Maps a `pipeline-error` event payload to the pill toast's display spec.
- * `"OllamaUnreachable"` is the only informational kind (mirrors
- * `errors::ErrorKind::is_blocking` on the Rust side); every other kind —
- * including any not-yet-known future kind, so an unrecognized value fails
- * safe rather than under-alarming the user — is blocking. `message` passes
- * through unchanged: the Rust side already guarantees it's static and
+ * Every kind not in {@link INFORMATIONAL_KINDS} — including any
+ * not-yet-known future kind, so an unrecognized value fails safe rather
+ * than under-alarming the user — is blocking. `message` passes through
+ * unchanged: the Rust side already guarantees it's static and
  * kind-derived, never transcript/clipboard/audio content.
  */
 export function toastForError(event: PipelineErrorEvent): Toast {
   return {
-    tone: event.kind === "OllamaUnreachable" ? "informational" : "blocking",
+    tone: INFORMATIONAL_KINDS.has(event.kind) ? "informational" : "blocking",
     message: event.message,
   };
 }
