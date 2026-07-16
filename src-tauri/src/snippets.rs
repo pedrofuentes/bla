@@ -19,10 +19,76 @@
 //! `trigger`/`body`, are user content — nothing in this module
 //! `println!`/`log!`s any of them, mirroring [`Snippet`]'s own doc comment
 //! on `store.rs`.
-//!
-//! TDD red step (issue #260): this file currently declares tests only —
-//! `match_snippet`/`trigger_matches` don't exist yet, so `cargo test` fails
-//! to compile. The next commit adds the implementation (green).
+
+#![allow(dead_code)] // Not yet wired to the pipeline/commands layer (#263).
+
+use crate::store::Snippet;
+
+/// Given a transcript `text` and the caller-supplied `snippets` (typically
+/// [`crate::store::Store::list_snippets`]'s result, though this function
+/// imposes no ordering of its own — see below), returns the stored
+/// [`Snippet::body`] of the **first** snippet (in `snippets`' given slice
+/// order) whose `trigger` is present in `text`, or `None` if no trigger
+/// matches.
+///
+/// - **First-match-in-list-order wins** (AC-52, mirroring AC-40's
+///   `resolve_tone_for_app` precedent in `context.rs`): if two snippets'
+///   triggers both appear in `text`, the one appearing earlier in
+///   `snippets` wins — simple and predictable, consistent with how
+///   `resolve_tone_for_app` already resolves overlapping `ToneRule`
+///   matches. This function does not itself decide what "list order"
+///   means (oldest-first, newest-first, ...) — that is entirely up to
+///   whatever order the caller passes in.
+/// - **Case-insensitive** (AC-52): matches `trigger_matches`'s semantics,
+///   see its own doc comment.
+/// - **Word-boundary-aware** (AC-52's "documented match-boundary
+///   decision"): see `trigger_matches`.
+pub(crate) fn match_snippet(text: &str, snippets: &[Snippet]) -> Option<String> {
+    snippets
+        .iter()
+        .find(|snippet| trigger_matches(text, &snippet.trigger))
+        .map(|snippet| snippet.body.clone())
+}
+
+/// Pure case-insensitive, word-boundary-aware match of `trigger` against
+/// `text`. Issue #260's match-boundary decision (documented here since the
+/// issue left the exact choice to the implementer):
+///
+/// - **Case-insensitive**: a spoken trigger phrase transcribed by
+///   whisper.cpp can surface with arbitrary capitalization (sentence-start
+///   capitalization, a proper-noun-like trigger, ...) that has nothing to
+///   do with what the user actually typed when configuring the snippet —
+///   forcing exact-case matches would make the feature unreliable for the
+///   common case. Same rationale as `context.rs`'s `app_pattern_matches`.
+/// - **Word-boundary-anchored, not a bare substring match**: a trigger
+///   like "sig" must NOT fire inside an unrelated transcribed word like
+///   "signature" or "design" — only when it appears as its own word (or
+///   phrase, for multi-word triggers) surrounded by non-word characters or
+///   the ends of `text`. A bare substring match would make short, common
+///   triggers unusably trigger-happy (a real risk for a dictation feature,
+///   where "sig" or "addr"-style short triggers are exactly the kind of
+///   thing users configure for speed). This reuses the SAME `\b`
+///   word-boundary primitive `cleanup.rs`'s `FillerPatterns::interjection`
+///   already relies on to avoid matching "um"/"uh"/"er" inside longer
+///   words — established precedent in this crate for boundary-anchored,
+///   case-insensitive matching against transcript text.
+/// - Implemented by escaping `trigger` into a literal (via `regex::escape`,
+///   mirroring `app_pattern_matches`'s own escaping of literal pattern
+///   text) and wrapping it in `(?i)\b...\b` — reuses the `regex` crate
+///   already in the dependency tree rather than hand-rolling a second
+///   boundary-scanning matcher.
+/// - An empty `trigger` never matches anything (defensive: `\b\b` against
+///   an empty pattern would otherwise match at almost every position in
+///   `text`, which is never a meaningful "trigger present" answer).
+fn trigger_matches(text: &str, trigger: &str) -> bool {
+    if trigger.is_empty() {
+        return false;
+    }
+    let pattern = format!(r"(?i)\b{}\b", regex::escape(trigger));
+    regex::Regex::new(&pattern)
+        .map(|re| re.is_match(text))
+        .unwrap_or(false)
+}
 
 #[cfg(test)]
 mod tests {
