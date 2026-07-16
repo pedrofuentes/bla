@@ -100,6 +100,52 @@ pub fn pill_visibility_for(state: &PipelineState) -> bool {
     !matches!(state, PipelineState::Idle)
 }
 
+/// The tray/pill's full display truth at a point in time: the pipeline
+/// state plus whether the pill should be visible for it. Bundled into one
+/// struct (issue #128) so `lib.rs::AppState` can guard both fields with a
+/// SINGLE mutex — `state` and `show_pill` are written together, atomically,
+/// every time (`apply_pipeline_state`'s `show_pill` parameter is not always
+/// `pill_visibility_for(&state)`; the AC-4 notice / issue-#151 done-settle
+/// paths pass `show_pill = true` for an `Idle` state so a toast/confirmation
+/// stays visible on a pill the plain rule would otherwise hide). Splitting
+/// them into two independently-locked fields would reopen exactly the kind
+/// of check-then-act gap this issue closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineDisplay {
+    pub state: PipelineState,
+    pub show_pill: bool,
+}
+
+/// What a `run_on_main_thread` closure should apply to the tray icon and
+/// pill visibility, given whatever [`PipelineDisplay`] is CURRENT in
+/// `AppState` at the moment the closure actually executes (issue #128).
+///
+/// **The race this closes:** `apply_pipeline_state` used to compute
+/// `show_pill`/the icon state ONCE, at enqueue time, and capture that local
+/// value in the `run_on_main_thread` closure. The state write (into
+/// `AppState`), that snapshot, and the `run_on_main_thread` enqueue were
+/// three separate steps — not atomic as a unit. Two same-generation
+/// `apply_pipeline_state` calls (e.g. one from the hotkey thread, one from
+/// the pipeline thread) could therefore enqueue closures whose CAPTURED
+/// snapshots reflect one chronological order while the main thread executes
+/// them in the other order: an older call's closure applying its stale
+/// snapshot strictly AFTER a newer call's closure already applied the
+/// current truth — leaving the pill stuck visible-while-`Idle`, or hidden
+/// while `Recording`, until the next unrelated transition happened to
+/// overwrite it.
+///
+/// The fix: closures no longer carry a captured snapshot at all. Every
+/// closure re-derives its `(TrayIconState, show_pill)` by calling this
+/// function against whatever `PipelineDisplay` `AppState`'s single mutex
+/// currently holds, read at execution time. However many closures end up
+/// running, in whatever order, each one applies the SAME current truth —
+/// so the on-screen result always matches the true current state the
+/// instant the last closure (of however many are in flight) runs, rather
+/// than depending on which stale closure happened to run last.
+pub fn resolve_display(current: &PipelineDisplay) -> (TrayIconState, bool) {
+    (tray_icon_state(&current.state), current.show_pill)
+}
+
 /// Whether an *elapsed* informational-notice period should now hide the pill
 /// (issue #126, M2 PR 2.4; Sentinel 🔴-2 on PR #135). The AC-4
 /// Ollama-unreachable toast is informational — the dictation still pasted —

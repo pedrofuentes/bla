@@ -119,7 +119,19 @@ pub(crate) struct AppState {
     level_poll_stop: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     settings: Mutex<settings::Settings>,
     output_switch: Mutex<tray::OutputModeSwitch>,
-    pipeline_state: Mutex<tray::PipelineState>,
+    /// The tray/pill's current display truth (issue #128): pipeline state
+    /// PLUS whether the pill should be visible for it, guarded by a SINGLE
+    /// mutex so the two are always written together atomically — see
+    /// [`tray::PipelineDisplay`]'s doc for why they're bundled rather than
+    /// two separately-locked fields. `apply_pipeline_state` writes this
+    /// once per call; its `run_on_main_thread` closure re-reads it AT
+    /// EXECUTION TIME via [`tray::resolve_display`] rather than closing
+    /// over a value captured when the closure was created — this is what
+    /// closes the intra-generation enqueue-order race (state-write,
+    /// visibility snapshot, and closure enqueue were not atomic as a unit,
+    /// so two same-generation calls' closures could apply out of
+    /// chronological order).
+    pipeline_display: Mutex<tray::PipelineDisplay>,
     /// The tray menu's disabled current-state line (issue #110):
     /// `set_pipeline_state` keeps its text in sync with the emitted
     /// `pipeline-state-changed` event/icon. `None` until `setup()` builds
@@ -158,7 +170,7 @@ pub(crate) struct AppState {
     /// dictation can already be recording/transcribing by the time the
     /// first one's background completion runs. Without a per-dictation
     /// identity, that stale completion reads/writes the single shared
-    /// `AppState.pipeline_state` slot, clobbering the live dictation's state
+    /// `AppState.pipeline_display` slot, clobbering the live dictation's state
     /// (dropping its waveform, showing wrong pill chrome, emitting a stray
     /// event) for anywhere from an instant up to the completion's full
     /// settle-visibility window. A stale generation means "no-op entirely."
@@ -1773,12 +1785,31 @@ fn set_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState) {
 /// (`settle_idle_keeping_pill_for_notice`, Sentinel 🔴-2 on PR #135) passes
 /// `true` so the transient toast is shown on a *visible* pill even as the
 /// pipeline settles to `Idle`.
+///
+/// **Issue #128 (intra-generation enqueue-order race):** this function
+/// writes `AppState::pipeline_display` and enqueues a `run_on_main_thread`
+/// closure, but those two steps are not atomic as a unit — two
+/// same-generation calls (e.g. one from the hotkey thread, one from the
+/// pipeline thread) can have their closures run on the main thread in
+/// either order, independent of which call's write happened first. The old
+/// code captured `show_pill`/the icon state ONCE, in a local, at the moment
+/// the closure was created — so whichever closure happened to run LAST won,
+/// even if it was enqueued by the chronologically OLDER call. The fix: the
+/// closure carries no captured snapshot at all. It re-reads
+/// `AppState::pipeline_display` itself, AT EXECUTION TIME, via
+/// [`tray::resolve_display`] — so no matter which call enqueued it or what
+/// order closures run in, every closure applies whatever is CURRENTLY true
+/// the instant it runs, not a stale point-in-time snapshot. See
+/// [`tray::PipelineDisplay`] and [`tray::resolve_display`]'s docs for the
+/// full mechanism and why `state`+`show_pill` are bundled under one mutex.
 fn apply_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState, show_pill: bool) {
     let state = app.state::<AppState>();
-    *state.pipeline_state.lock().unwrap() = new_state;
-    let icon_state = tray::tray_icon_state(&new_state);
-    let icon_label = format!("{icon_state:?}");
-    let _ = app.emit("pipeline-state-changed", icon_label.clone());
+    *state.pipeline_display.lock().unwrap() = tray::PipelineDisplay {
+        state: new_state,
+        show_pill,
+    };
+    let icon_label = format!("{:?}", tray::tray_icon_state(&new_state));
+    let _ = app.emit("pipeline-state-changed", icon_label);
 
     // Issue #110: reflect the same derived state on the real tray icon + its
     // disabled current-state menu line. `set_pipeline_state` runs on the
@@ -1795,7 +1826,18 @@ fn apply_pipeline_state(app: &tauri::AppHandle, new_state: tray::PipelineState, 
     let tray_icon = app.tray_by_id(TRAY_ID);
     let state_item = state.tray_state_item.lock().unwrap().clone();
     let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
+    let app_for_closure = app.clone();
     let _ = app.run_on_main_thread(move || {
+        // Issue #128: re-derive from `AppState::pipeline_display` read HERE
+        // — not a value captured when this closure was created above. See
+        // this function's doc comment.
+        let current = *app_for_closure
+            .state::<AppState>()
+            .pipeline_display
+            .lock()
+            .unwrap();
+        let (icon_state, show_pill) = tray::resolve_display(&current);
+        let icon_label = format!("{icon_state:?}");
         if let Some(tray_icon) = tray_icon {
             let _ = tray_icon.set_icon(Some(tray_icon_image(icon_state)));
         }
@@ -1892,7 +1934,7 @@ fn generation_is_live(app: &tauri::AppHandle, generation: u64) -> bool {
 /// thread wakes, alongside the epoch/state checks
 /// ([`tray::should_hide_pill_for_settle`]).
 ///
-/// Issue #174: the delayed-hide thread locks `pipeline_state` FIRST, then
+/// Issue #174: the delayed-hide thread locks `pipeline_display` FIRST, then
 /// loads the epoch/generation atomics — not the other way around. Loading
 /// the epoch before locking (the original, buggy order) left a window where
 /// a newer settle's full bump-epoch-then-apply-Idle sequence could
@@ -1923,8 +1965,12 @@ fn settle_idle_keeping_pill_visible(
     std::thread::spawn(move || {
         std::thread::sleep(duration);
         let state = app.state::<AppState>();
-        // #174: lock pipeline_state FIRST — see this function's doc comment.
-        let current_state = *state.pipeline_state.lock().unwrap();
+        // #174: lock pipeline_display FIRST — see this function's doc
+        // comment. #128: this reads only the `.state` field of the bundled
+        // `PipelineDisplay` — the settle-visibility guard logic below cares
+        // about the pipeline's actual state, not the display's `show_pill`
+        // (which this very settle forced to `true` regardless of state).
+        let current_state = state.pipeline_display.lock().unwrap().state;
         let current_epoch = state.pill_visibility_epoch.load(Ordering::SeqCst);
         let current_generation = state.dictation_generation.load(Ordering::SeqCst);
         if tray::should_hide_pill_for_settle(
@@ -2375,7 +2421,7 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                         // Issues #174/#175/#176: this completion belongs to
                         // `generation` — check it's still the live dictation
                         // BEFORE touching any shared state (including
-                        // reading `pipeline_state` for `previous` below,
+                        // reading `pipeline_display` for `previous` below,
                         // which would otherwise read a NEWER dictation's
                         // live value under this stale dictation's name). A
                         // stale generation means a newer dictation already
@@ -2430,7 +2476,12 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                             // transition before keeping the pill visible.
                             // Safe to read here (rather than stale) because
                             // of the generation check just above.
-                            let previous = *app.state::<AppState>().pipeline_state.lock().unwrap();
+                            let previous = app
+                                .state::<AppState>()
+                                .pipeline_display
+                                .lock()
+                                .unwrap()
+                                .state;
                             settle_idle_keeping_pill_for_done(&app, previous, generation);
                         }
                     }
@@ -2677,7 +2728,10 @@ pub fn run() {
                 level_poll_stop: Mutex::new(None),
                 settings: Mutex::new(settings.clone()),
                 output_switch: Mutex::new(tray::OutputModeSwitch::new(initial_output_mode)),
-                pipeline_state: Mutex::new(tray::PipelineState::Idle),
+                pipeline_display: Mutex::new(tray::PipelineDisplay {
+                    state: tray::PipelineState::Idle,
+                    show_pill: false,
+                }),
                 tray_state_item: Mutex::new(Some(tray_state_item)),
                 tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
                 pill_visibility_epoch: AtomicU64::new(0),
