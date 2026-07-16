@@ -268,6 +268,7 @@ mod tests {
             model_preset: ModelPreset::Small,
             output_mode: OutputModeSetting::File,
             file_path_template: "journal/{{date:YYYY-MM-DD}}.md".to_string(),
+            file_base_dir: "/Users/cofounder/Obsidian/Vault".to_string(),
             launch_at_login: true,
             sound_cues: false,
         }
@@ -297,6 +298,7 @@ mod tests {
         assert_ne!(default.model_preset, non_default.model_preset);
         assert_ne!(default.output_mode, non_default.output_mode);
         assert_ne!(default.file_path_template, non_default.file_path_template);
+        assert_ne!(default.file_base_dir, non_default.file_base_dir);
         assert_ne!(default.launch_at_login, non_default.launch_at_login);
         assert_ne!(default.sound_cues, non_default.sound_cues);
     }
@@ -319,6 +321,7 @@ mod tests {
             partial.file_path_template,
             Settings::default().file_path_template
         );
+        assert_eq!(partial.file_base_dir, Settings::default().file_base_dir);
         assert_eq!(partial.launch_at_login, Settings::default().launch_at_login);
         assert_eq!(partial.sound_cues, Settings::default().sound_cues);
     }
@@ -369,6 +372,40 @@ mod tests {
         let default = Settings::default();
         assert!(!default.launch_at_login);
         assert!(default.sound_cues);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #180: `file_base_dir` is the settings-window picker's "base
+    // folder / vault" field for file-mode output (e.g. an Obsidian vault
+    // path). Empty by default — `output::resolve_base_dir` falls back to
+    // the app-data dir when it's blank, preserving the pre-#180 hard-coded
+    // behavior for anyone who never opens the picker.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn file_base_dir_defaults_to_an_empty_string() {
+        assert_eq!(Settings::default().file_base_dir, "");
+    }
+
+    #[test]
+    fn pre_180_settings_json_without_file_base_dir_still_deserializes_with_a_default_empty_string()
+     {
+        // Mirrors a real settings.json written by a pre-#180 build: every
+        // field earlier M2 PRs introduced, but no `file_base_dir`.
+        let old_json = r#"{
+            "hotkey": "Control+Shift+D",
+            "recording_mode": "Toggle",
+            "model_preset": "Small",
+            "output_mode": "File",
+            "file_path_template": "journal/{{date:YYYY-MM-DD}}.md",
+            "launch_at_login": true,
+            "sound_cues": false
+        }"#;
+
+        let restored = from_json(old_json).unwrap();
+
+        assert_eq!(restored.file_path_template, "journal/{{date:YYYY-MM-DD}}.md");
+        assert_eq!(restored.file_base_dir, Settings::default().file_base_dir);
     }
 
     // -------------------------------------------------------------
