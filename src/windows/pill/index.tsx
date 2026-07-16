@@ -7,6 +7,12 @@ import { playCue } from "../../lib/soundCuePlayer";
 import { parsePipelineState, type PipelineState } from "../../lib/status";
 import { toastForError, type Toast as ToastSpec } from "../../lib/toast";
 import { barsFromLevels, scaleLevelForDisplay } from "../../lib/waveform";
+import {
+  allListenersFailed,
+  withListenerFailed,
+  withListenerRecovered,
+  type ListenerName,
+} from "./listenerHealth";
 import { PillWaveform } from "./PillWaveform";
 import { PipelineErrorToast } from "./Toast";
 
@@ -89,14 +95,6 @@ import { PipelineErrorToast } from "./Toast";
 const BAR_COUNT = 24;
 /** How often a "tick" is dispatched so the reducer's "done" auto-hide can fire (ms). */
 const TICK_INTERVAL_MS = 250;
-
-/** The three backend events the pill subscribes to (issue #182). */
-type ListenerName = "pipeline-state-changed" | "audio-level" | "pipeline-error";
-const ALL_LISTENERS: readonly ListenerName[] = [
-  "pipeline-state-changed",
-  "audio-level",
-  "pipeline-error",
-];
 
 /**
  * Tailwind classes for the small status dot. Doubles as the "recording"
@@ -215,12 +213,7 @@ export function PillWindow() {
           // ordered success settling after another listener's rejection
           // must never leave a stale failure behind for a listener that
           // just subscribed fine.
-          setFailedListeners((prev) => {
-            if (!prev.has(name)) return prev;
-            const next = new Set(prev);
-            next.delete(name);
-            return next;
-          });
+          setFailedListeners((prev) => withListenerRecovered(prev, name));
         })
         .catch((err: unknown) => {
           if (cancelled) return;
@@ -230,7 +223,7 @@ export function PillWindow() {
           // failure message -- not pipeline data.
           const reason = err instanceof Error ? err.message : String(err);
           console.error(`[pill] "${name}" event subscription failed:`, reason);
-          setFailedListeners((prev) => (prev.has(name) ? prev : new Set(prev).add(name)));
+          setFailedListeners((prev) => withListenerFailed(prev, name));
         });
     }
 
@@ -253,7 +246,7 @@ export function PillWindow() {
   // Issue #182: reserved for every listener having failed -- a single
   // failed subscription degrades only the feature it feeds (see below),
   // never the whole pill.
-  if (ALL_LISTENERS.every((name) => failedListeners.has(name))) {
+  if (allListenersFailed(failedListeners)) {
     return (
       <PillShell toast={toastNode}>
         <span aria-hidden className="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500" />
