@@ -247,6 +247,18 @@ mod tests {
     }
 
     #[test]
+    fn should_settle_with_notice_true_when_either_toast_condition_holds_issue_220() {
+        // Neither: no toast to show — plain "done" path.
+        assert!(!should_settle_with_notice(false, false));
+        // Ollama-fallback notice only (PR #135's existing case).
+        assert!(should_settle_with_notice(true, false));
+        // History-persist-failure notice only (issue #220's new case).
+        assert!(should_settle_with_notice(false, true));
+        // Both at once — still the notice path, not double-counted.
+        assert!(should_settle_with_notice(true, true));
+    }
+
+    #[test]
     fn should_hide_pill_for_settle_hides_only_when_idle_and_epoch_and_generation_unchanged_issue_155(
     ) {
         // The normal case: the epoch AND generation captured at settle-start

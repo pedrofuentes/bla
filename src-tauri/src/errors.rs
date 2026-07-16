@@ -186,6 +186,27 @@ mod tests {
         assert!(!ErrorKind::OllamaUnreachable.is_blocking());
     }
 
+    // -------------------------------------------------------------
+    // Issue #220 (Sentinel SNTL-20260715-bla-PR218-cc04f8b 🟡): a completed
+    // dictation's history-row persist failure is informational — the
+    // dictation itself already succeeded (pasted/written) by the time
+    // `Store::insert_history` runs, so this is a heads-up about a
+    // secondary, non-fatal loss (the history row), not a failure of the
+    // pipeline run.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn history_persist_failed_is_informational_not_blocking() {
+        assert!(!ErrorKind::HistoryPersistFailed.is_blocking());
+    }
+
+    #[test]
+    fn history_persist_failed_carries_a_static_kind_and_message() {
+        let event = PipelineErrorEvent::from(&ErrorKind::HistoryPersistFailed);
+        assert_eq!(event.kind, "HistoryPersistFailed");
+        assert!(!event.message.is_empty());
+    }
+
     #[test]
     fn capture_error_no_input_device_maps_to_mic_permission_denied() {
         assert_eq!(
