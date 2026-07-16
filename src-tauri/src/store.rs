@@ -98,6 +98,16 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
+    /// The connection's current `PRAGMA busy_timeout`, in milliseconds — the
+    /// value issue #162's test asserts against to confirm
+    /// [`Self::from_connection`] sets it before any caller can observe a
+    /// default of `0`.
+    #[cfg(test)]
+    fn busy_timeout_ms(&self) -> SqliteResult<i64> {
+        self.conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+    }
+
     /// Apply every migration in [`MIGRATIONS`] whose version is greater
     /// than the DB's current `user_version`, in order, each inside its own
     /// transaction. Forward-only and idempotent: re-running against an
@@ -233,6 +243,37 @@ mod tests {
     fn opening_an_in_memory_store_runs_migration_1_and_sets_user_version_to_1() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
         assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #162 (SNTL-20260713-bla-PR161-b26d368): `from_connection` never
+    // called `Connection::busy_timeout` explicitly, so a transient lock
+    // (second app instance, crash-relaunch race, OS indexer/backup read
+    // lock) could make the next write fail immediately with `SQLITE_BUSY`
+    // and drop a history row, instead of blocking up to `busy_timeout` for
+    // the lock to clear.
+    //
+    // Note on this test's red/green shape: as vendored, rusqlite 0.40.1
+    // already calls `sqlite3_busy_timeout(db, 5000)` unconditionally inside
+    // `InnerConnection::open_with_flags` (see
+    // `inner_connection.rs`) — so this assertion is green even before
+    // `from_connection` makes the call explicit below. The explicit call is
+    // still required per #162: it's a documented contract this crate owns
+    // rather than an incidental upstream default an unrelated future
+    // rusqlite bump could silently change, and it's what a reviewer
+    // (Sentinel) can see and verify at this call site without reading
+    // rusqlite's internals.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn opening_a_store_sets_a_five_second_busy_timeout_issue_162() {
+        let store = Store::open_in_memory().expect("open_in_memory should succeed");
+        assert_eq!(
+            store.busy_timeout_ms().unwrap(),
+            5_000,
+            "busy_timeout must be set to 5s so a transient lock blocks and retries instead of \
+             failing the write immediately with SQLITE_BUSY"
+        );
     }
 
     #[test]
