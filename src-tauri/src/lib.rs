@@ -63,6 +63,11 @@ pub mod audio;
 // the output router headlessly, and the cumulative acceptance suite
 // (`tests/acceptance.rs`) exercises them from outside the crate.
 pub mod cleanup;
+// `pub` (issue #256, part of #242, M4): the command-mode transform trait —
+// pure logic only in this PR, no pipeline/hotkey wiring (that's #259) —
+// mirrors `cleanup`'s "real, tested, standalone-usable API surface"
+// rationale above.
+pub mod command;
 mod commands;
 mod context;
 // `pub` (issue #126, M2 PR 2.4): the typed `pipeline-error` event vocabulary
