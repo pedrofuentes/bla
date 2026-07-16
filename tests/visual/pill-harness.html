@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>bla — Pill (visual-verification harness)</title>
+    <style>
+      /* The real pill window (tauri.conf.json) is transparent so the OS
+         compositor shows the desktop behind it; for a reviewable
+         screenshot here a neutral backdrop stands in for "the desktop" so
+         the pill's own dark bubble is legible against something. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #cbd5e1; /* slate-300 */
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/tests/visual/pill-harness.tsx"></script>
+  </body>
+</html>

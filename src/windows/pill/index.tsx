@@ -7,6 +7,12 @@ import { playCue } from "../../lib/soundCuePlayer";
 import { parsePipelineState, type PipelineState } from "../../lib/status";
 import { toastForError, type Toast as ToastSpec } from "../../lib/toast";
 import { barsFromLevels, scaleLevelForDisplay } from "../../lib/waveform";
+import {
+  allListenersFailed,
+  withListenerFailed,
+  withListenerRecovered,
+  type ListenerName,
+} from "./listenerHealth";
 import { PillWaveform } from "./PillWaveform";
 import { PipelineErrorToast } from "./Toast";
 
@@ -41,15 +47,34 @@ import { PipelineErrorToast } from "./Toast";
  * tone/message to show) lives in the pure `toastForError` helper,
  * unit-tested separately (`src/lib/toast.test.ts`).
  *
- * Event subscriptions (Sentinel 🔴, PR #137) are established individually,
- * not via a single `Promise.all`: a rejected subscription — the observable
- * shape of a missing capability grant, exactly what would silently break
- * this window since `src-tauri/capabilities/` only covered the main window —
- * is surfaced as a visible fallback instead of vanishing as an unhandled
- * rejection that kills every listener, and the subscriptions that DID
- * succeed keep their unlisten cleanup on unmount. The pill's own event
- * access is granted by `src-tauri/capabilities/pill.json` (listen/unlisten
- * only).
+ * Event subscriptions (Sentinel 🔴, PR #137; fixed for per-listener degrade
+ * in issue #182) are established individually, not via a single
+ * `Promise.all`: a rejected subscription — the observable shape of a
+ * missing capability grant, exactly what would silently break this window
+ * since `src-tauri/capabilities/` only covered the main window — no longer
+ * vanishes as an unhandled rejection that kills every listener, and the
+ * subscriptions that DID succeed keep their unlisten cleanup on unmount.
+ * The pill's own event access is granted by `src-tauri/capabilities/
+ * pill.json` (listen/unlisten only).
+ *
+ * Issue #182 fix: a failed subscription is tracked *per listener*
+ * (`failedListeners`, a `Set<ListenerName>`) instead of one sticky
+ * `eventsError` flag set on any rejection and never cleared — the original
+ * bug meant a single failed `audio-level` subscription blanked the whole
+ * pill (including the state dot fed by the still-working
+ * `pipeline-state-changed` listener) to a fixed "Status unavailable", and
+ * masked whichever subscriptions DID succeed. Now: the "Status unavailable"
+ * fallback is reserved for every listener having failed
+ * (`allListenersFailed`); a listener that later resolves always clears its
+ * own prior failure from the set (so a stale flag can never linger past a
+ * successful (re)subscription); and while only `audio-level` has failed,
+ * `state.mode === "recording"` falls back to the state dot instead of a
+ * `PillWaveform` that would only ever render a flat, feature-dead line with
+ * no data to draw. Each rejection's reason (a string, e.g. "event.listen
+ * not allowed") is logged via `console.error` for diagnosis (ties to #152)
+ * — never the event payload itself, since some payloads (audio-level,
+ * pipeline-error) are pipeline-derived and MISSION.md §7 forbids logging
+ * anything derived from audio/transcript content.
  *
  * Issue #126, M2 PR 2.7: also plays a short synthesized sound cue on each
  * `pipeline-state-changed` transition, gated by the `sound_cues` preference
@@ -71,9 +96,14 @@ const BAR_COUNT = 24;
 /** How often a "tick" is dispatched so the reducer's "done" auto-hide can fire (ms). */
 const TICK_INTERVAL_MS = 250;
 
-/** Tailwind classes for the small status dot shown outside "recording" mode. */
-const DOT_CLASSES: Record<Exclude<PillMode, "recording">, string> = {
+/**
+ * Tailwind classes for the small status dot. Doubles as the "recording"
+ * mode's fallback (issue #182) when the `audio-level` subscription has
+ * failed and there's no live level data to paint a waveform with.
+ */
+const DOT_CLASSES: Record<PillMode, string> = {
   idle: "bg-neutral-400",
+  recording: "animate-pulse bg-sky-400",
   transcribing: "animate-pulse bg-amber-400",
   done: "bg-emerald-400",
   error: "bg-red-500",
@@ -101,7 +131,10 @@ export function PillWindow() {
   const [state, dispatch] = useReducer(pillReducer, initialPillState);
   const [levels, setLevels] = useState<number[]>([]);
   const [toast, setToast] = useState<ToastSpec | null>(null);
-  const [eventsError, setEventsError] = useState<string | null>(null);
+  // Issue #182: per-listener, not one sticky flag -- see the class doc
+  // above for why. A listener's own successful (re)subscription always
+  // removes it from this set.
+  const [failedListeners, setFailedListeners] = useState<ReadonlySet<ListenerName>>(new Set());
   // Refs, not state: read inside the pipeline-state-changed handler without
   // needing either value to trigger a re-render on its own.
   const soundCuesEnabledRef = useRef(false);
@@ -134,38 +167,63 @@ export function PillWindow() {
 
     // Sentinel 🔴 (PR #137): NOT a single Promise.all — one rejected
     // subscription (the observable shape of a capability/ACL failure) must
-    // neither hide the failure (it's surfaced via eventsError) nor discard
-    // the unlisten cleanup of the subscriptions that succeeded.
+    // neither hide the failure (issue #182: surfaced per-listener via
+    // `failedListeners`, logged to the console) nor discard the unlisten
+    // cleanup of the subscriptions that succeeded.
     const active: Array<() => void> = [];
-    const subscriptions: Array<Promise<() => void>> = [
-      onEvent("pipeline-state-changed", (payload) => {
-        if (cancelled) return;
-        const pipelineState = parsePipelineState(payload);
-        const cue = cueForTransition(prevPipelineStateRef.current, pipelineState);
-        prevPipelineStateRef.current = pipelineState;
-        if (cue && shouldPlayCue(cue, soundCuesEnabledRef.current)) playCue(cue);
-        // Fresh bars for the next recording rather than a stale tail from
-        // the previous one.
-        if (pipelineState === "Active") setLevels([]);
-        dispatch({ type: "pipeline-state", state: pipelineState, now: Date.now() });
-      }),
-      onEvent("audio-level", (level) => {
-        if (!cancelled) setLevels((buf) => pushLevel(buf, level));
-      }),
-      onEvent("pipeline-error", (event) => {
-        if (!cancelled) setToast(toastForError(event));
-      }),
+    const subscriptions: Array<{ name: ListenerName; promise: Promise<() => void> }> = [
+      {
+        name: "pipeline-state-changed",
+        promise: onEvent("pipeline-state-changed", (payload) => {
+          if (cancelled) return;
+          const pipelineState = parsePipelineState(payload);
+          const cue = cueForTransition(prevPipelineStateRef.current, pipelineState);
+          prevPipelineStateRef.current = pipelineState;
+          if (cue && shouldPlayCue(cue, soundCuesEnabledRef.current)) playCue(cue);
+          // Fresh bars for the next recording rather than a stale tail from
+          // the previous one.
+          if (pipelineState === "Active") setLevels([]);
+          dispatch({ type: "pipeline-state", state: pipelineState, now: Date.now() });
+        }),
+      },
+      {
+        name: "audio-level",
+        promise: onEvent("audio-level", (level) => {
+          if (!cancelled) setLevels((buf) => pushLevel(buf, level));
+        }),
+      },
+      {
+        name: "pipeline-error",
+        promise: onEvent("pipeline-error", (event) => {
+          if (!cancelled) setToast(toastForError(event));
+        }),
+      },
     ];
-    for (const subscription of subscriptions) {
-      subscription
+    for (const { name, promise } of subscriptions) {
+      promise
         .then((unlisten) => {
           // Resolved after unmount: unsubscribe immediately instead of
           // pushing to a list nobody will drain.
-          if (cancelled) unlisten();
-          else active.push(unlisten);
+          if (cancelled) {
+            unlisten();
+            return;
+          }
+          active.push(unlisten);
+          // Clear only this listener's own prior failure -- a differently-
+          // ordered success settling after another listener's rejection
+          // must never leave a stale failure behind for a listener that
+          // just subscribed fine.
+          setFailedListeners((prev) => withListenerRecovered(prev, name));
         })
-        .catch((err) => {
-          if (!cancelled) setEventsError(String(err));
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          // Log the rejection *reason* only -- never any event payload
+          // (MISSION.md §7: audio/transcript-derived content must never be
+          // logged). `err` here is `listen()`'s rejection, e.g. an ACL
+          // failure message -- not pipeline data.
+          const reason = err instanceof Error ? err.message : String(err);
+          console.error(`[pill] "${name}" event subscription failed:`, reason);
+          setFailedListeners((prev) => withListenerFailed(prev, name));
         });
     }
 
@@ -185,7 +243,10 @@ export function PillWindow() {
 
   const toastNode = toast && <PipelineErrorToast toast={toast} onDismiss={() => setToast(null)} />;
 
-  if (eventsError) {
+  // Issue #182: reserved for every listener having failed -- a single
+  // failed subscription degrades only the feature it feeds (see below),
+  // never the whole pill.
+  if (allListenersFailed(failedListeners)) {
     return (
       <PillShell toast={toastNode}>
         <span aria-hidden className="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500" />
@@ -197,14 +258,20 @@ export function PillWindow() {
   }
 
   const label = pillLabel(state.mode);
+  // A failed audio-level subscription means `levels` can never receive
+  // data -- rendering `PillWaveform` anyway would just paint a permanently
+  // flat, feature-dead line, so fall back to the state dot (issue #182)
+  // instead, same as every non-recording mode already does.
+  const showWaveform = state.mode === "recording" && !failedListeners.has("audio-level");
 
   return (
     <PillShell toast={toastNode}>
-      {state.mode === "recording" ? (
+      {showWaveform ? (
         <PillWaveform bars={barsFromLevels(levels, BAR_COUNT).map(scaleLevelForDisplay)} />
       ) : (
         <span
           aria-hidden
+          data-testid="pill-status-dot"
           className={`h-2.5 w-2.5 shrink-0 rounded-full ${DOT_CLASSES[state.mode]}`}
         />
       )}

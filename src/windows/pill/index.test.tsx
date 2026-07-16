@@ -5,8 +5,14 @@
  *   `audio-level`, and `pipeline-error` (issue #126, M2 PR 2.3): a single
  *   `Promise.all` would lose every `unlisten` — and silently stop updating —
  *   the moment any one subscription is ACL-rejected, so each is tracked and
- *   cleaned up independently, and a rejected subscription surfaces a visible
- *   `events-error` fallback instead of vanishing.
+ *   cleaned up independently.
+ * - Per-listener degrade, not whole-pill blanking (issue #182): a single
+ *   rejected subscription degrades only the feature that listener feeds
+ *   (e.g. `audio-level` failing drops the live waveform back to the state
+ *   dot) rather than replacing the entire pill with the `events-error`
+ *   fallback — that fallback is now reserved for every subscription having
+ *   failed, and a listener's later success always clears its own prior
+ *   failure rather than leaving a stale blanking flag around.
  * - The `pipeline-error` toast (issue #126, M2 PR 2.4; Sentinel 🔴-1 on PR
  *   #135): drives the real emit→listen→render path, firing a mocked event
  *   through the exact seam the component subscribes with and asserting the
@@ -126,10 +132,57 @@ describe("PillWindow", () => {
     expect(mounted.container.textContent).toContain("Transcribing");
   });
 
-  it("surfaces a visible fallback when a subscription is rejected (capability/ACL failure)", async () => {
+  it("does not blank the whole pill when only one subscription is rejected (per-listener degrade)", async () => {
     // The observable shape of a missing capability grant: plugin:event|listen
     // is ACL-rejected, so onEvent rejects. It must not vanish as an unhandled
-    // rejection that silently kills the whole UI.
+    // rejection that silently kills the whole UI (issue #182) — only the
+    // feature that specific listener feeds should degrade.
+    onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
+      if (event === "audio-level") return Promise.reject(new Error("event.listen not allowed"));
+      eventHandlers[event] = handler;
+      return Promise.resolve(vi.fn());
+    });
+
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    // pipeline-state-changed still succeeded, so the pill keeps rendering
+    // live state instead of the "Status unavailable" fallback.
+    expect(mounted.container.querySelector('[data-testid="events-error"]')).toBeNull();
+    fire("pipeline-state-changed", "Busy");
+    expect(mounted.container.textContent).toContain("Transcribing");
+  });
+
+  it("keeps the state dot alive (in place of the waveform) when only audio-level fails", async () => {
+    onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
+      if (event === "audio-level") return Promise.reject(new Error("event.listen not allowed"));
+      eventHandlers[event] = handler;
+      return Promise.resolve(vi.fn());
+    });
+
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-state-changed", "Active");
+    // No live audio-level data can ever arrive, so the waveform (which
+    // would just render a permanently flat line) is replaced by the state
+    // dot instead of either a dead waveform or the full fallback.
+    expect(mounted.container.querySelector('[data-testid="pill-waveform"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="pill-status-dot"]')).not.toBeNull();
+    expect(mounted.container.textContent).toContain("Recording");
+  });
+
+  it("reserves the Status unavailable fallback for every subscription failing", async () => {
+    onEvent.mockImplementation(() => Promise.reject(new Error("event.listen not allowed")));
+
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="events-error"]')).not.toBeNull();
+  });
+
+  it("logs only the rejection reason for a failed subscription, never event payloads", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     onEvent.mockImplementation((event: string) =>
       event === "audio-level"
         ? Promise.reject(new Error("event.listen not allowed"))
@@ -139,7 +192,11 @@ describe("PillWindow", () => {
     mounted = mount(<PillWindow />);
     await flush();
 
-    expect(mounted.container.querySelector('[data-testid="events-error"]')).not.toBeNull();
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    const loggedArgs = consoleError.mock.calls[0];
+    expect(loggedArgs.join(" ")).toContain("audio-level");
+    expect(loggedArgs.join(" ")).toContain("event.listen not allowed");
+    consoleError.mockRestore();
   });
 
   it("still cleans up the listeners that succeeded when another subscription fails", async () => {
