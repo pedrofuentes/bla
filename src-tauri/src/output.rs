@@ -1105,4 +1105,194 @@ mod tests {
             "23:59 compound slash entry\n"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Issue #208 (Sentinel SNTL-20260715-bla-PR204 🟡, sentinel:security):
+    // harden the file-output write path against the symlink/TOCTOU gap.
+    // `confine_relative_path` is purely lexical, so a symlink swapped in (or
+    // pre-planted inside the user-chosen base dir) between confine and write
+    // can redirect the append outside the confined tree. The fix:
+    //   * canonicalize the resolved parent (after `create_dir_all`) and
+    //     verify it stays under the canonicalized base — catches a symlinked
+    //     *intermediate* directory escaping the tree;
+    //   * refuse a pre-existing *final-component* symlink; and
+    //   * open the final component with `O_NOFOLLOW` on Unix (atomic).
+    // Same-user-bounded, defense-in-depth (see module docs / PR body).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_within_base_accepts_paths_under_the_canonical_base() {
+        let base = Path::new("/private/vault");
+        assert!(is_within_base(base, Path::new("/private/vault")));
+        assert!(is_within_base(base, Path::new("/private/vault/daily")));
+        assert!(is_within_base(base, Path::new("/private/vault/a/b/c.md")));
+    }
+
+    #[test]
+    fn is_within_base_rejects_paths_outside_the_canonical_base() {
+        let base = Path::new("/private/vault");
+        assert!(!is_within_base(base, Path::new("/private")));
+        assert!(!is_within_base(base, Path::new("/etc/passwd")));
+        assert!(!is_within_base(base, Path::new("/private/other")));
+        // A sibling that shares a *string* prefix but not a *path* prefix
+        // must not be accepted (the check is component-wise, not textual).
+        assert!(!is_within_base(base, Path::new("/private/vault-evil/x.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_refuses_to_append_through_a_symlinked_intermediate_dir_escaping_base() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // Pre-plant: `base/daily` is a symlink to a directory OUTSIDE the
+        // confined tree — exactly the "symlink pre-planted inside the
+        // user-chosen base dir" case from the finding.
+        symlink(outside.path(), base.path().join("daily")).unwrap();
+
+        let clipboard = FakeClipboard::new("untouched");
+        let paste = FakePaste::new();
+        let mode = OutputMode::File {
+            base_dir: base.path().to_path_buf(),
+            config: FileConfig {
+                path_template: "daily/{{date:YYYY-MM-DD}}.md".to_string(),
+                timestamp_prefix_template: None,
+            },
+        };
+
+        let err = route(
+            &mode,
+            "secret dictation".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &clipboard,
+            &paste,
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, RouteError::UnsafeSymlink);
+        assert!(
+            !outside.path().join("2026-07-07.md").exists(),
+            "append escaped the confined base via a symlinked intermediate dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_refuses_to_append_when_the_final_target_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.md");
+        fs::write(&victim, "original contents\n").unwrap();
+        // Pre-plant a final-component symlink inside the base that points at
+        // a file outside it.
+        symlink(&victim, base.path().join("2026-07-07.md")).unwrap();
+
+        let mode = OutputMode::File {
+            base_dir: base.path().to_path_buf(),
+            config: FileConfig {
+                path_template: "{{date:YYYY-MM-DD}}.md".to_string(),
+                timestamp_prefix_template: None,
+            },
+        };
+
+        let err = route(
+            &mode,
+            "secret dictation".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &FakeClipboard::new("untouched"),
+            &FakePaste::new(),
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, RouteError::UnsafeSymlink);
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original contents\n",
+            "append followed a final-component symlink out of the confined base"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_still_appends_when_the_base_dir_itself_is_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        // A user may legitimately point `base_dir` at a symlink (e.g. an
+        // Obsidian vault reachable through one). Canonicalizing the base
+        // before comparing means this must NOT be over-refused.
+        let real = tempdir().unwrap();
+        let link_parent = tempdir().unwrap();
+        let base_link = link_parent.path().join("vault-link");
+        symlink(real.path(), &base_link).unwrap();
+
+        let mode = OutputMode::File {
+            base_dir: base_link.clone(),
+            config: FileConfig {
+                path_template: "daily/{{date:YYYY-MM-DD}}.md".to_string(),
+                timestamp_prefix_template: Some("{{time:HH:mm}} ".to_string()),
+            },
+        };
+
+        let outcome = route(
+            &mode,
+            "legit entry".to_string(),
+            clock(2026, 7, 7, 9, 5),
+            &FakeClipboard::new("untouched"),
+            &FakePaste::new(),
+            |_delay| {},
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        match outcome {
+            OutputOutcome::AppendedTo(_) => {}
+            other => panic!("expected AppendedTo, got {other:?}"),
+        }
+        // Written through the symlinked base into the real directory.
+        assert_eq!(
+            fs::read_to_string(real.path().join("daily/2026-07-07.md")).unwrap(),
+            "09:05 legit entry\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_entry_refuses_to_follow_a_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        // `append_entry` opens its final component with `O_NOFOLLOW`, so a
+        // symlinked target must make the open fail rather than writing
+        // through it. (Without the fix, the append would overwrite/append to
+        // the symlink's out-of-tree target.)
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.md");
+        fs::write(&victim, "original contents\n").unwrap();
+        let link = base.path().join("note.md");
+        symlink(&victim, &link).unwrap();
+
+        let config = FileConfig {
+            path_template: link.to_string_lossy().into_owned(),
+            timestamp_prefix_template: None,
+        };
+
+        let result = append_entry(&config, "should not be written", clock(2026, 7, 7, 9, 5));
+
+        assert!(
+            result.is_err(),
+            "append_entry must refuse to follow a final-component symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original contents\n",
+            "append_entry followed a final-component symlink to an out-of-tree file"
+        );
+    }
 }
