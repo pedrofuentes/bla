@@ -85,6 +85,34 @@ const MIGRATIONS: &[Migration] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_tone_rules_created_at_ms ON tone_rules(created_at_ms);",
     ),
+    (
+        4,
+        // Issue #258 (AC-51, part of #242's M4 scope): `snippets(trigger
+        // UNIQUE NOCASE, body)` — a voice-spoken trigger phrase maps to a
+        // stored body it expands to (#260's `match_snippet` does the actual
+        // matching; #261 wires IPC/UI; this migration + its CRUD is store-
+        // only). `trigger`'s column-level `UNIQUE COLLATE NOCASE`
+        // constraint mirrors `dictionary.term`'s (#160/#200) and
+        // `tone_rules.app_pattern`'s (#202) existing precedent for the same
+        // reason: case-insensitive uniqueness is a property of the schema
+        // itself, not something every caller has to remember to check for.
+        // Unlike `tone_rules`, this table's CRUD is explicit add/update/
+        // remove rather than upsert-by-pattern: `add_snippet` mirrors
+        // `add_term`'s INSERT-OR-IGNORE-then-lookup dedup (a case-
+        // insensitive duplicate trigger resolves to the existing row, with
+        // the first-inserted casing/body/timestamp winning), and
+        // `update_snippet` is a separate by-id operation for editing an
+        // existing snippet's trigger/body in place — the constraint still
+        // rejects an update that would collide with a DIFFERENT row's
+        // trigger.
+        "CREATE TABLE IF NOT EXISTS snippets (
+            id INTEGER PRIMARY KEY,
+            trigger TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            body TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_snippets_created_at_ms ON snippets(created_at_ms);",
+    ),
 ];
 
 /// A single dictation history entry (issue #160).
@@ -183,6 +211,28 @@ pub struct ToneRule {
     pub id: i64,
     pub app_pattern: String,
     pub tone: ToneProfile,
+    pub created_at_ms: i64,
+}
+
+/// One stored text snippet (issue #258, AC-51, part of #242's M4 scope): a
+/// trigger phrase spoken during dictation, and the body text it expands to.
+/// The actual matching against a transcript is `snippets::match_snippet`'s
+/// job (#260, not this module) — `Store` only owns persistence, mirroring
+/// how `context::resolve_tone_for_app` (not `store.rs`) owns `ToneRule`
+/// matching.
+///
+/// Derives `Debug` for test assertions only, mirroring [`HistoryRow`]'s /
+/// [`DictionaryTerm`]'s own doc comment: `trigger` and `body` are both user
+/// content and stay under the same no-log invariant (MISSION §5/§7) as
+/// transcript text — nothing in this crate `println!`/`log!`s a `Snippet`.
+/// Also derives `Serialize` (like `HistoryRow`/`DictionaryTerm`/`ToneRule`)
+/// so a later IPC command (#261) can hand rows to the frontend's Snippets
+/// tab — the one sanctioned "leaves this module" path, not logging.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Snippet {
+    pub id: i64,
+    pub trigger: String,
+    pub body: String,
     pub created_at_ms: i64,
 }
 
@@ -520,6 +570,75 @@ impl Store {
     pub fn delete_tone_rule(&self, id: i64) -> SqliteResult<()> {
         self.conn
             .execute("DELETE FROM tone_rules WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Add a snippet (issue #258, AC-51). Case-insensitively unique on
+    /// `trigger` (schema: `trigger UNIQUE COLLATE NOCASE`), mirroring
+    /// [`Self::add_term`]'s own dedup policy: adding a trigger phrase that
+    /// already exists under a different case is a no-op, not a second row
+    /// or an error — the first-inserted casing, body, and `created_at_ms`
+    /// win. Returns the row id either way, so a caller always gets a stable
+    /// id back for the trigger it asked for.
+    pub fn add_snippet(&self, trigger: &str, body: &str, created_at_ms: i64) -> SqliteResult<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO snippets (trigger, body, created_at_ms) VALUES (?1, ?2, ?3)",
+            params![trigger, body, created_at_ms],
+        )?;
+        // The column's own `COLLATE NOCASE` makes this lookup
+        // case-insensitive too, mirroring `add_term`'s equivalent comment.
+        self.conn.query_row(
+            "SELECT id FROM snippets WHERE trigger = ?1",
+            params![trigger],
+            |row| row.get(0),
+        )
+    }
+
+    /// All snippets, most-recently-added first (mirrors [`Self::list_terms`]'s
+    /// newest-first ordering). The list order [`Self::list_terms`]'s doc
+    /// comment cares about is `build_initial_prompt`'s length-cap policy,
+    /// which doesn't apply here; #260's `match_snippet` documents its own
+    /// list-order contract (first match wins) independently of what order
+    /// this method returns rows in.
+    pub fn list_snippets(&self) -> SqliteResult<Vec<Snippet>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, trigger, body, created_at_ms FROM snippets
+             ORDER BY created_at_ms DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Snippet {
+                id: row.get(0)?,
+                trigger: row.get(1)?,
+                body: row.get(2)?,
+                created_at_ms: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Update an existing snippet's `trigger` and `body` in place by id.
+    /// Updating an id that doesn't exist is a no-op, not an error (mirrors
+    /// [`Self::delete_history`]/[`Self::remove_term`]/
+    /// [`Self::delete_tone_rule`]). If the new `trigger` collides
+    /// case-insensitively with a DIFFERENT existing row's trigger, the
+    /// schema's `UNIQUE COLLATE NOCASE` constraint rejects the update with
+    /// an `Err` — uniqueness is enforced at the schema level here too, not
+    /// just on insert (AC-51), so two rows can never end up with the same
+    /// trigger phrase regardless of which write path put them there.
+    pub fn update_snippet(&self, id: i64, trigger: &str, body: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE snippets SET trigger = ?1, body = ?2 WHERE id = ?3",
+            params![trigger, body, id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a single snippet by id. Removing an id that doesn't exist is
+    /// a no-op, not an error (mirrors [`Self::delete_history`]/
+    /// [`Self::remove_term`]/[`Self::delete_tone_rule`]).
+    pub fn remove_snippet(&self, id: i64) -> SqliteResult<()> {
+        self.conn
+            .execute("DELETE FROM snippets WHERE id = ?1", params![id])?;
         Ok(())
     }
 
