@@ -361,6 +361,106 @@ fn should_reuse_cached_stt(
     cached == Some(wanted)
 }
 
+/// Persist exactly one history row for a completed dictation (AC-29, issue
+/// #198) — the pure, injectable decision `run_pipeline_in_background` calls
+/// for every `Pipeline::run` that returns `Ok(outcome)`. Takes `store` and
+/// `created_at_ms` as plain injected values (rather than reading them off
+/// `AppState`/the real clock) so this is unit-testable via
+/// `Store::open_in_memory()` without constructing an `AppState` (issue
+/// #165's Windows-CI hard rule: no `AppState` literals in `#[cfg(test)]`
+/// code).
+///
+/// **Placement rationale (issue #198, interaction with the #174/#175/#176
+/// generation-id mechanism, PR #214):** the call site in
+/// `run_pipeline_in_background` invokes this BEFORE checking
+/// `generation_is_live` — `Pipeline::run`'s `Ok(outcome)` means the text was
+/// already pasted/written by the time this runs, regardless of whether this
+/// dictation's generation is still the live one. A stale generation drops
+/// only UI-visible effects (event emits, pill state writes, settle spawns —
+/// see `run_pipeline_in_background`'s own comments on that gate); it must
+/// NOT drop the history row, or a dictation whose text was genuinely pasted
+/// would silently be missing from history. `app_name` is `None` for now —
+/// `context.rs`'s active-app detection is still a stub, not wired into the
+/// pipeline; a later PR threads a real value through once it lands.
+fn record_history_entry(
+    store: &store::Store,
+    created_at_ms: i64,
+    outcome: &pipeline::Outcome,
+    app_name: Option<&str>,
+) -> rusqlite::Result<i64> {
+    store.insert_history(
+        created_at_ms,
+        &outcome.raw_transcript,
+        &outcome.cleaned_transcript,
+        app_name,
+    )
+}
+
+/// Copy a history entry's cleaned transcript to the clipboard (AC-30, issue
+/// #198), routed through the existing `output::Clipboard`/
+/// `ClipboardPayload` seam so the text is never handed to a caller as a bare
+/// `String` that could end up in a log call — mirrors
+/// `output::paste_via_clipboard_swap`'s own `payload.into_inner()` ->
+/// `clipboard.set()` handoff, minus the save/restore dance (this is a
+/// "copy", not the dictation cursor-paste path). Pure/injectable — takes
+/// `store` and `clipboard` directly rather than reading `AppState`, so it's
+/// unit-testable via `Store::open_in_memory()` + a fake `Clipboard` without
+/// constructing an `AppState`.
+///
+/// The error path (`id` not found) never reads or touches the clipboard at
+/// all, so a copy of a since-deleted entry can't leave stale/wrong text on
+/// the clipboard.
+fn copy_history_entry_text(
+    store: &store::Store,
+    clipboard: &impl output::Clipboard,
+    id: i64,
+) -> Result<(), String> {
+    let row = store
+        .get_history(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no history entry with id {id}"))?;
+    let payload = output::ClipboardPayload::new(row.cleaned);
+    clipboard
+        .set(&payload.into_inner())
+        .map_err(|e| e.to_string())
+}
+
+/// Prune history rows older than the retention cutoff (AC-31, issue #198):
+/// computes the cutoff via `store::retention_cutoff_ms` and calls
+/// `Store::prune_history` only when it returns `Some` (i.e.
+/// `retention_days > 0`) — `retention_days == 0` ("keep forever") is a
+/// deliberate no-op, never touching a row, rather than treating `None` as
+/// "prune from the epoch". Pure/injectable — takes `store` and `now_ms`
+/// directly (rather than reading `AppState`/the real clock) so it's
+/// unit-testable via `Store::open_in_memory()` without constructing an
+/// `AppState`. Called from both the startup path (`run`'s `.setup()`) and
+/// `commands::set_settings` whenever `retention_days` is in effect, so a
+/// freshly-lowered retention window takes effect on the next save, not only
+/// after a restart.
+fn prune_history_for_retention(
+    store: &store::Store,
+    now_ms: i64,
+    retention_days: u32,
+) -> rusqlite::Result<usize> {
+    match store::retention_cutoff_ms(now_ms, retention_days) {
+        Some(cutoff_ms) => store.prune_history(cutoff_ms),
+        None => Ok(0),
+    }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch — the one
+/// place `record_history_entry`/`prune_history_for_retention`'s real
+/// call sites read the system clock (mirrors `real_clock`'s module-doc
+/// convention just below: OS-glue callers inject a plain value into pure
+/// functions rather than those functions reading the clock themselves).
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 #[cfg(test)]
 mod apply_settings_tests {
     //! Issue #126 / PR #134 Sentinel 🔴-3: `commands::set_settings` must
