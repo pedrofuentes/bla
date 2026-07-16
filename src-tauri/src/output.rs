@@ -24,9 +24,14 @@
 //! either target; the file branch additionally confines its resolved path
 //! to a configured base directory (`confine_relative_path`), rejecting
 //! absolute paths and `..` traversal that would escape it (security AC
-//! carried from PR #41's Sentinel review). Symlink-TOCTOU guarding and
-//! restrictive file permissions on the confined target remain noted
-//! follow-ups, not addressed here.
+//! carried from PR #41's Sentinel review). The write itself is additionally
+//! hardened against the symlink/TOCTOU gap (issue #208,
+//! `open_confined_for_append`): the resolved parent is canonicalized and
+//! verified to stay under the canonicalized base, and the final component is
+//! opened refusing to follow a symlink (`O_NOFOLLOW` on Unix). This is
+//! same-user-bounded defense-in-depth, not a privilege boundary — see that
+//! function's docs. Restrictive file permissions on the confined target
+//! remain a noted follow-up, not addressed here.
 //!
 //! `route`'s first non-test consumer is `pipeline` (issue #25), which calls
 //! it from `Pipeline::run`; the runtime wiring in `lib.rs` (issue #91) then
@@ -181,9 +186,11 @@ pub enum PathConfinementError {
 /// relative path to `base_dir`, rejecting absolute paths and any `..`
 /// traversal that would climb above `base_dir`.
 ///
-/// Purely lexical: no filesystem access and no symlink resolution. (Note:
-/// symlink-TOCTOU on the confined target and restrictive file permissions
-/// are follow-up items per issue #21's comment — not addressed here.)
+/// Purely lexical: no filesystem access and no symlink resolution. The
+/// symlink/TOCTOU hardening the lexical check can't provide lives in
+/// [`open_confined_for_append`] (issue #208), which the file-route write
+/// path runs on top of this. Restrictive file permissions on the confined
+/// target remain a follow-up per issue #21's comment.
 pub fn confine_relative_path(
     base_dir: &Path,
     expanded_relative: &str,
@@ -359,6 +366,119 @@ pub fn resolve_base_dir(configured: &str, app_data_dir: &Path) -> PathBuf {
     }
 }
 
+/// `O_NOFOLLOW` for the final `open(2)` component (issue #208). The standard
+/// library exposes no constant for it, so we define the platform value
+/// directly (std-only, **no new dependency**) and pass it through
+/// [`std::os::unix::fs::OpenOptionsExt::custom_flags`]. Values match the
+/// system `<fcntl.h>`: `0x0100` on the Darwin/BSD family, `0o400000` on
+/// Linux/Android (asm-generic — the arches bla ships on). Any other Unix
+/// gets `0` (a no-op custom flag); there the cross-platform pre-open
+/// [`std::fs::symlink_metadata`] refusal and the canonical-parent check in
+/// [`open_confined_for_append`] still apply.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const FINAL_OPEN_NOFOLLOW: i32 = 0x0100;
+
+/// Linux/Android value of [`FINAL_OPEN_NOFOLLOW`] — see its doc comment.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const FINAL_OPEN_NOFOLLOW: i32 = 0o400000;
+
+/// Fallback for any other Unix: a no-op custom flag — see [`FINAL_OPEN_NOFOLLOW`].
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+        target_os = "android"
+    ))
+))]
+const FINAL_OPEN_NOFOLLOW: i32 = 0;
+
+/// Open `path` for create-if-absent append, refusing to follow a symlink at
+/// the **final** component. On Unix this is atomic via `O_NOFOLLOW`
+/// ([`FINAL_OPEN_NOFOLLOW`]); the [`open_confined_for_append`] caller adds a
+/// cross-platform pre-open [`std::fs::symlink_metadata`] refusal for the
+/// non-race case (the documented Windows equivalent, since std wires no
+/// `O_NOFOLLOW` there — and Windows symlink creation needs elevation, so the
+/// residual final-component race is not reachable by an unprivileged
+/// same-user process by default). OS-integration glue (AGENTS.md exemption).
+#[cfg(unix)]
+fn open_final_no_follow(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(FINAL_OPEN_NOFOLLOW)
+        .open(path)
+}
+
+/// Non-Unix [`open_final_no_follow`]: std exposes no `O_NOFOLLOW` equivalent
+/// here, so the final-component guard is the caller's pre-open
+/// [`std::fs::symlink_metadata`] refusal — see its doc comment.
+#[cfg(not(unix))]
+fn open_final_no_follow(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Pure prefix check backing the symlink-escape guard (issue #208): true iff
+/// `candidate_canonical` is `base_canonical` itself or lies beneath it.
+/// Component-wise (via [`Path::starts_with`]), so a sibling that merely
+/// shares a string prefix (`/vault-evil` vs `/vault`) is correctly rejected.
+/// Both arguments are expected already-canonicalized by the caller.
+fn is_within_base(base_canonical: &Path, candidate_canonical: &Path) -> bool {
+    candidate_canonical.starts_with(base_canonical)
+}
+
+/// Open the confined file-mode target for append, hardened against the
+/// symlink/TOCTOU gap (issue #208, Sentinel SNTL-20260715-bla-PR204). Steps:
+///
+/// 1. `create_dir_all` the parent chain — this also materializes `base_dir`,
+///    since [`confine_relative_path`] guarantees `confined` is lexically
+///    under it.
+/// 2. Canonicalize the resolved parent **and** `base_dir` (after step 1, so
+///    every symlink in the chain is resolved) and verify the parent is still
+///    within the base via [`is_within_base`] — catches a symlinked
+///    *intermediate* directory that escapes the confined tree.
+/// 3. Refuse a pre-existing *final-component* symlink ([`std::fs::symlink_metadata`],
+///    no-follow) — the cross-platform belt to the Unix `O_NOFOLLOW` open.
+/// 4. Open with [`open_final_no_follow`].
+///
+/// Same-user-bounded defense-in-depth (see the module docs / PR body):
+/// closes the reachable escape, with a documented residual TOCTOU window on
+/// the parent components between canonicalize and open. OS-integration glue.
+fn open_confined_for_append(base_dir: &Path, confined: &Path) -> Result<fs::File, RouteError> {
+    let parent = confined.parent().unwrap_or(base_dir);
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let base_canonical = fs::canonicalize(base_dir)?;
+    let parent_canonical = fs::canonicalize(parent)?;
+    if !is_within_base(&base_canonical, &parent_canonical) {
+        return Err(RouteError::UnsafeSymlink);
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(confined) {
+        if meta.file_type().is_symlink() {
+            return Err(RouteError::UnsafeSymlink);
+        }
+    }
+
+    open_final_no_follow(confined).map_err(RouteError::from)
+}
+
 /// Selects which output target a finished dictation is routed to (AC-14
 /// switches this per-dictation from settings-derived state).
 pub enum OutputMode {
@@ -385,6 +505,13 @@ pub enum OutputOutcome {
 pub enum RouteError {
     Io(String),
     PathConfinement(PathConfinementError),
+    /// The file-mode target could not be written safely: the resolved parent
+    /// canonicalized to a path outside the confined base (a symlinked
+    /// intermediate directory escaping the tree), or the final component was
+    /// a symlink (issue #208). Carries **no** path/content — kind only, so it
+    /// flows through the existing `PipelineError::Output` -> `ErrorKind::Other`
+    /// surface without leaking anything (MISSION §7 no-log invariant).
+    UnsafeSymlink,
 }
 
 impl From<io::Error> for RouteError {
@@ -428,12 +555,19 @@ pub fn route(
         OutputMode::File { base_dir, config } => {
             let expanded = expand_template(&config.path_template, clock);
             let confined = confine_relative_path(base_dir, &expanded)?;
-            let resolved_config = FileConfig {
-                path_template: confined.to_string_lossy().into_owned(),
-                timestamp_prefix_template: config.timestamp_prefix_template.clone(),
-            };
-            let path = append_entry(&resolved_config, &transcript, clock)?;
-            Ok(OutputOutcome::AppendedTo(path))
+            // Issue #208: `confine_relative_path` is purely lexical, so the
+            // open must additionally refuse symlink escapes at write time —
+            // `open_confined_for_append` verifies the canonical parent stays
+            // under the canonical base and refuses to follow a symlinked
+            // final component.
+            let mut file = open_confined_for_append(base_dir, &confined)?;
+            let prefix = config
+                .timestamp_prefix_template
+                .as_deref()
+                .map(|t| expand_template(t, clock))
+                .unwrap_or_default();
+            writeln!(file, "{prefix}{transcript}")?;
+            Ok(OutputOutcome::AppendedTo(confined))
         }
     }
 }
@@ -458,10 +592,12 @@ pub fn append_entry(config: &FileConfig, entry: &str, clock: Clock) -> io::Resul
         .map(|t| expand_template(t, clock))
         .unwrap_or_default();
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    // Issue #208: refuse to follow a symlink at the final component (Unix:
+    // atomic via `O_NOFOLLOW`), so a symlinked target can't redirect the
+    // append out of tree. `route`'s file branch adds the base-confinement
+    // and intermediate-symlink checks (`open_confined_for_append`) on top of
+    // this; this open is the shared final-component guard.
+    let mut file = open_final_no_follow(&path)?;
     writeln!(file, "{prefix}{entry}")?;
 
     Ok(path)
