@@ -497,15 +497,13 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             let tone_sql: String = row.get(2)?;
-            let tone = ToneProfile::from_sql(&tone_sql).unwrap_or_else(|| {
-                // Unreachable via this module's own writes (the CHECK
-                // constraint already rejects anything else at insert time)
-                // — only reachable via a hand-edited DB file. Verbatim is
-                // the least surprising default: it changes nothing about
-                // the transcript rather than silently applying an
-                // unrequested style rewrite.
-                ToneProfile::Verbatim
-            });
+            // Unreachable via this module's own writes (the CHECK
+            // constraint already rejects anything else at insert time) —
+            // only reachable via a hand-edited DB file. Verbatim is the
+            // least surprising default: it changes nothing about the
+            // transcript rather than silently applying an unrequested
+            // style rewrite.
+            let tone = ToneProfile::from_sql(&tone_sql).unwrap_or(ToneProfile::Verbatim);
             Ok(ToneRule {
                 id: row.get(0)?,
                 app_pattern: row.get(1)?,
@@ -776,7 +774,10 @@ mod tests {
             .upsert_tone_rule("Slack", ToneProfile::Formal, 2_000)
             .unwrap();
 
-        assert_eq!(first_id, second_id, "both calls must resolve to the same row");
+        assert_eq!(
+            first_id, second_id,
+            "both calls must resolve to the same row"
+        );
 
         let rules = store.list_tone_rules().unwrap();
         assert_eq!(rules.len(), 1, "an edit must not add a second row");

@@ -171,8 +171,8 @@ mod tests {
     use crate::cleanup::{Cleanup, RegexCleanup, Tone};
     use crate::store::{Store, ToneProfile, ToneRule};
 
-    use super::{app_pattern_matches, resolve_tone_for_app, tone_profile_to_tone, ActiveAppName};
     use super::ActiveAppSource;
+    use super::{app_pattern_matches, resolve_tone_for_app, tone_profile_to_tone, ActiveAppName};
 
     // -------------------------------------------------------------
     // AC-43: the active-app detection seam's public type carries only an

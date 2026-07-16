@@ -1349,7 +1349,10 @@ mod ollama_tests {
         let (_, body) = cleanup.transport.captured_request();
         let parsed: serde_json::Value =
             serde_json::from_str(&body).expect("request body must be valid JSON");
-        assert_eq!(parsed["system"], render_cleanup_prompt_v3(&[], Tone::Neutral));
+        assert_eq!(
+            parsed["system"],
+            render_cleanup_prompt_v3(&[], Tone::Neutral)
+        );
     }
 
     // -------------------------------------------------------------
@@ -1440,7 +1443,10 @@ mod ollama_tests {
 
         assert_ne!(casual, neutral, "casual must add a tone instruction");
         assert_ne!(formal, neutral, "formal must add a tone instruction");
-        assert_ne!(casual, formal, "casual and formal must differ from each other");
+        assert_ne!(
+            casual, formal,
+            "casual and formal must differ from each other"
+        );
 
         assert!(casual.to_lowercase().contains("casual"));
         assert!(formal.to_lowercase().contains("formal"));
