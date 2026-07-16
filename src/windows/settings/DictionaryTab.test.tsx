@@ -161,6 +161,85 @@ describe("DictionaryTab (AC-38: list/add/remove)", () => {
     expect(mounted.container.querySelector('[data-testid="dictionary-term-1"]')).toBeNull();
     expect(mounted.container.querySelector('[data-testid="dictionary-term-2"]')).not.toBeNull();
   });
+
+  it("disables the Add button and shows 'Adding…' while add_dictionary_term is in flight, then re-enables it (#234)", async () => {
+    let resolveAdd!: (id: number) => void;
+    setupInvoke({
+      add_dictionary_term: () =>
+        new Promise<number>((resolve) => {
+          resolveAdd = resolve;
+        }),
+    });
+
+    mounted = mount(<DictionaryTab />);
+    await flush();
+
+    const input = mounted.container.querySelector<HTMLInputElement>(
+      '[data-testid="dictionary-add-input"]',
+    )!;
+    const addButton = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="dictionary-add-button"]',
+    )!;
+    typeInto(input, "Pendington");
+    click(addButton);
+    await flush();
+
+    // In flight: disabled and labeled, not just eventually-succeeds — a
+    // regression that drops `disabled={adding}` or the `.finally` reset
+    // would let a double-click fire `add_dictionary_term` twice, which this
+    // asserts against directly below too.
+    expect(addButton.disabled).toBe(true);
+    expect(addButton.textContent).toBe("Adding…");
+
+    resolveAdd(3);
+    await flush();
+
+    expect(addButton.disabled).toBe(false);
+    expect(addButton.textContent).toBe("Add");
+    expect(invoke.mock.calls.filter((c) => c[0] === "add_dictionary_term").length).toBe(1);
+  });
+
+  it("disables the Remove button and shows 'Removing…' for that term while remove_dictionary_term is in flight, then re-enables it (#234)", async () => {
+    let resolveRemove!: () => void;
+    setupInvoke({
+      remove_dictionary_term: () =>
+        new Promise<void>((resolve) => {
+          resolveRemove = resolve;
+        }),
+    });
+
+    mounted = mount(<DictionaryTab />);
+    await flush();
+
+    const removeButton1 = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="dictionary-remove-1"]',
+    )!;
+    const removeButton2 = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="dictionary-remove-2"]',
+    )!;
+    click(removeButton1);
+    await flush();
+
+    // Only the term being removed is disabled — the other term's Remove
+    // button stays live.
+    expect(removeButton1.disabled).toBe(true);
+    expect(removeButton1.textContent).toBe("Removing…");
+    expect(removeButton2.disabled).toBe(false);
+    expect(removeButton2.textContent).toBe("Remove");
+    // The row is still present until the call resolves — no optimistic
+    // removal.
+    expect(mounted.container.querySelector('[data-testid="dictionary-term-1"]')).not.toBeNull();
+
+    resolveRemove();
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="dictionary-term-1"]')).toBeNull();
+    const stillRemove2 = mounted.container.querySelector<HTMLButtonElement>(
+      '[data-testid="dictionary-remove-2"]',
+    )!;
+    expect(stillRemove2.disabled).toBe(false);
+    expect(invoke.mock.calls.filter((c) => c[0] === "remove_dictionary_term").length).toBe(1);
+  });
 });
 
 describe("DictionaryTab (AC-39: add-term validation)", () => {

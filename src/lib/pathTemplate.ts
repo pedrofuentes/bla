@@ -49,8 +49,7 @@ export function validatePathTemplate(template: string): PathTemplateValidation {
   if (WINDOWS_DRIVE_PREFIX.test(template)) {
     return {
       valid: false,
-      reason:
-        "Path must be relative to the base folder — remove the drive letter (e.g. \"C:\").",
+      reason: 'Path must be relative to the base folder — remove the drive letter (e.g. "C:").',
     };
   }
 
@@ -64,7 +63,7 @@ export function validatePathTemplate(template: string): PathTemplateValidation {
   if (template.startsWith("/")) {
     return {
       valid: false,
-      reason: "Path must be relative to the base folder — remove the leading \"/\".",
+      reason: 'Path must be relative to the base folder — remove the leading "/".',
     };
   }
 
@@ -76,7 +75,7 @@ export function validatePathTemplate(template: string): PathTemplateValidation {
       if (depth < 0) {
         return {
           valid: false,
-          reason: "Path escapes the base folder — remove the \"..\" that climbs above it.",
+          reason: 'Path escapes the base folder — remove the ".." that climbs above it.',
         };
       }
     } else {

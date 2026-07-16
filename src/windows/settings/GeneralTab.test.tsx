@@ -1299,6 +1299,16 @@ describe("GeneralTab", () => {
       invoke.mockClear();
       focus(baseDirInput);
       typeInto(baseDirInput, "/Users/cofounder/Obsidian/Vault");
+      await flush();
+
+      // #209: typing alone (pre-blur) must not commit — this control is
+      // blur-commit, not per-keystroke. Asserting only the post-blur call
+      // (below) doesn't catch a regression to per-keystroke commit, since
+      // that call would ALSO be present after blur. The `await flush()`
+      // above is load-bearing: without it, the assertion would pass
+      // vacuously (no microtask has run yet) regardless of the guard.
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
       blur(baseDirInput);
       await flush();
 
@@ -1348,6 +1358,13 @@ describe("GeneralTab", () => {
       invoke.mockClear();
       focus(templateInput);
       typeInto(templateInput, "daily/{{date:YYYY-MM-DD}}.md");
+      await flush();
+
+      // #209: same negative assertion as the base-folder field — typing
+      // alone must not commit before blur. The `await flush()` above is
+      // load-bearing (see base-folder test for why).
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
       blur(templateInput);
       await flush();
 
