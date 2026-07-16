@@ -18,8 +18,14 @@
 //! storage, but it is never logged — no `Debug`/`log!`/`println!` of row
 //! contents anywhere in this module or its call sites. [`HistoryRow`]
 //! derives `Debug` only because tests assert on it; nothing here prints one.
+//! It also derives `Serialize` (issue #198) so `commands::search_history`
+//! can hand rows to the frontend over Tauri IPC — the one sanctioned
+//! "leaves this module" path for history text (the History tab the user
+//! opens to browse their own dictations, #199), distinct from logging: IPC
+//! payloads never pass through `eprintln!`/`log!`/an emitted error event.
 
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use serde::Serialize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -50,7 +56,7 @@ const MIGRATIONS: &[Migration] = &[(
 /// logs/prints a `HistoryRow` (MISSION §5/§7: raw/cleaned dictation text
 /// must never be logged, even though storing it in local SQLite is
 /// sanctioned).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HistoryRow {
     pub id: i64,
     pub created_at_ms: i64,
@@ -182,6 +188,27 @@ impl Store {
             })
         })?;
         rows.collect()
+    }
+
+    /// Fetch a single history row by id, or `None` if no row has that id.
+    /// Issue #198 (AC-30): `copy_history_entry` uses this to read a row's
+    /// `cleaned` text before routing it through the clipboard.
+    pub fn get_history(&self, id: i64) -> SqliteResult<Option<HistoryRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, created_at_ms, raw, cleaned, app_name FROM history WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(HistoryRow {
+                        id: row.get(0)?,
+                        created_at_ms: row.get(1)?,
+                        raw: row.get(2)?,
+                        cleaned: row.get(3)?,
+                        app_name: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Delete a single history row by id. Deleting an id that doesn't exist
