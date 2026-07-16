@@ -1297,6 +1297,7 @@ describe("GeneralTab", () => {
         '[data-testid="file-base-dir-input"]',
       )!;
       invoke.mockClear();
+      focus(baseDirInput);
       typeInto(baseDirInput, "/Users/cofounder/Obsidian/Vault");
       blur(baseDirInput);
       await flush();
@@ -1345,6 +1346,7 @@ describe("GeneralTab", () => {
         '[data-testid="file-path-template-input"]',
       )!;
       invoke.mockClear();
+      focus(templateInput);
       typeInto(templateInput, "daily/{{date:YYYY-MM-DD}}.md");
       blur(templateInput);
       await flush();
@@ -1370,6 +1372,7 @@ describe("GeneralTab", () => {
         '[data-testid="file-path-template-input"]',
       )!;
       invoke.mockClear();
+      focus(templateInput);
       typeInto(templateInput, "/etc/passwd");
       blur(templateInput);
       await flush();
@@ -1397,6 +1400,7 @@ describe("GeneralTab", () => {
         '[data-testid="file-path-template-input"]',
       )!;
       invoke.mockClear();
+      focus(templateInput);
       typeInto(templateInput, "../../etc/{{date:YYYY-MM-DD}}.md");
       blur(templateInput);
       await flush();
@@ -1425,6 +1429,7 @@ describe("GeneralTab", () => {
       const templateInput = mounted.container.querySelector<HTMLInputElement>(
         '[data-testid="file-path-template-input"]',
       )!;
+      focus(templateInput);
       typeInto(templateInput, "/etc/passwd");
       blur(templateInput);
       await flush();
