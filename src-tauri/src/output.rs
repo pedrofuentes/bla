@@ -340,6 +340,25 @@ impl PasteSynthesizer for EnigoPaste {
     }
 }
 
+/// Resolve the file-mode base directory a dictation's templated path
+/// should be confined to (issue #180's settings-window picker — the "base
+/// folder / vault" field, e.g. an Obsidian vault path). A blank
+/// `configured` value (the pre-#180 default, or a user who cleared the
+/// field) falls back to `app_data_dir`, preserving the previous hard-coded
+/// behavior; a non-blank value is the user's chosen folder, used verbatim
+/// (surrounding whitespace trimmed). Pure so the decision is unit-testable
+/// without a live `tauri::AppHandle` —
+/// `lib.rs::run_pipeline_in_background` (OS-integration glue) is the sole
+/// real caller.
+pub fn resolve_base_dir(configured: &str, app_data_dir: &Path) -> PathBuf {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        app_data_dir.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
 /// Selects which output target a finished dictation is routed to (AC-14
 /// switches this per-dictation from settings-derived state).
 pub enum OutputMode {
@@ -814,6 +833,49 @@ mod tests {
         let base = PathBuf::from("/vault");
         let err = confine_relative_path(&base, "../../etc/passwd").unwrap_err();
         assert_eq!(err, PathConfinementError::EscapesBaseDir);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #180: the settings-window picker's "base folder / vault" field
+    // persists as `settings::Settings::file_base_dir`; `resolve_base_dir` is
+    // the pure decision `lib.rs::run_pipeline_in_background` (OS-integration
+    // glue, not unit-testable directly) delegates to when building
+    // `OutputMode::File`'s `base_dir` — previously hard-coded to
+    // `app_data_dir` with no way for the user to change it.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_base_dir_falls_back_to_app_data_dir_when_unset() {
+        let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
+        assert_eq!(
+            resolve_base_dir("", app_data_dir),
+            app_data_dir.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn resolve_base_dir_falls_back_to_app_data_dir_when_blank() {
+        let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
+        assert_eq!(
+            resolve_base_dir("   ", app_data_dir),
+            app_data_dir.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn resolve_base_dir_uses_the_configured_vault_path_verbatim_when_set() {
+        let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
+        let vault = "/Users/cofounder/Obsidian/Vault";
+        assert_eq!(resolve_base_dir(vault, app_data_dir), PathBuf::from(vault));
+    }
+
+    #[test]
+    fn resolve_base_dir_trims_surrounding_whitespace_off_a_configured_path() {
+        let app_data_dir = Path::new("/app-data");
+        assert_eq!(
+            resolve_base_dir("  /Users/cofounder/Obsidian/Vault  ", app_data_dir),
+            PathBuf::from("/Users/cofounder/Obsidian/Vault")
+        );
     }
 
     #[test]

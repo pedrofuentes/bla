@@ -85,3 +85,29 @@ export function change(el: HTMLInputElement | HTMLSelectElement, value: string):
     el.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
+
+/**
+ * Sets a text `<input>`'s value and dispatches `input`, wrapped in `act`.
+ * React's `onChange` for text-like inputs listens to the native `input`
+ * event, not `change` (issue #180's path/folder text fields) — `change()`
+ * above works for `<select>`/checkbox/radio, but a text field's onChange
+ * handler never fires from a bare `change` event.
+ *
+ * A plain `el.value = value` isn't enough for a CONTROLLED input: React
+ * patches the element's `value` setter to update its own internal value
+ * tracker alongside the DOM value, so an assignment through that patched
+ * setter leaves React believing nothing changed when the `input` event
+ * fires next, and `onChange` never runs. Going through the native
+ * `HTMLInputElement.prototype` setter instead (the standard
+ * testing-library-style workaround) bypasses that tracker.
+ */
+export function typeInto(el: HTMLInputElement, value: string): void {
+  const nativeValueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype,
+    "value",
+  )!.set!;
+  act(() => {
+    nativeValueSetter.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}

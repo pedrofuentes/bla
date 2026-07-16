@@ -14,6 +14,7 @@ import {
 } from "../../lib/status";
 import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
 import { applySettingsPatch, revertPatchedFields } from "../../lib/settingsPatch";
+import { validatePathTemplate } from "../../lib/pathTemplate";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
 
@@ -94,6 +95,23 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
  * unlisten cleanup. The `settings` snapshot is mirrored in `settingsRef` so
  * the serial queue and the `output-mode-changed` subscription read/merge the
  * latest value.
+ *
+ * Issue #180 (AC-3): the Output section adds the missing file-mode
+ * output-path/template picker — an output-mode selector plus, when File is
+ * selected, a "base folder / vault" field (e.g. an Obsidian vault path) and
+ * a `{{date:YYYY-MM-DD}}`-style path-template field. The mode radios
+ * auto-apply immediately like every other discrete control here; the two
+ * free-text fields instead commit on blur (typing shouldn't fire
+ * `set_settings` per keystroke) through local `*Draft` state, seeded once
+ * from the loaded `settings` (safe because no other writer — the
+ * `output-mode-changed` subscription only ever touches `output_mode` —
+ * mutates these two fields out of band). The template field additionally
+ * gates persistence on `validatePathTemplate`, mirroring
+ * `output::confine_relative_path`'s structural rules client-side so an
+ * obviously-invalid template (absolute, or escaping the base folder via
+ * `..`) shows an inline error instead of ever reaching `set_settings` — not
+ * a replacement for the Rust-side guard, which still confines every
+ * dictation regardless of what this lets through.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -108,9 +126,20 @@ export function GeneralTab() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
+  // Issue #180: local editable drafts for the two file-mode text fields,
+  // committed on blur rather than auto-applying per keystroke. Seeded once
+  // from the first loaded `settings` (see `fileFieldsInitializedRef` below).
+  const [baseDirDraft, setBaseDirDraft] = useState("");
+  const [templateDraft, setTemplateDraft] = useState("");
+  const [templateError, setTemplateError] = useState<string | null>(null);
 
   // The latest known settings, read by each queued apply when it RUNS.
   const settingsRef = useRef<Settings | null>(null);
+  // Set once the file-mode drafts have been seeded from the first loaded
+  // `settings`, so a later settings update (e.g. the output-mode-changed
+  // subscription, or this component's own auto-applies) never clobbers
+  // whatever the user is mid-typing into these two fields.
+  const fileFieldsInitializedRef = useRef(false);
   // Serial queue for EVERY OS-shortcut operation — auto-applies AND the
   // hotkey capture suspend/resume (PR #185 cycle-6 🔴): routing all of them
   // through one chain means the capture's suspend/resume can never run
@@ -157,6 +186,14 @@ export function GeneralTab() {
         if (cancelled) return;
         settingsRef.current = loaded;
         setSettings(loaded);
+        // Issue #180: seed the file-mode text-field drafts once, from the
+        // first load only — never re-seeded afterward, so it can't clobber
+        // in-progress typing.
+        if (!fileFieldsInitializedRef.current) {
+          fileFieldsInitializedRef.current = true;
+          setBaseDirDraft(loaded.file_base_dir ?? "");
+          setTemplateDraft(loaded.file_path_template);
+        }
       })
       .catch((err) => {
         if (!cancelled) setSaveError(String(err));
@@ -499,6 +536,38 @@ export function GeneralTab() {
     void applySettingsChange({ hotkey: chord });
   }, [pendingHotkey, hotkeyError, applySettingsChange]);
 
+  // ---- Issue #180: file-mode output picker (base folder + path template) ----
+
+  const commitBaseDir = useCallback(() => {
+    const current = settingsRef.current;
+    if (!current) return;
+    const value = baseDirDraft.trim();
+    if (value === (current.file_base_dir ?? "")) return;
+    void applySettingsChange({ file_base_dir: value });
+  }, [baseDirDraft, applySettingsChange]);
+
+  const handleTemplateChange = useCallback((value: string) => {
+    setTemplateDraft(value);
+    const result = validatePathTemplate(value);
+    setTemplateError(result.valid ? null : result.reason);
+  }, []);
+
+  const commitTemplate = useCallback(() => {
+    const current = settingsRef.current;
+    if (!current) return;
+    const result = validatePathTemplate(templateDraft);
+    if (!result.valid) {
+      // Invalid: show the error, and withhold persisting it — the Rust-side
+      // guard (output::confine_relative_path) would reject it at write time
+      // anyway, but this keeps an obviously-bad template out of
+      // settings.json entirely rather than only failing later mid-dictation.
+      setTemplateError(result.reason);
+      return;
+    }
+    if (templateDraft === current.file_path_template) return;
+    void applySettingsChange({ file_path_template: templateDraft });
+  }, [templateDraft, applySettingsChange]);
+
   if (!settings) {
     return <p className="text-sm text-neutral-500 dark:text-neutral-400">Loading…</p>;
   }
@@ -605,6 +674,98 @@ export function GeneralTab() {
           {modelStatusLabel(modelStatus, downloadPercent)}
         </p>
       </div>
+
+      <fieldset className="flex flex-col gap-2" data-testid="output-section">
+        <legend className="text-sm font-medium">Output</legend>
+        <div className="flex gap-4 text-sm">
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="output-mode"
+              data-testid="output-mode-cursor"
+              checked={settings.output_mode === "Cursor"}
+              onChange={() => void applySettingsChange({ output_mode: "Cursor" })}
+            />
+            Paste at cursor
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="output-mode"
+              data-testid="output-mode-file"
+              checked={settings.output_mode === "File"}
+              onChange={() => void applySettingsChange({ output_mode: "File" })}
+            />
+            Append to a file
+          </label>
+        </div>
+
+        {settings.output_mode === "File" && (
+          <div className="flex flex-col gap-3 pt-1" data-testid="file-output-fields">
+            <div className="flex flex-col gap-1">
+              <label
+                htmlFor="file-base-dir-input"
+                className="text-xs font-medium text-neutral-600 dark:text-neutral-400"
+              >
+                Base folder (vault)
+              </label>
+              <input
+                id="file-base-dir-input"
+                data-testid="file-base-dir-input"
+                type="text"
+                value={baseDirDraft}
+                placeholder="Defaults to bla's app-data folder"
+                onChange={(e) => setBaseDirDraft(e.target.value)}
+                onBlur={commitBaseDir}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                className="rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
+              />
+              <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                e.g. your Obsidian vault's path. Leave blank to use bla's app-data folder.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label
+                htmlFor="file-path-template-input"
+                className="text-xs font-medium text-neutral-600 dark:text-neutral-400"
+              >
+                Path template
+              </label>
+              <input
+                id="file-path-template-input"
+                data-testid="file-path-template-input"
+                type="text"
+                value={templateDraft}
+                onChange={(e) => handleTemplateChange(e.target.value)}
+                onBlur={commitTemplate}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+                className={`rounded-md border bg-white px-3 py-2 text-sm focus:outline-none dark:bg-neutral-950 ${
+                  templateError
+                    ? "border-red-500 focus:border-red-500"
+                    : "border-neutral-300 focus:border-blue-500 dark:border-neutral-700"
+                }`}
+              />
+              <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                Supports {"{{date:YYYY-MM-DD}}"} and {"{{time:HH:mm}}"} tokens, e.g.{" "}
+                {"daily/{{date:YYYY-MM-DD}}.md"}
+              </p>
+              {templateError && (
+                <p
+                  data-testid="file-path-template-error"
+                  className="text-xs text-red-600 dark:text-red-400"
+                >
+                  {templateError}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+      </fieldset>
 
       <div className="flex flex-col gap-2">
         <label className="flex items-center gap-2 text-sm">
