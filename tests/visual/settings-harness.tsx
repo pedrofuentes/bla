@@ -35,12 +35,31 @@
  * rather than rejecting, so a Playwright script exercising the tab sees
  * the same contract the component's own client-side duplicate check
  * (`DictionaryTab.tsx`) is written against.
+ *
+ * A `?tone=` query param (issue #203) selects the starting
+ * `list_tone_rules` row set for the Tone tab — see `TONE_FIXTURES`. Every
+ * `app_pattern` is an obviously synthetic placeholder app name ("SynthMail"
+ * etc.), same privacy note as dictionary terms above.
+ * `list_tone_rules`/`upsert_tone_rule`/`delete_tone_rule` are mocked
+ * statefully (mutating a module-local array), and `upsert_tone_rule`
+ * mirrors the real backend's case-insensitive upsert-by-pattern behavior
+ * (see `store::Store::upsert_tone_rule`) — updating an existing row in
+ * place rather than adding a second one — so a Playwright script exercising
+ * the tab sees the same contract `ToneTab.tsx`'s own client-side duplicate
+ * check is written against.
  */
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { SettingsWindow } from "../../src/windows/settings/index";
-import type { DictionaryTerm, HistoryRow, ModelRegistryEntry, Settings } from "../../src/lib/ipc";
+import type {
+  DictionaryTerm,
+  HistoryRow,
+  ModelRegistryEntry,
+  Settings,
+  ToneProfile,
+  ToneRule,
+} from "../../src/lib/ipc";
 import "../../src/index.css";
 
 const DEFAULT_SETTINGS: Settings = {
@@ -118,6 +137,36 @@ const DICTIONARY_FIXTURES: Record<string, DictionaryTerm[]> = {
   empty: [],
 };
 
+// Issue #203: obviously synthetic placeholder tone rules (never a real
+// installed app name) for the Tone tab's design-loop screenshots. Ordered
+// oldest-`created_at_ms`-first (ascending id), matching `list_tone_rules`'s
+// real insertion-order/match-order contract.
+const TONE_RULES: ToneRule[] = [
+  {
+    id: 1,
+    app_pattern: "SynthMail",
+    tone: "formal",
+    created_at_ms: Date.parse("2026-07-13T08:12:00Z"),
+  },
+  {
+    id: 2,
+    app_pattern: "ChatSynth*",
+    tone: "casual",
+    created_at_ms: Date.parse("2026-07-14T18:05:00Z"),
+  },
+  {
+    id: 3,
+    app_pattern: "*Terminal",
+    tone: "verbatim",
+    created_at_ms: Date.parse("2026-07-15T09:41:00Z"),
+  },
+];
+
+const TONE_FIXTURES: Record<string, ToneRule[]> = {
+  default: TONE_RULES,
+  empty: [],
+};
+
 const params = new URLSearchParams(window.location.search);
 const fixtureName = params.get("fixture") ?? "default";
 const settings = FIXTURES[fixtureName] ?? DEFAULT_SETTINGS;
@@ -137,6 +186,14 @@ let dictionaryTerms: DictionaryTerm[] = [
   ...(DICTIONARY_FIXTURES[dictionaryFixtureName] ?? DICTIONARY_TERMS),
 ];
 let nextDictionaryId = Math.max(0, ...dictionaryTerms.map((t) => t.id)) + 1;
+
+const toneFixtureName = params.get("tone") ?? "default";
+// Mutable copy — `upsert_tone_rule`/`delete_tone_rule` mutate this array,
+// mirroring the real commands' effect on the underlying store, so a
+// Playwright script can drive an add/edit/remove click and screenshot the
+// resulting state.
+let toneRules: ToneRule[] = [...(TONE_FIXTURES[toneFixtureName] ?? TONE_RULES)];
+let nextToneId = Math.max(0, ...toneRules.map((r) => r.id)) + 1;
 
 mockWindows("settings");
 // `shouldMockEvents: true` so GeneralTab's `onEvent` subscriptions
@@ -199,6 +256,31 @@ mockIPC(
       case "remove_dictionary_term": {
         const { id } = payload as { id: number };
         dictionaryTerms = dictionaryTerms.filter((t) => t.id !== id);
+        return undefined;
+      }
+      case "list_tone_rules":
+        return toneRules;
+      // Mirrors `store::Store::upsert_tone_rule`'s real case-insensitive
+      // upsert-by-`app_pattern` contract: an existing pattern is UPDATEd in
+      // place (same id) rather than adding a second row, so this fixture
+      // stays honest about what `ToneTab`'s own client-side duplicate check
+      // is defending against (see this file's doc comment).
+      case "upsert_tone_rule": {
+        const { app_pattern, tone } = payload as { app_pattern: string; tone: ToneProfile };
+        const existing = toneRules.find(
+          (r) => r.app_pattern.toLowerCase() === app_pattern.toLowerCase(),
+        );
+        if (existing) {
+          toneRules = toneRules.map((r) => (r.id === existing.id ? { ...r, tone } : r));
+          return existing.id;
+        }
+        const id = nextToneId++;
+        toneRules = [...toneRules, { id, app_pattern, tone, created_at_ms: Date.now() }];
+        return id;
+      }
+      case "delete_tone_rule": {
+        const { id } = payload as { id: number };
+        toneRules = toneRules.filter((r) => r.id !== id);
         return undefined;
       }
       default:
