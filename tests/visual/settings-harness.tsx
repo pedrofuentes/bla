@@ -23,12 +23,24 @@
  * mocked statefully (mutating a module-local array) so Playwright driving
  * a Delete/Clear-all click sees the list actually change, matching what
  * the real backend commands do.
+ *
+ * A `?dictionary=` query param (issue #201) selects the starting
+ * `list_dictionary_terms` row set for the Dictionary tab — see
+ * `DICTIONARY_FIXTURES`. Every term is an obviously synthetic placeholder,
+ * same privacy note as history above.
+ * `list_dictionary_terms`/`add_dictionary_term`/`remove_dictionary_term`
+ * are mocked statefully (mutating a module-local array), and
+ * `add_dictionary_term` mirrors the real backend's case-insensitive
+ * `UNIQUE COLLATE NOCASE` no-op behavior (see `store::Store::add_term`)
+ * rather than rejecting, so a Playwright script exercising the tab sees
+ * the same contract the component's own client-side duplicate check
+ * (`DictionaryTab.tsx`) is written against.
  */
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { SettingsWindow } from "../../src/windows/settings/index";
-import type { HistoryRow, ModelRegistryEntry, Settings } from "../../src/lib/ipc";
+import type { DictionaryTerm, HistoryRow, ModelRegistryEntry, Settings } from "../../src/lib/ipc";
 import "../../src/index.css";
 
 const DEFAULT_SETTINGS: Settings = {
@@ -93,6 +105,19 @@ const HISTORY_FIXTURES: Record<string, HistoryRow[]> = {
   empty: [],
 };
 
+// Issue #201: obviously synthetic placeholder dictionary terms (never real
+// user vocabulary) for the Dictionary tab's design-loop screenshots.
+const DICTIONARY_TERMS: DictionaryTerm[] = [
+  { id: 3, term: "Fixtureon", created_at_ms: Date.parse("2026-07-15T09:41:00Z") },
+  { id: 2, term: "synthetiql", created_at_ms: Date.parse("2026-07-14T18:05:00Z") },
+  { id: 1, term: "PlaceholderCorp", created_at_ms: Date.parse("2026-07-14T08:12:00Z") },
+];
+
+const DICTIONARY_FIXTURES: Record<string, DictionaryTerm[]> = {
+  default: DICTIONARY_TERMS,
+  empty: [],
+};
+
 const params = new URLSearchParams(window.location.search);
 const fixtureName = params.get("fixture") ?? "default";
 const settings = FIXTURES[fixtureName] ?? DEFAULT_SETTINGS;
@@ -102,6 +127,16 @@ const historyFixtureName = params.get("history") ?? "default";
 // Playwright script can drive a Delete/Clear-all click and screenshot the
 // resulting state.
 let historyRows: HistoryRow[] = [...(HISTORY_FIXTURES[historyFixtureName] ?? HISTORY_ROWS)];
+
+const dictionaryFixtureName = params.get("dictionary") ?? "default";
+// Mutable copy — `add_dictionary_term`/`remove_dictionary_term` mutate
+// this array, mirroring the real commands' effect on the underlying
+// store, so a Playwright script can drive an add/remove click and
+// screenshot the resulting state.
+let dictionaryTerms: DictionaryTerm[] = [
+  ...(DICTIONARY_FIXTURES[dictionaryFixtureName] ?? DICTIONARY_TERMS),
+];
+let nextDictionaryId = Math.max(0, ...dictionaryTerms.map((t) => t.id)) + 1;
 
 mockWindows("settings");
 // `shouldMockEvents: true` so GeneralTab's `onEvent` subscriptions
@@ -145,6 +180,27 @@ mockIPC(
       case "clear_history":
         historyRows = [];
         return undefined;
+      case "list_dictionary_terms":
+        return dictionaryTerms;
+      // Mirrors `store::Store::add_term`'s real `INSERT OR IGNORE` +
+      // `UNIQUE COLLATE NOCASE` contract: a case-insensitive duplicate is
+      // a no-op that resolves with the existing row's id rather than
+      // rejecting, so this fixture stays honest about what
+      // `DictionaryTab`'s own client-side duplicate check is defending
+      // against (see this file's doc comment).
+      case "add_dictionary_term": {
+        const { term } = payload as { term: string };
+        const existing = dictionaryTerms.find((t) => t.term.toLowerCase() === term.toLowerCase());
+        if (existing) return existing.id;
+        const id = nextDictionaryId++;
+        dictionaryTerms = [{ id, term, created_at_ms: Date.now() }, ...dictionaryTerms];
+        return id;
+      }
+      case "remove_dictionary_term": {
+        const { id } = payload as { id: number };
+        dictionaryTerms = dictionaryTerms.filter((t) => t.id !== id);
+        return undefined;
+      }
       default:
         throw new Error(`settings-harness: unmocked command ${cmd}`);
     }
