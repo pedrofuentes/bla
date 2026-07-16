@@ -609,10 +609,17 @@ pub fn append_entry(config: &FileConfig, entry: &str, clock: Clock) -> io::Resul
 /// this assertion fails to compile and `cargo test` fails with it.
 #[cfg(test)]
 mod clipboard_payload_trait_assertions {
-    use super::ClipboardPayload;
+    use super::{CapturedSelection, ClipboardPayload};
     use static_assertions::assert_not_impl_any;
 
     assert_not_impl_any!(ClipboardPayload: std::fmt::Debug, std::fmt::Display, serde::Serialize);
+    // Issue #257: `CapturedSelection` carries the captured selection (and
+    // the pre-copy clipboard) as `ClipboardPayload` fields — assert
+    // explicitly, per the module docs' standing instruction to extend this
+    // guard for every second payload-carrying type, rather than relying on
+    // the fact that deriving these traits would already fail to compile
+    // because `ClipboardPayload` itself doesn't implement them.
+    assert_not_impl_any!(CapturedSelection: std::fmt::Debug, std::fmt::Display, serde::Serialize);
 }
 
 #[cfg(test)]
@@ -1047,6 +1054,202 @@ mod tests {
     fn clipboard_payload_round_trips_its_text_via_the_single_consumption_path() {
         let payload = ClipboardPayload::new("hello from the transcript".to_string());
         assert_eq!(payload.into_inner(), "hello from the transcript");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #257 (AC-48): command-mode selection capture/replace, reusing
+    // the clipboard-swap machinery above. The discriminating behavior under
+    // test is the restore distinction: `replace_selection` must restore the
+    // ORIGINAL pre-copy clipboard value `capture_selection` saved, never the
+    // intermediate captured-selection value that sits on the clipboard while
+    // the instruction is recorded/transformed in between.
+    // -----------------------------------------------------------------
+
+    /// Fake copy synthesizer: on `synthesize_copy`, writes a fixed
+    /// "selection" string to the clipboard — mirroring the real `enigo`
+    /// glue, where the synthesized keystroke doesn't write the clipboard
+    /// itself; the OS does, in response to it, because some other app has
+    /// focus and a selection. Records whether it was invoked.
+    struct FakeCopy<'a> {
+        clipboard: &'a FakeClipboard,
+        selection_text: &'a str,
+        called: RefCell<bool>,
+    }
+
+    impl<'a> FakeCopy<'a> {
+        fn new(clipboard: &'a FakeClipboard, selection_text: &'a str) -> Self {
+            Self {
+                clipboard,
+                selection_text,
+                called: RefCell::new(false),
+            }
+        }
+    }
+
+    impl CopySynthesizer for FakeCopy<'_> {
+        fn synthesize_copy(&self) -> io::Result<()> {
+            *self.called.borrow_mut() = true;
+            self.clipboard.set(self.selection_text)
+        }
+    }
+
+    #[test]
+    fn capture_selection_saves_pre_copy_clipboard_and_returns_the_selection_ac48() {
+        let clipboard = FakeClipboard::new("pre-copy clipboard contents");
+        let copy = FakeCopy::new(&clipboard, "captured selection text");
+
+        let captured = capture_selection(&clipboard, &copy).unwrap();
+
+        assert!(*copy.called.borrow());
+        assert_eq!(captured.selection.into_inner(), "captured selection text");
+        assert_eq!(
+            captured.pre_copy_clipboard.into_inner(),
+            "pre-copy clipboard contents"
+        );
+    }
+
+    #[test]
+    fn capture_selection_never_writes_the_clipboard_itself() {
+        // Capture only ever *reads* the clipboard (before and after the
+        // copy keystroke) — the OS is what writes the selection onto it in
+        // response to the synthesized keystroke, not this function.
+        let clipboard = FakeClipboard::new("pre-copy clipboard contents");
+        let copy = FakeCopy::new(&clipboard, "captured selection text");
+
+        capture_selection(&clipboard, &copy).unwrap();
+
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "captured selection text",
+            "capture must not touch the clipboard again after reading the selection"
+        );
+    }
+
+    #[test]
+    fn replace_selection_restores_the_pre_copy_original_not_the_captured_selection_ac48() {
+        // Simulate the state after `capture_selection` already ran: the
+        // clipboard currently holds the mid-flow captured-selection value,
+        // NOT the user's original pre-copy clipboard contents.
+        let clipboard = FakeClipboard::new("captured selection text");
+        let paste = FakePaste::new();
+        let pre_copy_clipboard =
+            ClipboardPayload::new("ORIGINAL pre-copy clipboard contents".to_string());
+        let transformed = ClipboardPayload::new("transformed replacement text".to_string());
+
+        replace_selection(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            pre_copy_clipboard,
+            transformed,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert!(*paste.called.borrow());
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "ORIGINAL pre-copy clipboard contents",
+            "must restore the pre-copy original, not the intermediate captured-selection value"
+        );
+    }
+
+    #[test]
+    fn replace_selection_writes_the_transformed_text_before_pasting() {
+        let clipboard = FakeClipboard::new("captured selection text");
+        // A paste synthesizer that snapshots what the clipboard held at the
+        // moment it was invoked, proving the transformed text was written
+        // first.
+        struct SnapshotPaste<'a> {
+            clipboard: &'a FakeClipboard,
+            seen: RefCell<Option<String>>,
+        }
+        impl PasteSynthesizer for SnapshotPaste<'_> {
+            fn synthesize_paste(&self) -> io::Result<()> {
+                *self.seen.borrow_mut() = Some(self.clipboard.get().unwrap());
+                Ok(())
+            }
+        }
+        let paste = SnapshotPaste {
+            clipboard: &clipboard,
+            seen: RefCell::new(None),
+        };
+        let pre_copy_clipboard = ClipboardPayload::new("original".to_string());
+        let transformed = ClipboardPayload::new("transformed replacement text".to_string());
+
+        replace_selection(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            pre_copy_clipboard,
+            transformed,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paste.seen.borrow().as_deref(),
+            Some("transformed replacement text")
+        );
+    }
+
+    #[test]
+    fn replace_selection_skips_restore_if_clipboard_changed_during_delay() {
+        let clipboard = FakeClipboard::new("captured selection text");
+        let paste = FakePaste::new();
+        let pre_copy_clipboard = ClipboardPayload::new("original pre-copy contents".to_string());
+        let transformed = ClipboardPayload::new("transformed replacement text".to_string());
+
+        // Simulate another actor writing to the clipboard during the
+        // restore delay, from inside the injected sleep callback.
+        replace_selection(
+            &clipboard,
+            &paste,
+            |_delay| {
+                clipboard
+                    .set("someone else's newer clipboard value")
+                    .unwrap();
+            },
+            pre_copy_clipboard,
+            transformed,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "someone else's newer clipboard value"
+        );
+    }
+
+    #[test]
+    fn replace_selection_restores_pre_copy_original_when_paste_synthesis_fails() {
+        // Mirrors issue #65's coverage for `paste_via_clipboard_swap`: a
+        // paste-synthesis failure must not leave the transformed text
+        // permanently on the clipboard, and the value restored must be the
+        // pre-copy original passed in, not whatever happened to be on the
+        // clipboard beforehand.
+        let clipboard = FakeClipboard::new("captured selection text");
+        let paste = FailingPaste;
+        let pre_copy_clipboard = ClipboardPayload::new("original pre-copy contents".to_string());
+        let transformed = ClipboardPayload::new("transformed replacement text".to_string());
+
+        let err = replace_selection(
+            &clipboard,
+            &paste,
+            |_delay| {},
+            pre_copy_clipboard,
+            transformed,
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("synthetic paste synthesis"));
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "original pre-copy contents",
+            "must not leave the transformed text on the clipboard when paste synthesis fails"
+        );
     }
 
     // -----------------------------------------------------------------
