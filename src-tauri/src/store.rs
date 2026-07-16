@@ -389,6 +389,40 @@ mod tests {
     }
 
     // -------------------------------------------------------------
+    // get_history (issue #198, AC-30): copy_history_entry needs to fetch a
+    // single row by id to read its `cleaned` text before routing it through
+    // the clipboard.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn get_history_returns_the_row_matching_the_given_id() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_history(1_000, "hello world", "Hello, world.", Some("Notes"))
+            .unwrap();
+
+        let row = store.get_history(id).unwrap();
+        assert_eq!(
+            row,
+            Some(HistoryRow {
+                id,
+                created_at_ms: 1_000,
+                raw: "hello world".to_string(),
+                cleaned: "Hello, world.".to_string(),
+                app_name: Some("Notes".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn get_history_returns_none_for_an_id_that_does_not_exist() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_history(1_000, "alpha", "alpha.", None).unwrap();
+
+        assert_eq!(store.get_history(999).unwrap(), None);
+    }
+
+    // -------------------------------------------------------------
     // search limit + ordering
     // -------------------------------------------------------------
 
