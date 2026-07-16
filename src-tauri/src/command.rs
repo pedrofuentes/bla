@@ -44,6 +44,166 @@
 //! garbage paste (AC-47).
 #![allow(dead_code)]
 
+use crate::cleanup::OllamaTransport;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Errors an [`OllamaCommand`] (or any future [`CommandTransform`]
+/// implementation) may return. Deliberately a **distinct** type from
+/// `cleanup::CleanupError` — even though it currently has the same single
+/// variant, the two error spaces are not the same concept: `CleanupError`
+/// always has a deterministic `RegexCleanup` fallback behind it (AC-4),
+/// while `CommandError` never does (AC-47) — collapsing them into one type
+/// would blur that distinction at every call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandError {
+    /// The transport could not be reached, timed out, or returned a
+    /// response this module can't parse. Unlike `cleanup::Cleanup`, there
+    /// is no regex-style fallback for an arbitrary spoken instruction
+    /// (AC-47) — callers (the pipeline wiring in #259) must surface this
+    /// to the user rather than silently pasting something else.
+    Unreachable,
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CommandError::Unreachable => write!(f, "command transform backend unreachable"),
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+/// Pure text-transformation seam for command mode (mirrors
+/// `cleanup::Cleanup`'s role, over two inputs instead of one). `content` is
+/// the user's selected text (untrusted — see the module doc comment);
+/// `instruction` is the spoken command describing how to rewrite it
+/// (trusted). Implementations must be pure aside from the network call
+/// itself — no local parsing/"sanitizing" of `content` for embedded
+/// directives; the prompt design is the sole defense against those
+/// (AC-46), not ad hoc Rust string-matching.
+pub trait CommandTransform {
+    /// Rewrites `content` according to `instruction`. Never treats
+    /// `content` as a source of instructions, never answers `instruction`
+    /// as a question, never adds content beyond what's derivable from
+    /// `content` (AC-47).
+    fn transform(&self, content: &str, instruction: &str) -> Result<String, CommandError>;
+}
+
+/// The versioned, rewrite-only command-mode prompt (issue #256, AC-46).
+/// Embedded at compile time, per the same "add a new file, never edit the
+/// old one in place" convention as `cleanup::CLEANUP_PROMPT_V1` — a future
+/// prompt revision adds `command_v2.txt` and repoints the constant used by
+/// [`OllamaCommand`], leaving this file and its regression tests intact.
+pub const COMMAND_PROMPT_V1: &str = include_str!("../prompts/command_v1.txt");
+
+/// The `{{INSTRUCTION}}` placeholder inside [`COMMAND_PROMPT_V1`],
+/// substituted at call time by [`render_command_prompt_v1`] with the
+/// user's spoken instruction.
+const COMMAND_PROMPT_V1_INSTRUCTION_PLACEHOLDER: &str = "{{INSTRUCTION}}";
+
+/// Renders [`COMMAND_PROMPT_V1`] with `instruction` substituted into the
+/// `{{INSTRUCTION}}` placeholder (issue #256, AC-46). Pure and
+/// deterministic — no network, no OS calls.
+///
+/// This is what makes the channel separation structural rather than
+/// incidental: the instruction is folded into the *trusted* rendered
+/// prompt text here, entirely independent of whatever `content` string a
+/// caller later sends alongside it as Ollama's separate `prompt` field
+/// (see [`OllamaCommand::transform`]) — the two channels are never
+/// concatenated by this module's own code.
+pub fn render_command_prompt_v1(instruction: &str) -> String {
+    COMMAND_PROMPT_V1.replace(COMMAND_PROMPT_V1_INSTRUCTION_PLACEHOLDER, instruction)
+}
+
+/// Request body shape for Ollama's `/api/generate` endpoint — identical
+/// field layout to `cleanup::GenerateRequest`, but the two fields carry
+/// different channels here: `system` carries the rendered, instruction-
+/// bearing prompt ([`render_command_prompt_v1`]); `prompt` carries the
+/// selected content, untouched, so the model sees exactly the selection
+/// the caller passed in and this module never merges the two channels
+/// itself.
+#[derive(Serialize)]
+struct GenerateRequest<'a> {
+    model: &'a str,
+    system: &'a str,
+    prompt: &'a str,
+    stream: bool,
+}
+
+/// The subset of Ollama's `/api/generate` response this module reads.
+#[derive(Deserialize)]
+struct GenerateResponse {
+    response: String,
+}
+
+/// Ollama-backed [`CommandTransform`] (issue #256). Reuses
+/// `cleanup::OllamaTransport` (and, in production, `cleanup::UreqTransport`)
+/// rather than standing up a second HTTP client — command mode talks to the
+/// exact same `localhost:11434` origin as cleanup, never a new one
+/// (MISSION §5).
+///
+/// Never falls back: any failure to reach or parse a response from the
+/// endpoint is mapped to [`CommandError::Unreachable`] and returned to the
+/// caller (AC-47) — there is no `RegexCommand`-style deterministic
+/// approximation for an arbitrary spoken instruction, unlike
+/// `cleanup::RegexCleanup`. This module never logs `content` or
+/// `instruction` (MISSION §5) — both are user content.
+pub struct OllamaCommand<T: OllamaTransport> {
+    base_url: String,
+    model: String,
+    transport: T,
+}
+
+impl<T: OllamaTransport> OllamaCommand<T> {
+    /// Builds an `OllamaCommand` against `base_url` (no trailing slash
+    /// required — it's trimmed) using `model` and the given transport.
+    ///
+    /// Same MISSION §5 locality invariant as `cleanup::OllamaCleanup::new`:
+    /// `base_url` should resolve to the local machine. Enforcement at
+    /// config time is pipeline-wiring's job (#259), not this pure-logic
+    /// module's.
+    pub fn new(base_url: impl Into<String>, model: impl Into<String>, transport: T) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            transport,
+        }
+    }
+
+    /// Builds an `OllamaCommand` against `cleanup::DEFAULT_OLLAMA_BASE_URL`
+    /// — reused directly rather than declaring a parallel constant that
+    /// could silently drift from cleanup's (no new network origin).
+    pub fn with_default_base_url(model: impl Into<String>, transport: T) -> Self {
+        Self::new(crate::cleanup::DEFAULT_OLLAMA_BASE_URL, model, transport)
+    }
+}
+
+impl<T: OllamaTransport> CommandTransform for OllamaCommand<T> {
+    fn transform(&self, content: &str, instruction: &str) -> Result<String, CommandError> {
+        let system_prompt = render_command_prompt_v1(instruction);
+        let request = GenerateRequest {
+            model: &self.model,
+            system: &system_prompt,
+            prompt: content,
+            stream: false,
+        };
+        let body = serde_json::to_string(&request).map_err(|_| CommandError::Unreachable)?;
+        let url = format!("{}/api/generate", self.base_url.trim_end_matches('/'));
+
+        let response_body = self
+            .transport
+            .post(&url, &body)
+            .map_err(|_| CommandError::Unreachable)?;
+
+        let parsed: GenerateResponse =
+            serde_json::from_str(&response_body).map_err(|_| CommandError::Unreachable)?;
+
+        Ok(parsed.response.trim().to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,7 +289,10 @@ mod tests {
         // (not the original content, not a synthesized placeholder).
         let command = command_with(StubTransport::unreachable());
         let result = command.transform("some selected text", "make this formal");
-        assert!(result.is_err(), "an unreachable transport must never succeed");
+        assert!(
+            result.is_err(),
+            "an unreachable transport must never succeed"
+        );
     }
 
     // -------------------------------------------------------------
@@ -157,9 +320,7 @@ mod tests {
         let stub = StubTransport::succeeding("Rewritten text.");
         let command = command_with(stub);
         let instruction = "make this sound more formal";
-        command
-            .transform("some content", instruction)
-            .unwrap();
+        command.transform("some content", instruction).unwrap();
 
         let (_, body) = command.transport.captured_request();
         let parsed: serde_json::Value =
