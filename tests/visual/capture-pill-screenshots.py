@@ -75,6 +75,20 @@ def capture(base_url: str) -> None:
         page.wait_for_selector('[data-testid="events-error"]')
         page.screenshot(path=str(OUT_DIR / "pill-status-unavailable.png"))
 
+        # ---- (4) HistoryPersistFailed informational toast (issue #220) ----
+        # the dictation itself already pasted; only the secondary history-row
+        # write failed, so this renders informational (blue), not blocking.
+        page.goto(f"{base_url}/tests/visual/pill-harness.html")
+        page.wait_for_function("() => typeof window.__pillHarnessEmit === 'function'")
+        page.evaluate(
+            """() => window.__pillHarnessEmit('pipeline-error', {
+                kind: 'HistoryPersistFailed',
+                message: "Couldn't save this dictation to history.",
+            })"""
+        )
+        page.wait_for_selector('[role="status"]')
+        page.screenshot(path=str(OUT_DIR / "pill-history-persist-failed-toast.png"))
+
         context.close()
         browser.close()
 
