@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn opening_an_in_memory_store_runs_every_migration_and_sets_user_version_to_the_latest() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     // -------------------------------------------------------------
@@ -630,7 +630,10 @@ mod tests {
     #[test]
     fn fresh_db_migration_ledger_records_every_migration_exactly_once_issue_163() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            store.applied_migration_versions().unwrap(),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -650,18 +653,22 @@ mod tests {
         let store = Store::open(&path)
             .expect("second open must not reapply migrations (would violate schema_migrations' PRIMARY KEY if the guard were broken)");
 
-        assert_eq!(store.schema_version().unwrap(), 3);
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2, 3]);
+        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(
+            store.applied_migration_versions().unwrap(),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]
-    fn upgrading_a_pre_existing_v1_db_applies_only_migration_2_and_3_issue_163() {
+    fn upgrading_a_pre_existing_v1_db_applies_migrations_2_through_4_issue_163() {
         // Simulates a real-world upgrade: a DB created by code that only
         // knew about migration 1 (no `schema_migrations` ledger existed
         // yet) is then opened by the current code. Migration 1 must NOT be
         // re-applied (and isn't retroactively recorded in the ledger —
         // only migrations that actually ran through this runner are); only
-        // migrations 2 (dictionary) and 3 (tone_rules) should apply.
+        // migrations 2 (dictionary), 3 (tone_rules), and 4 (snippets)
+        // should apply.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.sqlite3");
         {
@@ -671,8 +678,8 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("upgrade open should succeed");
-        assert_eq!(store.schema_version().unwrap(), 3);
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![2, 3]);
+        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![2, 3, 4]);
 
         // Migration 2's table is now actually usable.
         let id = store.add_term("Kubernetes", 1_000).unwrap();
@@ -682,6 +689,9 @@ mod tests {
             .upsert_tone_rule("Notes", ToneProfile::Casual, 1_000)
             .unwrap();
         assert!(rule_id > 0);
+        // Migration 4's table is now actually usable too.
+        let snippet_id = store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+        assert!(snippet_id > 0);
     }
 
     // -------------------------------------------------------------
@@ -690,36 +700,81 @@ mod tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn upgrading_a_pre_existing_v2_db_applies_only_migration_3_issue_202() {
+    fn upgrading_a_pre_existing_v2_db_applies_migrations_3_and_4_issue_202() {
         // A DB already migrated to v2 by code that predates tone_rules
-        // (issue #200's own state) must, on the next open, apply ONLY
-        // migration 3 — not re-run 1/2.
+        // (issue #200's own state) must, on the next open, apply migrations
+        // 3 (tone_rules) and 4 (snippets) — not re-run 1/2.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.sqlite3");
         {
             let store = Store::open(&path).expect("v1+v2 open should succeed");
-            assert_eq!(store.schema_version().unwrap(), 3);
+            assert_eq!(store.schema_version().unwrap(), 4);
         }
         // Roll the on-disk DB back to pretend it only ever reached v2: undo
-        // migration 3's ledger row and table, then reset user_version.
+        // migrations 3 and 4's ledger rows and tables, then reset
+        // user_version.
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "DROP TABLE tone_rules;
-                 DELETE FROM schema_migrations WHERE version = 3;
+                 DROP TABLE snippets;
+                 DELETE FROM schema_migrations WHERE version IN (3, 4);
                  PRAGMA user_version = 2;",
             )
             .unwrap();
         }
 
         let store = Store::open(&path).expect("upgrade open should succeed");
-        assert_eq!(store.schema_version().unwrap(), 3);
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2, 3]);
+        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(
+            store.applied_migration_versions().unwrap(),
+            vec![1, 2, 3, 4]
+        );
 
         let rule_id = store
             .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
             .unwrap();
         assert!(rule_id > 0);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #258 (M4, part of #242): migration 4 — `snippets`. Mirrors
+    // #163's/#202's discriminating upgrade-path pattern for this new
+    // migration.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn upgrading_a_pre_existing_v3_db_applies_only_migration_4_issue_258() {
+        // A DB already migrated to v3 by code that predates snippets
+        // (issue #202's own state) must, on the next open, apply ONLY
+        // migration 4 — not re-run 1/2/3.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+        {
+            let store = Store::open(&path).expect("v1+v2+v3 open should succeed");
+            assert_eq!(store.schema_version().unwrap(), 4);
+        }
+        // Roll the on-disk DB back to pretend it only ever reached v3: undo
+        // migration 4's ledger row and table, then reset user_version.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE snippets;
+                 DELETE FROM schema_migrations WHERE version = 4;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).expect("upgrade open should succeed");
+        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(
+            store.applied_migration_versions().unwrap(),
+            vec![1, 2, 3, 4]
+        );
+
+        let snippet_id = store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+        assert!(snippet_id > 0);
     }
 
     #[test]
@@ -972,14 +1027,14 @@ mod tests {
 
         {
             let store = Store::open(&path).expect("first open should succeed");
-            assert_eq!(store.schema_version().unwrap(), 3);
+            assert_eq!(store.schema_version().unwrap(), 4);
         }
 
         // Re-opening an already-migrated DB must not error and must leave
         // user_version untouched — the migration runner is forward-only and
         // idempotent.
         let store = Store::open(&path).expect("second open should succeed");
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     // -------------------------------------------------------------
@@ -1399,5 +1454,160 @@ mod tests {
 
         assert_eq!(deleted, 0, "a clock-skewed `now` must not prune anything");
         assert_eq!(store.search_history("", 10).unwrap().len(), 3);
+    }
+
+    // -------------------------------------------------------------
+    // Snippets CRUD (issue #258, AC-51, part of #242's M4 scope)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn add_snippet_then_list_snippets_round_trips_the_snippet() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+        assert!(id > 0);
+
+        let snippets = store.list_snippets().unwrap();
+        assert_eq!(
+            snippets,
+            vec![Snippet {
+                id,
+                trigger: "addr".to_string(),
+                body: "123 Main St".to_string(),
+                created_at_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn adding_a_snippet_twice_with_different_casing_is_a_case_insensitive_no_op_issue_258() {
+        // Mirrors #160's dictionary precedent (`dictionary(term UNIQUE
+        // NOCASE)`), applied here to `trigger`: adding "Addr" then "addr"
+        // must be a no-op/conflict, not two rows — the first-inserted
+        // casing, body, and timestamp win.
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store.add_snippet("Addr", "123 Main St", 1_000).unwrap();
+        let second_id = store.add_snippet("addr", "999 Other Ave", 2_000).unwrap();
+
+        assert_eq!(
+            first_id, second_id,
+            "both calls must resolve to the same row"
+        );
+
+        let snippets = store.list_snippets().unwrap();
+        assert_eq!(
+            snippets.len(),
+            1,
+            "a case-insensitive duplicate trigger must not add a second row"
+        );
+        assert_eq!(
+            snippets[0].trigger, "Addr",
+            "the first-inserted casing must win"
+        );
+        assert_eq!(
+            snippets[0].body, "123 Main St",
+            "the first-inserted body must win"
+        );
+        assert_eq!(
+            snippets[0].created_at_ms, 1_000,
+            "the first-inserted timestamp must win"
+        );
+    }
+
+    #[test]
+    fn distinct_snippet_triggers_are_not_treated_as_duplicates() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+        store.add_snippet("sig", "Best, Pat", 2_000).unwrap();
+
+        assert_eq!(store.list_snippets().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_snippets_orders_most_recently_added_first() {
+        // Mirrors `list_terms`'s own newest-first ordering policy (issue
+        // #70's rationale doesn't apply verbatim here — there's no length
+        // cap to pack against — but consistent ordering across the store's
+        // list methods is its own value).
+        let store = Store::open_in_memory().unwrap();
+        store.add_snippet("oldest", "o", 1_000).unwrap();
+        store.add_snippet("middle", "m", 2_000).unwrap();
+        store.add_snippet("newest", "n", 3_000).unwrap();
+
+        let triggers: Vec<String> = store
+            .list_snippets()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.trigger)
+            .collect();
+        assert_eq!(triggers, vec!["newest", "middle", "oldest"]);
+    }
+
+    #[test]
+    fn update_snippet_changes_trigger_and_body_in_place_ac51() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+
+        store.update_snippet(id, "address", "456 Oak Ave").unwrap();
+
+        let snippets = store.list_snippets().unwrap();
+        assert_eq!(snippets.len(), 1, "an update must not add a second row");
+        assert_eq!(snippets[0].id, id);
+        assert_eq!(snippets[0].trigger, "address");
+        assert_eq!(snippets[0].body, "456 Oak Ave");
+    }
+
+    #[test]
+    fn update_snippet_on_a_nonexistent_id_is_a_noop_ac51() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+
+        store
+            .update_snippet(999_999, "bogus", "bogus body")
+            .unwrap();
+
+        let snippets = store.list_snippets().unwrap();
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].trigger, "addr");
+    }
+
+    #[test]
+    fn update_snippet_colliding_case_insensitively_with_another_trigger_is_rejected_ac51() {
+        // Defense-in-depth at update time too, not just insert time: the
+        // schema's `UNIQUE COLLATE NOCASE` constraint is the single source
+        // of truth for trigger-phrase uniqueness (AC-51), so an update that
+        // would collide with a DIFFERENT existing row's trigger (even under
+        // a different case) must fail rather than silently merge two rows.
+        let store = Store::open_in_memory().unwrap();
+        store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+        let sig_id = store.add_snippet("sig", "Best, Pat", 2_000).unwrap();
+
+        let result = store.update_snippet(sig_id, "ADDR", "Should not apply");
+        assert!(
+            result.is_err(),
+            "updating to a trigger that collides case-insensitively with another row must fail"
+        );
+    }
+
+    #[test]
+    fn remove_snippet_removes_only_the_targeted_row_ac51() {
+        let store = Store::open_in_memory().unwrap();
+        let keep = store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+        let drop = store.add_snippet("sig", "Best, Pat", 2_000).unwrap();
+
+        store.remove_snippet(drop).unwrap();
+
+        let snippets = store.list_snippets().unwrap();
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].id, keep);
+    }
+
+    #[test]
+    fn remove_snippet_on_a_nonexistent_id_is_a_noop_ac51() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_snippet("addr", "123 Main St", 1_000).unwrap();
+
+        store.remove_snippet(999_999).unwrap();
+
+        assert_eq!(store.list_snippets().unwrap().len(), 1);
     }
 }
