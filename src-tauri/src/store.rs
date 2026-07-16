@@ -444,7 +444,9 @@ mod tests {
     #[test]
     fn get_history_returns_none_for_an_id_that_does_not_exist() {
         let store = Store::open_in_memory().unwrap();
-        store.insert_history(1_000, "alpha", "alpha.", None).unwrap();
+        store
+            .insert_history(1_000, "alpha", "alpha.", None)
+            .unwrap();
 
         assert_eq!(store.get_history(999).unwrap(), None);
     }

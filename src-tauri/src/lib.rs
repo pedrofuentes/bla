@@ -980,7 +980,7 @@ mod history_wiring_tests {
         let day_ms: i64 = 24 * 60 * 60 * 1000;
         let now_ms = 10 * day_ms;
         store
-            .insert_history(1 * day_ms, "too old", "too old.", None)
+            .insert_history(day_ms, "too old", "too old.", None)
             .unwrap();
         store
             .insert_history(9 * day_ms, "recent enough", "recent enough.", None)
