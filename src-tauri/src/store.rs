@@ -897,6 +897,74 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------
+    // Issue #221 (SNTL-20260715-bla-PR218-cc04f8b): the test above is
+    // honest about its own limits (see the comment block above it) but
+    // isn't actually discriminating on its own — verified by temporarily
+    // deleting `conn.busy_timeout(Duration::from_secs(5))?;` from
+    // `from_connection` in a worktree and re-running: the PRAGMA-value test
+    // above still passed, because rusqlite 0.40.1's internal default is
+    // *also* exactly 5000ms. A PRAGMA-only assertion structurally cannot
+    // tell "this crate's explicit call" apart from "the vendored default
+    // happens to match it" — no query against the open connection can, since
+    // both code paths leave it in the identical observable state.
+    //
+    // So this second test pins the *source-level* contract instead: it
+    // parses `from_connection`'s own body out of this file's source (the
+    // same include_str!-and-scan technique issue #239 uses to pin the
+    // wire-key attribute on `#[tauri::command]` fns) and asserts the
+    // explicit call is textually present. This doesn't protect against
+    // rusqlite changing its internal default — nothing observable can, from
+    // outside rusqlite — but it does protect against exactly the change
+    // #162/#221 are about: this crate's own `from_connection` silently
+    // losing the explicit call (a refactor, a "looks redundant, deleting
+    // it" cleanup) without anyone noticing, because the PRAGMA test alone
+    // would stay green.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn from_connection_source_calls_busy_timeout_explicitly_issue_221() {
+        let src = include_str!("store.rs");
+        let fn_start = src
+            .find("fn from_connection(")
+            .expect("from_connection not found in store.rs source");
+        let body_start = src[fn_start..]
+            .find('{')
+            .map(|i| fn_start + i)
+            .expect("from_connection has no body");
+
+        // Depth-counted scan to the matching close brace. from_connection's
+        // body contains no string/char literals with braces in them, so a
+        // naive counter is safe here.
+        let mut depth = 0i32;
+        let mut body_end = body_start;
+        for (i, ch) in src[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            depth == 0 && body_end > body_start,
+            "failed to find from_connection's closing brace"
+        );
+
+        let body = &src[body_start..=body_end];
+        assert!(
+            body.contains("conn.busy_timeout("),
+            "from_connection must call `conn.busy_timeout(...)` explicitly (issue #162/#221) — \
+             removing it would go undetected by the PRAGMA-value test alone, since rusqlite's \
+             own internal default currently produces the identical observable busy_timeout"
+        );
+    }
+
     #[test]
     fn reopening_an_on_disk_store_is_idempotent_and_keeps_user_version_stable() {
         let dir = tempfile::tempdir().unwrap();
