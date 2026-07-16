@@ -60,13 +60,13 @@ jobs:
 
       - name: Setup Node
         if: steps.pnpm.outputs.present == 'true'
-        uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
 
       - name: Setup pnpm
         if: steps.pnpm.outputs.present == 'true'
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0 (commit SHA — the tag object SHA is not resolvable by Actions)
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9 (commit SHA — the tag object SHA is not resolvable by Actions)
 
       - name: pnpm install
         if: steps.pnpm.outputs.present == 'true'
@@ -165,13 +165,13 @@ jobs:
 
       - name: Setup Node
         if: steps.pnpm.outputs.present == 'true'
-        uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
 
       - name: Setup pnpm
         if: steps.pnpm.outputs.present == 'true'
-        uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0 (commit SHA — the tag object SHA is not resolvable by Actions)
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9 (commit SHA — the tag object SHA is not resolvable by Actions)
 
       - name: pnpm install
         if: steps.pnpm.outputs.present == 'true'
