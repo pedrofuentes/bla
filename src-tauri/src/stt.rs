@@ -323,6 +323,71 @@ mod whisper_integration_tests {
             .expect("transcription should succeed");
         println!("transcribed: {text:?}");
     }
+
+    /// AC-35 (PRD AC-21, issue #200): the real, whisper-gated half of "a
+    /// dictionary term absent from a fixture WAV's default transcription is
+    /// correctly recognized once added to the dictionary and injected into
+    /// Whisper's `initial_prompt`". `#[ignore]`d for the same reason as
+    /// `transcribes_a_real_model` above — no model file (or, here, no
+    /// speech fixture) is available in CI — the always-on,
+    /// never-`#[ignore]`d dictionary-PLUMBING assertion (does the term
+    /// actually reach `TranscribeOpts`/`initial_prompt`) lives in
+    /// `lib.rs::dictionary_wiring_tests`, which needs neither a model nor a
+    /// WAV file to run.
+    ///
+    /// `BLA_TEST_DICTIONARY_FIXTURE_WAV` should point at a synthetic
+    /// (TTS-generated, per ADR-0007 — never a real recording) 16 kHz mono
+    /// WAV containing speech of a term the base model is known to
+    /// mis-transcribe without help (an uncommon proper noun/acronym is a
+    /// good choice), e.g.:
+    ///
+    /// ```sh
+    /// BLA_TEST_WHISPER_MODEL=/path/to/ggml-model.bin \
+    /// BLA_TEST_DICTIONARY_FIXTURE_WAV=/path/to/fixture.wav \
+    /// BLA_TEST_DICTIONARY_TERM=Kubernetes \
+    ///   cargo test --features whisper -- --ignored dictionary_term_improves_recognition_on_a_real_model
+    /// ```
+    #[test]
+    #[ignore = "requires a downloaded whisper.cpp model file and a speech fixture WAV; not available in CI"]
+    fn dictionary_term_improves_recognition_on_a_real_model() {
+        let model_path = std::env::var("BLA_TEST_WHISPER_MODEL")
+            .expect("set BLA_TEST_WHISPER_MODEL to a whisper.cpp model file path");
+        let fixture_path = std::env::var("BLA_TEST_DICTIONARY_FIXTURE_WAV")
+            .expect("set BLA_TEST_DICTIONARY_FIXTURE_WAV to a synthetic speech fixture WAV path");
+        let term = std::env::var("BLA_TEST_DICTIONARY_TERM")
+            .expect("set BLA_TEST_DICTIONARY_TERM to the term the fixture speaks");
+
+        let mut reader = hound::WavReader::open(&fixture_path).expect("fixture WAV should open");
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("sample should decode") as f32 / i16::MAX as f32)
+            .collect();
+
+        let stt = WhisperStt::new(&model_path).expect("model should load");
+
+        let without_dictionary = stt
+            .transcribe(&samples, &TranscribeOpts::default())
+            .expect("transcription without a dictionary should succeed");
+        let with_dictionary = stt
+            .transcribe(
+                &samples,
+                &TranscribeOpts {
+                    dictionary: vec![term.clone()],
+                },
+            )
+            .expect("transcription with a dictionary should succeed");
+
+        assert!(
+            !without_dictionary.contains(&term),
+            "test fixture setup: the default transcription already contains {term:?} \
+             ({without_dictionary:?}) — pick a fixture/term the base model actually mis-transcribes"
+        );
+        assert!(
+            with_dictionary.contains(&term),
+            "AC-35: injecting {term:?} into the dictionary should recover it in the \
+             transcription, got {with_dictionary:?}"
+        );
+    }
 }
 
 #[cfg(test)]
