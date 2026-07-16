@@ -109,6 +109,19 @@ export interface PipelineErrorEvent {
 }
 
 /**
+ * Mirrors `store::DictionaryTerm` (src-tauri/src/store.rs) — one row
+ * returned by `list_dictionary_terms`. Carries the user's own personal-
+ * dictionary vocabulary: sanctioned to render in the Dictionary tab
+ * (#201), but never `console.log`/persist it anywhere else (MISSION §5/§7)
+ * — the same no-log invariant `HistoryRow` documents above.
+ */
+export interface DictionaryTerm {
+  id: number;
+  term: string;
+  created_at_ms: number;
+}
+
+/**
  * Command name → { args, result } typing. Extend this map as `commands.rs`
  * grows; each key must match a `#[tauri::command]` name exactly.
  */
@@ -146,6 +159,23 @@ export interface Commands {
   delete_history_entry: { args: { id: number }; result: void };
   /** Mirrors `commands::clear_history` (issue #198/#199) — the History tab's "Clear all". */
   clear_history: { result: void };
+  /**
+   * Mirrors `commands::list_dictionary_terms` (issue #200/#201) —
+   * every personal-dictionary term, most-recently-added first.
+   */
+  list_dictionary_terms: { result: DictionaryTerm[] };
+  /**
+   * Mirrors `commands::add_dictionary_term` (issue #200/#201). The
+   * backend's `dictionary(term UNIQUE COLLATE NOCASE)` constraint makes a
+   * case-insensitive duplicate an `INSERT OR IGNORE` no-op that still
+   * resolves with the existing row's id — it is never a rejected call, so
+   * the Dictionary tab checks for a case-insensitive duplicate against its
+   * already-loaded list itself before calling this (see
+   * `DictionaryTab.tsx`'s doc comment).
+   */
+  add_dictionary_term: { args: { term: string }; result: number };
+  /** Mirrors `commands::remove_dictionary_term` (issue #200/#201). */
+  remove_dictionary_term: { args: { id: number }; result: void };
 }
 
 /**

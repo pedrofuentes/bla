@@ -50,6 +50,11 @@ beforeEach(() => {
       case "delete_history_entry":
       case "clear_history":
         return Promise.resolve(undefined);
+      // Issue #201: the Dictionary tab (mounted once its tab is clicked)
+      // lists terms on mount — mocked here so switching to it in these
+      // tab-bar tests doesn't reject through an unmocked command.
+      case "list_dictionary_terms":
+        return Promise.resolve([]);
       default:
         return Promise.reject(new Error(`unmocked command ${command}`));
     }
@@ -76,13 +81,25 @@ describe("SettingsWindow tab bar", () => {
     mounted = mount(<SettingsWindow />);
     await flush();
 
-    click(mounted.container.querySelector('[data-testid="tab-dictionary"]')!);
+    click(mounted.container.querySelector('[data-testid="tab-tone"]')!);
     await flush();
 
     expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
     const placeholder = mounted.container.querySelector('[data-testid="placeholder-panel"]');
     expect(placeholder).not.toBeNull();
-    expect(placeholder?.textContent).toMatch(/dictionary/i);
+    expect(placeholder?.textContent).toMatch(/tone/i);
+  });
+
+  it("switches to the real Dictionary panel when the Dictionary tab is clicked (issue #201)", async () => {
+    mounted = mount(<SettingsWindow />);
+    await flush();
+
+    click(mounted.container.querySelector('[data-testid="tab-dictionary"]')!);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="placeholder-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="dictionary-panel"]')).not.toBeNull();
   });
 
   it("switches to the real History panel when the History tab is clicked (issue #199)", async () => {
@@ -101,7 +118,7 @@ describe("SettingsWindow tab bar", () => {
     mounted = mount(<SettingsWindow />);
     await flush();
 
-    click(mounted.container.querySelector('[data-testid="tab-dictionary"]')!);
+    click(mounted.container.querySelector('[data-testid="tab-tone"]')!);
     await flush();
     click(mounted.container.querySelector('[data-testid="tab-general"]')!);
     await flush();
