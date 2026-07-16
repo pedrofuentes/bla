@@ -287,6 +287,43 @@ pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// editing `cleanup_v1.txt` in place.
 pub const CLEANUP_PROMPT_V1: &str = include_str!("../prompts/cleanup_v1.txt");
 
+/// The M3 personal-dictionary-aware cleanup prompt (issue #200, PRD AC-21,
+/// AC-36). Supersedes `CLEANUP_PROMPT_V1` as `OllamaCleanup`'s live system
+/// prompt (see [`OllamaCleanup::with_dictionary`]) — per the same "add a new
+/// file, never edit the old one in place" convention as `CLEANUP_PROMPT_V1`'s
+/// own doc comment, `cleanup_v1.txt` stays on disk untouched (its own
+/// `ac10_prompt_file_contains_the_rewrite_only_constraints` regression test
+/// keeps protecting it structurally). Contains a `{{DICTIONARY}}`
+/// placeholder — see [`render_cleanup_prompt_v2`] for the substitution.
+pub const CLEANUP_PROMPT_V2: &str = include_str!("../prompts/cleanup_v2.txt");
+
+/// The `{{DICTIONARY}}` placeholder inside [`CLEANUP_PROMPT_V2`], substituted
+/// at call time by [`render_cleanup_prompt_v2`].
+const CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER: &str = "{{DICTIONARY}}";
+
+/// Renders [`CLEANUP_PROMPT_V2`] with `dictionary`'s current terms
+/// substituted into the `{{DICTIONARY}}` placeholder (issue #200, PRD
+/// AC-21, AC-36).
+///
+/// Terms are comma-joined using [`crate::stt::build_initial_prompt`] —
+/// reused directly rather than reimplemented, so this rendering path and
+/// Whisper's `initial_prompt` seam can't silently drift out of sync on
+/// escaping/collapsing rules (AC-36(a)). An empty dictionary substitutes a
+/// short "no terms" sentence rather than leaving a dangling, ungrammatical
+/// trailing fragment, so the rendered prompt reads cleanly either way.
+pub fn render_cleanup_prompt_v2(dictionary: &[String]) -> String {
+    let terms = crate::stt::build_initial_prompt(dictionary);
+    let dictionary_sentence = if terms.is_empty() {
+        "The user's dictionary is currently empty.".to_string()
+    } else {
+        format!("The user's current dictionary terms: {terms}.")
+    };
+    CLEANUP_PROMPT_V2.replace(
+        CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER,
+        &dictionary_sentence,
+    )
+}
+
 /// Errors an [`OllamaTransport`] may return. `OllamaCleanup::clean` maps
 /// every variant to [`CleanupError::Unreachable`] (AC-4) — transport
 /// internals never propagate past this module.
