@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { defineConfig, configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // UI unit tests (MISSION.md §7: UI components counted separately from the
@@ -17,6 +17,7 @@ export default defineConfig({
     // Scaffold has no behavior-bearing components yet (AGENTS.md scaffolding
     // exemption); drop this once the first real `*.test.tsx` lands.
     passWithNoTests: true,
+    exclude: [...configDefaults.exclude, "**/.worktrees/**", "**/.claude/worktrees/**"],
     coverage: {
       provider: "v8",
       reporter: ["text", "html"],
