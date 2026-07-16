@@ -38,17 +38,33 @@ use std::time::Duration;
 /// appending entries here — nothing about the runner itself needs to change.
 type Migration = (i64, &'static str);
 
-const MIGRATIONS: &[Migration] = &[(
-    1,
-    "CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY,
-        created_at_ms INTEGER NOT NULL,
-        raw TEXT NOT NULL,
-        cleaned TEXT NOT NULL,
-        app_name TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_history_created_at_ms ON history(created_at_ms);",
-)];
+const MIGRATIONS: &[Migration] = &[
+    (
+        1,
+        "CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY,
+            created_at_ms INTEGER NOT NULL,
+            raw TEXT NOT NULL,
+            cleaned TEXT NOT NULL,
+            app_name TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_history_created_at_ms ON history(created_at_ms);",
+    ),
+    (
+        2,
+        // Issue #200 (PRD AC-21), schema per #160's plan note:
+        // `dictionary(term UNIQUE NOCASE)`. `term`'s column-level `UNIQUE
+        // COLLATE NOCASE` constraint is what makes `add_term`'s
+        // case-insensitive de-duplication ("Kubernetes" then "kubernetes"
+        // is a no-op, not two rows) a property of the schema itself rather
+        // than something every caller has to remember to check for.
+        "CREATE TABLE IF NOT EXISTS dictionary (
+            id INTEGER PRIMARY KEY,
+            term TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at_ms INTEGER NOT NULL
+        );",
+    ),
+];
 
 /// A single dictation history entry (issue #160).
 ///
@@ -63,6 +79,26 @@ pub struct HistoryRow {
     pub raw: String,
     pub cleaned: String,
     pub app_name: Option<String>,
+}
+
+/// One term in the user's personal dictionary (issue #200, PRD AC-21):
+/// vocabulary — names, product names, jargon, acronyms — fed to Whisper's
+/// `initial_prompt` ([`crate::stt::build_initial_prompt`]) and to the
+/// `cleanup_v2` rewrite prompt ([`crate::cleanup::render_cleanup_prompt_v2`])
+/// to bias recognition and spelling correction toward the user's own words.
+///
+/// Derives `Debug` for test assertions only, mirroring [`HistoryRow`]'s own
+/// doc comment: dictionary terms are user content and stay under the same
+/// no-log invariant (MISSION §5/§7) as transcript text — nothing in this
+/// crate `println!`/`log!`s a `DictionaryTerm`. Also derives `Serialize`
+/// (like `HistoryRow`) so `commands::list_dictionary_terms` can hand rows to
+/// the frontend over Tauri IPC — the one sanctioned "leaves this module"
+/// path, the user's own Dictionary tab (#201).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DictionaryTerm {
+    pub id: i64,
+    pub term: String,
+    pub created_at_ms: i64,
 }
 
 /// Headless SQLite persistence layer wrapping a single [`rusqlite::Connection`].
@@ -127,7 +163,25 @@ impl Store {
     /// than the DB's current `user_version`, in order, each inside its own
     /// transaction. Forward-only and idempotent: re-running against an
     /// already-migrated DB applies nothing and errors on nothing.
+    ///
+    /// Issue #163 (SNTL-20260713-bla-PR161-b26d368): also maintains a
+    /// `schema_migrations` ledger recording exactly which versions have
+    /// been applied. Migration 1's SQL happens to be idempotent on its own
+    /// (`CREATE TABLE/INDEX IF NOT EXISTS`), so the `if *version <= current
+    /// { continue; }` guard below had no test that could actually tell it
+    /// apart from not existing at all. `INSERT INTO schema_migrations` is
+    /// deliberately NOT idempotent (`version` is a `PRIMARY KEY`): if that
+    /// guard is ever silently broken, a migration gets re-applied, its
+    /// ledger insert hits a PRIMARY KEY violation, and `Store::open`
+    /// returns `Err` instead of quietly re-running SQL with no visible
+    /// effect — a failure a test (or a real reopen) can observe directly.
     fn migrate(&mut self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL
+            );",
+        )?;
+
         let current: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -142,9 +196,26 @@ impl Store {
             // compile-time constant from MIGRATIONS, never user input, so
             // formatting it into the statement is safe.
             tx.execute_batch(&format!("PRAGMA user_version = {version};"))?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                params![version],
+            )?;
             tx.commit()?;
         }
         Ok(())
+    }
+
+    /// The set of migration versions [`Self::migrate`] has actually applied
+    /// through the `schema_migrations` ledger, oldest first — the
+    /// discriminating assertion issue #163 asks for (see `migrate`'s doc
+    /// comment).
+    #[cfg(test)]
+    fn applied_migration_versions(&self) -> SqliteResult<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
     }
 
     /// Insert a new history row and return its assigned row id.
@@ -234,6 +305,73 @@ impl Store {
             "DELETE FROM history WHERE created_at_ms < ?1",
             params![cutoff_ms],
         )
+    }
+
+    /// The most recent `history` row's `created_at_ms`, or `None` if
+    /// `history` is empty. [`retention_cutoff_ms`]'s clock-skew guard
+    /// (issue #219) uses this to sanity-check the computed cutoff against
+    /// data that has actually been recorded.
+    pub fn newest_history_timestamp(&self) -> SqliteResult<Option<i64>> {
+        self.conn
+            .query_row("SELECT MAX(created_at_ms) FROM history", [], |row| {
+                row.get(0)
+            })
+    }
+
+    /// Add `term` to the personal dictionary (issue #200, PRD AC-21).
+    /// Case-insensitively unique (schema: `term UNIQUE COLLATE NOCASE`) —
+    /// adding a term that already exists under a different case
+    /// ("Kubernetes" then "kubernetes") is a no-op, not a second row or an
+    /// error: the first-inserted casing and `created_at_ms` win. Returns
+    /// the row id either way, so a caller always gets a stable id back for
+    /// the term it asked for, whether that add just happened or a
+    /// case-insensitive match already existed.
+    pub fn add_term(&self, term: &str, created_at_ms: i64) -> SqliteResult<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO dictionary (term, created_at_ms) VALUES (?1, ?2)",
+            params![term, created_at_ms],
+        )?;
+        // The column's own `COLLATE NOCASE` makes this lookup
+        // case-insensitive too, so this resolves to the existing row on a
+        // conflict without needing an explicit `COLLATE` in the query.
+        self.conn.query_row(
+            "SELECT id FROM dictionary WHERE term = ?1",
+            params![term],
+            |row| row.get(0),
+        )
+    }
+
+    /// All dictionary terms, most-recently-added first.
+    ///
+    /// Ordering is a deliberate policy choice (issue #70): `build_initial_prompt`
+    /// packs terms into Whisper's `initial_prompt` in the order it's given
+    /// and skips whichever ones don't fit the length cap. Feeding it terms
+    /// newest-first means that when the whole dictionary doesn't fit, it's
+    /// the OLDEST terms that get skipped — recently-added terms are more
+    /// likely to be what the user is actively dictating about (new jargon,
+    /// a name they just added), so they should win a place over older ones
+    /// rather than losing out to an arbitrary/insertion-order truncation.
+    pub fn list_terms(&self) -> SqliteResult<Vec<DictionaryTerm>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, term, created_at_ms FROM dictionary
+             ORDER BY created_at_ms DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DictionaryTerm {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                created_at_ms: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Remove a single dictionary term by id. Removing an id that doesn't
+    /// exist is a no-op, not an error (mirrors [`Self::delete_history`]).
+    pub fn remove_term(&self, id: i64) -> SqliteResult<()> {
+        self.conn
+            .execute("DELETE FROM dictionary WHERE id = ?1", params![id])?;
+        Ok(())
     }
 }
 
