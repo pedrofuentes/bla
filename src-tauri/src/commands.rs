@@ -492,3 +492,213 @@ pub fn resume_hotkey(
     }
     Ok(())
 }
+
+// -------------------------------------------------------------------------
+// Issue #239 (SNTL-20260716-bla-PR237-14507f3): class-level guard for the
+// #237 🔴 (`upsert_tone_rule`'s `app_pattern` argument mismatched on the
+// wire because tauri-macros defaults every `#[tauri::command]` arg to
+// camelCase, and nothing exercised the real JS↔Rust wire contract — cargo
+// tests call `Store` methods directly, and Vitest mocks `lib/ipc` wholesale,
+// so a multi-word snake_case arg name silently missing `rename_all =
+// "snake_case"` was structurally invisible until it broke in the real app).
+//
+// This isn't a true invoke-handler round-trip (Tauri's test harness for
+// that is heavier than this module needs); it's a convention test: parse
+// every `#[tauri::command...] pub fn NAME(...)` block out of this file's
+// own source and assert that any block with a multi-word (contains `_`)
+// argument name also carries `rename_all = "snake_case"` on its attribute.
+// It will fail the moment a new command repeats the #237 mistake, without
+// needing to know that command's name in advance.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod wire_key_contract_tests {
+    /// This file's own source, parsed at test time rather than compile
+    /// time — deliberately re-reading the same file the `#[tauri::command]`
+    /// fns above live in, so the guard can never drift out of sync with
+    /// what's actually there.
+    const SRC: &str = include_str!("commands.rs");
+
+    /// One parsed `#[tauri::command...]` block: the fn's name, whether its
+    /// attribute carries an explicit `rename_all = "snake_case"`, and the
+    /// raw text between the fn's parens.
+    struct CommandBlock {
+        name: String,
+        has_snake_case_rename: bool,
+        params_raw: String,
+    }
+
+    /// True when `idx` is the first non-whitespace position on its line —
+    /// i.e. everything from the start of the line up to `idx` is
+    /// whitespace. Used to tell a real `#[tauri::command]` attribute (which
+    /// always starts its own line) apart from the marker string appearing
+    /// mid-line inside a doc comment, a `//` comment, or a string literal —
+    /// this test module's own source talks *about* `#[tauri::command]`
+    /// prose-style in several places (see this fn's own doc comments and
+    /// the `marker`/`.expect(...)` strings below), and a naive substring
+    /// scan over `include_str!`-ed self-referential source would otherwise
+    /// false-positive on every one of them.
+    fn is_at_line_start(src: &str, idx: usize) -> bool {
+        let line_start = src[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        src[line_start..idx].chars().all(char::is_whitespace)
+    }
+
+    /// Scans `src` for every `#[tauri::command...]` attribute immediately
+    /// followed by `pub fn NAME(...)`, in source order. Deliberately a
+    /// simple linear scan rather than a real Rust parser (a `syn`
+    /// dependency would be overkill for a test-only convention check) —
+    /// robust enough for this file's actual shape (attribute directly
+    /// above `pub fn`, no other attributes in between, no nested
+    /// parentheses inside any command's parameter list) plus the
+    /// line-start check above to skip this very test module's own
+    /// prose/string mentions of the marker text.
+    fn parse_command_blocks(src: &str) -> Vec<CommandBlock> {
+        let marker = "#[tauri::command";
+        let mut blocks = Vec::new();
+        let mut search_from = 0usize;
+
+        while let Some(rel) = src[search_from..].find(marker) {
+            let attr_start = search_from + rel;
+            if !is_at_line_start(src, attr_start) {
+                // A mid-line mention (doc comment, `//` comment, or string
+                // literal talking about the marker) — not a real attribute.
+                // Skip past it and keep scanning.
+                search_from = attr_start + marker.len();
+                continue;
+            }
+
+            let attr_end = attr_start
+                + src[attr_start..]
+                    .find(']')
+                    .expect("unterminated #[tauri::command attribute");
+            let attr_text = &src[attr_start..=attr_end];
+            let has_snake_case_rename =
+                attr_text.contains("rename_all") && attr_text.contains("snake_case");
+
+            let after_attr = &src[attr_end + 1..];
+            let fn_kw = after_attr
+                .find("fn ")
+                .expect("no `fn` found after a #[tauri::command] attribute");
+            let after_fn = &after_attr[fn_kw + "fn ".len()..];
+            let paren_open = after_fn
+                .find('(')
+                .expect("no `(` found after a command fn's name");
+            let name = after_fn[..paren_open].trim().to_string();
+            let paren_close = after_fn[paren_open..].find(')').expect(
+                "unterminated parameter list — a param type contains a nested `(`, \
+                         which this simple scanner doesn't handle",
+            );
+            let params_raw = after_fn[paren_open + 1..paren_open + paren_close].to_string();
+
+            blocks.push(CommandBlock {
+                name,
+                has_snake_case_rename,
+                params_raw,
+            });
+
+            // Resume scanning strictly after this attribute — the next
+            // `#[tauri::command` occurrence (if any) is necessarily after
+            // it, so this can't re-match the same block or skip the next.
+            search_from = attr_end + 1;
+        }
+
+        blocks
+    }
+
+    /// Splits a raw parameter list on top-level commas only (never inside
+    /// `<...>` generic brackets, e.g. `State<'_, AppState>`'s internal
+    /// comma), then extracts each parameter's name (the identifier before
+    /// its `:`).
+    fn param_names(params_raw: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut depth = 0i32;
+        let mut current = String::new();
+
+        for ch in params_raw.chars() {
+            match ch {
+                '<' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                '>' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    names.push(std::mem::take(&mut current));
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            names.push(current);
+        }
+
+        names
+            .into_iter()
+            .filter_map(|param| param.split(':').next().map(|n| n.trim().to_string()))
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
+    /// A "multi-word" arg name per #239's contract: snake_case with at
+    /// least one underscore (e.g. `app_pattern`) — the class of name that
+    /// tauri-macros' default camelCase-on-the-wire rewriting actually
+    /// changes (`app_pattern` -> `appPattern`), unlike a single-word name
+    /// (`state`, `id`, `term`) which is identical either way.
+    fn is_multi_word_snake_case(name: &str) -> bool {
+        name.contains('_')
+    }
+
+    #[test]
+    fn parser_sanity_finds_every_known_command_including_the_pinned_snake_case_one() {
+        // A guard on the guard: if the scanner regresses to finding zero or
+        // too few blocks (e.g. a future edit changes the file's shape in a
+        // way the simple scanner can't follow), fail loudly here rather
+        // than the real assertion below silently vacuously passing over an
+        // empty list.
+        let blocks = parse_command_blocks(SRC);
+        assert!(
+            blocks.len() >= 15,
+            "expected to find every #[tauri::command] fn in this file; found only {} — the \
+             scanner may have regressed",
+            blocks.len()
+        );
+
+        let upsert = blocks
+            .iter()
+            .find(|b| b.name == "upsert_tone_rule")
+            .expect("parser did not find the known upsert_tone_rule command");
+        assert!(
+            upsert.has_snake_case_rename,
+            "upsert_tone_rule must keep its rename_all = \"snake_case\" attribute (issue #237)"
+        );
+        assert!(
+            param_names(&upsert.params_raw).contains(&"app_pattern".to_string()),
+            "parser did not find upsert_tone_rule's app_pattern argument"
+        );
+    }
+
+    #[test]
+    fn every_multiword_arg_command_carries_rename_all_snake_case_issue_239() {
+        let blocks = parse_command_blocks(SRC);
+
+        let offenders: Vec<String> = blocks
+            .iter()
+            .filter(|b| {
+                let has_multiword_arg = param_names(&b.params_raw)
+                    .iter()
+                    .any(|n| is_multi_word_snake_case(n));
+                has_multiword_arg && !b.has_snake_case_rename
+            })
+            .map(|b| b.name.clone())
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these #[tauri::command] fns take a multi-word snake_case argument but don't carry \
+             `rename_all = \"snake_case\"` — tauri-macros' default camelCase-on-the-wire naming \
+             will mismatch whatever the frontend actually sends (the #237 bug's class, issue \
+             #239): {offenders:?}"
+        );
+    }
+}
