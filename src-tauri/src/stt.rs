@@ -331,7 +331,10 @@ impl Stt for WhisperStt {
 /// model — `decoded` mirrors exactly what `Segment::to_str_lossy()`
 /// returns, minus whisper-rs's own error type, which this module has no
 /// reason to depend on outside the feature gate.
-fn accumulate_segment_text(text: &mut String, decoded: Result<std::borrow::Cow<'_, str>, ()>) -> bool {
+fn accumulate_segment_text(
+    text: &mut String,
+    decoded: Result<std::borrow::Cow<'_, str>, ()>,
+) -> bool {
     match decoded {
         Ok(s) => {
             let was_lossy = matches!(s, std::borrow::Cow::Owned(_));
@@ -458,8 +461,9 @@ mod tests {
     #[test]
     fn accumulate_segment_text_appends_lossily_decoded_text_instead_of_dropping_it_issue_71() {
         let mut text = String::new();
-        let decoded: Result<std::borrow::Cow<'_, str>, ()> =
-            Ok(std::borrow::Cow::Owned("recovered \u{FFFD}text".to_string()));
+        let decoded: Result<std::borrow::Cow<'_, str>, ()> = Ok(std::borrow::Cow::Owned(
+            "recovered \u{FFFD}text".to_string(),
+        ));
         let was_lossy = accumulate_segment_text(&mut text, decoded);
         assert!(
             was_lossy,
@@ -488,8 +492,7 @@ mod tests {
     #[test]
     fn accumulate_segment_text_does_not_flag_clean_utf8_segments() {
         let mut text = String::new();
-        let was_lossy =
-            accumulate_segment_text(&mut text, Ok(std::borrow::Cow::Borrowed("clean")));
+        let was_lossy = accumulate_segment_text(&mut text, Ok(std::borrow::Cow::Borrowed("clean")));
         assert!(!was_lossy);
         assert_eq!(text, "clean");
     }

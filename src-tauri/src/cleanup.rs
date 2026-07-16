@@ -938,7 +938,8 @@ mod tests {
         // (see ureq::stream::io_err_timeout) — both the old string-matching
         // code and the typed check agree here; kept as a realistic
         // regression anchor.
-        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out reading response");
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out reading response");
         let err: ureq::Error = io_err.into();
         assert_eq!(classify_ureq_error(err), TransportError::Timeout);
     }
@@ -954,7 +955,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_ureq_error_classifies_a_typed_timeout_correctly_even_without_the_word_timeout_in_the_message_issue_74() {
+    fn classify_ureq_error_classifies_a_typed_timeout_correctly_even_without_the_word_timeout_in_the_message_issue_74(
+    ) {
         // The finding's core complaint: string-matching on the rendered
         // message is fragile. A genuine io::ErrorKind::TimedOut whose
         // message text doesn't happen to contain "timed out"/"timeout" (a
@@ -967,7 +969,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_ureq_error_does_not_misclassify_a_non_timeout_error_that_merely_mentions_timeout_issue_74() {
+    fn classify_ureq_error_does_not_misclassify_a_non_timeout_error_that_merely_mentions_timeout_issue_74(
+    ) {
         // The inverse fragility: an error whose message happens to contain
         // the substring "timeout" (e.g. a config-validation message) but
         // whose actual io::ErrorKind is NOT TimedOut must not be
