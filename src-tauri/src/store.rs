@@ -21,6 +21,7 @@
 
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
+use std::time::Duration;
 
 /// One forward-only migration: the `user_version` it brings the schema to,
 /// and the SQL that gets it there. Idempotent by construction — the runner
@@ -84,6 +85,14 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> SqliteResult<Self> {
+        // Issue #162 (SNTL-20260713-bla-PR161-b26d368): set explicitly,
+        // before `migrate()`, so a transient lock on the real on-disk DB
+        // this connection is about to be wired to on the dictation hot path
+        // (second app instance — no single-instance guard exists; a
+        // crash-relaunch race; an OS indexer/backup read lock) makes the
+        // next write BLOCK AND RETRY for up to 5s instead of failing
+        // immediately with `SQLITE_BUSY` and dropping a history row.
+        conn.busy_timeout(Duration::from_secs(5))?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
