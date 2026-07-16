@@ -142,6 +142,27 @@ pub(crate) struct AppState {
     /// instead of hiding the pill out from under the second one's own still-
     /// live visible window.
     pill_visibility_epoch: AtomicU64,
+    /// Per-dictation generation id (issues #174/#175/#176): bumped once at
+    /// the start of every dictation (`react_to_transition`'s
+    /// `StartRecording` arm), BEFORE anything else runs. The value in effect
+    /// when `StopRecording` kicks off `run_pipeline_in_background` is
+    /// carried through to that background thread and every settle helper it
+    /// calls; each checks it's still `== dictation_generation.load()` (via
+    /// [`tray::should_apply_dictation_completion`] /
+    /// [`tray::should_hide_pill_for_settle`]) before any state write, event
+    /// emit, or settle spawn.
+    ///
+    /// **Why this exists:** the hotkeys `StateMachine` resets to
+    /// `Phase::Idle` synchronously on `StopRecording`, before the
+    /// transcription thread it kicked off has returned — so a second
+    /// dictation can already be recording/transcribing by the time the
+    /// first one's background completion runs. Without a per-dictation
+    /// identity, that stale completion reads/writes the single shared
+    /// `AppState.pipeline_state` slot, clobbering the live dictation's state
+    /// (dropping its waveform, showing wrong pill chrome, emitting a stray
+    /// event) for anywhere from an instant up to the completion's full
+    /// settle-visibility window. A stale generation means "no-op entirely."
+    dictation_generation: AtomicU64,
     /// PR #185 Sentinel 🔴-1: the generation of the latest outstanding
     /// hotkey-capture suspend (`commands::suspend_hotkey`), or `0` when the
     /// global dictation hotkey is not suspended. A monotonic token minted by
@@ -891,6 +912,13 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
     let state = app.state::<AppState>();
     match transition {
         Some(hotkeys::Transition::StartRecording) => {
+            // Issues #174/#175/#176: mint a new per-dictation generation id
+            // FIRST, before anything else in this arm — so any earlier
+            // dictation's still-in-flight background completion (see
+            // `run_pipeline_in_background`/`generation_is_live`) is
+            // immediately recognized as stale the moment this dictation
+            // begins, rather than only once ITS OWN state write lands.
+            state.dictation_generation.fetch_add(1, Ordering::SeqCst);
             // Drop any stale samples and any error recorded by a previous
             // session before starting a fresh capture window, so the
             // degraded-capture check on StopRecording reflects only THIS
@@ -951,8 +979,15 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             }
 
             let samples = state.buffer.lock().unwrap().drain();
+            // Issues #174/#175/#176: this dictation's identity for the
+            // background thread `run_pipeline_in_background` is about to
+            // spawn — the generation `StartRecording` minted for it (no
+            // other `StartRecording` can have run between this dictation's
+            // own Start and Stop, so this load reads back exactly that
+            // value).
+            let generation = state.dictation_generation.load(Ordering::SeqCst);
             set_pipeline_state(app, tray::PipelineState::Transcribing);
-            run_pipeline_in_background(app.clone(), samples);
+            run_pipeline_in_background(app.clone(), samples, generation);
         }
         Some(hotkeys::Transition::Cancelled) => {
             let session = state.capture.lock().unwrap().take();
@@ -1125,6 +1160,20 @@ fn bump_pill_visibility_epoch(state: &AppState) -> u64 {
     state.pill_visibility_epoch.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+/// Whether `generation` — a dictation's id, captured once at
+/// `StartRecording` and carried through `run_pipeline_in_background`/the
+/// settle helpers it calls — is still the live dictation generation
+/// (issues #174/#175/#176; see [`AppState::dictation_generation`] and
+/// [`tray::should_apply_dictation_completion`]). Every background-thread
+/// state write / event emit / settle spawn in this file is gated on this
+/// returning `true` immediately beforehand; `false` means a newer dictation
+/// has already started and the caller must no-op entirely.
+fn generation_is_live(app: &tauri::AppHandle, generation: u64) -> bool {
+    let state = app.state::<AppState>();
+    let current = state.dictation_generation.load(Ordering::SeqCst);
+    tray::should_apply_dictation_completion(generation, current)
+}
+
 /// Settles the pipeline to `Idle` while keeping the pill **visible** for
 /// `duration`, then hiding it once that window elapses — unless a newer
 /// overlapping settle or a new dictation says otherwise. Shared by both
@@ -1149,7 +1198,36 @@ fn bump_pill_visibility_epoch(state: &AppState) -> u64 {
 /// older settle's delayed hide could fire after the newer settle already
 /// re-applied `Idle`+visible, incorrectly hiding it). The window `hide()` is
 /// marshaled to the main thread like every other pill mutation.
-fn settle_idle_keeping_pill_visible(app: &tauri::AppHandle, duration: std::time::Duration) {
+///
+/// Issues #174/#175/#176: `generation` is this settle's dictation's id
+/// (threaded through from `run_pipeline_in_background`). Checked once up
+/// front — a newer dictation already superseding this one means even the
+/// immediate `apply_pipeline_state(Idle, true)` below must not run, let
+/// alone spawn a delayed-hide thread — and again when the delayed-hide
+/// thread wakes, alongside the epoch/state checks
+/// ([`tray::should_hide_pill_for_settle`]).
+///
+/// Issue #174: the delayed-hide thread locks `pipeline_state` FIRST, then
+/// loads the epoch/generation atomics — not the other way around. Loading
+/// the epoch before locking (the original, buggy order) left a window where
+/// a newer settle's full bump-epoch-then-apply-Idle sequence could
+/// interleave strictly between the epoch load and the lock acquisition, so
+/// the reader would see a stale-but-matching epoch alongside the newer
+/// settle's fresh `Idle` state — wrongly hiding the pill out from under it.
+/// Locking first gives the epoch/generation loads a real happens-before edge
+/// via the mutex acquire/release back to any writer whose state write this
+/// thread just observed (a settle's epoch bump always precedes its own
+/// state write in program order, and a `StartRecording`'s generation bump
+/// always precedes ITS state write too), closing the race independent of
+/// the atomics' own ordering.
+fn settle_idle_keeping_pill_visible(
+    app: &tauri::AppHandle,
+    duration: std::time::Duration,
+    generation: u64,
+) {
+    if !generation_is_live(app, generation) {
+        return;
+    }
     let epoch = {
         let state = app.state::<AppState>();
         bump_pill_visibility_epoch(&state)
@@ -1160,9 +1238,17 @@ fn settle_idle_keeping_pill_visible(app: &tauri::AppHandle, duration: std::time:
     std::thread::spawn(move || {
         std::thread::sleep(duration);
         let state = app.state::<AppState>();
-        let current_epoch = state.pill_visibility_epoch.load(Ordering::SeqCst);
+        // #174: lock pipeline_state FIRST — see this function's doc comment.
         let current_state = *state.pipeline_state.lock().unwrap();
-        if tray::should_hide_pill_for_settle(epoch, current_epoch, &current_state) {
+        let current_epoch = state.pill_visibility_epoch.load(Ordering::SeqCst);
+        let current_generation = state.dictation_generation.load(Ordering::SeqCst);
+        if tray::should_hide_pill_for_settle(
+            epoch,
+            current_epoch,
+            generation,
+            current_generation,
+            &current_state,
+        ) {
             let pill_window = app.get_webview_window(PILL_WINDOW_LABEL);
             let _ = app.run_on_main_thread(move || {
                 if let Some(window) = pill_window {
@@ -1175,8 +1261,8 @@ fn settle_idle_keeping_pill_visible(app: &tauri::AppHandle, duration: std::time:
 
 /// Settles the pipeline to `Idle` for the AC-4 informational-notice path
 /// (Sentinel 🔴-2 on PR #135) — see [`settle_idle_keeping_pill_visible`].
-fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
-    settle_idle_keeping_pill_visible(app, PILL_NOTICE_DURATION);
+fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle, generation: u64) {
+    settle_idle_keeping_pill_visible(app, PILL_NOTICE_DURATION, generation);
 }
 
 /// Settles the pipeline to `Idle` for a completed-dictation "done"
@@ -1190,12 +1276,24 @@ fn settle_idle_keeping_pill_for_notice(app: &tauri::AppHandle) {
 /// (the non-fallback success arm of `run_pipeline_in_background`), falling
 /// back to the plain settle otherwise so an unrelated transition never grows
 /// a spurious "done" pill.
-fn settle_idle_keeping_pill_for_done(app: &tauri::AppHandle, previous: tray::PipelineState) {
+fn settle_idle_keeping_pill_for_done(
+    app: &tauri::AppHandle,
+    previous: tray::PipelineState,
+    generation: u64,
+) {
+    // Issues #174/#175/#176: defense in depth — `run_pipeline_in_background`
+    // already checks `generation_is_live` before calling this, but the plain
+    // (non-visible-settle) `Idle` write below is itself a pipeline-state
+    // write, so it gets the same gate rather than relying solely on the
+    // caller.
+    if !generation_is_live(app, generation) {
+        return;
+    }
     if !tray::should_keep_pill_visible_for_done(&previous) {
         set_pipeline_state(app, tray::PipelineState::Idle);
         return;
     }
-    settle_idle_keeping_pill_visible(app, DONE_PILL_DURATION);
+    settle_idle_keeping_pill_visible(app, DONE_PILL_DURATION, generation);
 }
 
 /// Dispatches a click on one of the tray menu's items (issue #110), by the
@@ -1439,7 +1537,7 @@ fn spawn_stt_cache_warm(
 /// `OllamaCleanup` with `Pipeline`'s built-in `RegexCleanup` fallback
 /// (AC-4); output is routed per the live output-mode switch, itself seeded
 /// from `Settings` (AC-14).
-fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
+fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generation: u64) {
     std::thread::spawn(move || {
         let (settings, route_target) = {
             let state = app.state::<AppState>();
@@ -1506,6 +1604,19 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                 );
                 match pipeline.run(&samples, &opts) {
                     Ok(outcome) => {
+                        // Issues #174/#175/#176: this completion belongs to
+                        // `generation` — check it's still the live dictation
+                        // BEFORE touching any shared state (including
+                        // reading `pipeline_state` for `previous` below,
+                        // which would otherwise read a NEWER dictation's
+                        // live value under this stale dictation's name). A
+                        // stale generation means a newer dictation already
+                        // started while this one was transcribing; no-op
+                        // entirely — no event emit, no state write, no
+                        // settle spawn.
+                        if !generation_is_live(&app, generation) {
+                            return;
+                        }
                         // Issue #126 (M2 PR 2.4), AC-4/ADR-0005: the Ollama
                         // fallback is informational, not a failure — the
                         // dictation already completed and pasted/wrote
@@ -1519,7 +1630,7 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                             // pill visible for the toast's lifetime, then
                             // settle to hidden/Idle (unless a new dictation
                             // preempts).
-                            settle_idle_keeping_pill_for_notice(&app);
+                            settle_idle_keeping_pill_for_notice(&app, generation);
                         } else {
                             // Issue #151: a plain Idle transition hid the
                             // pill in the same call that entered the
@@ -1531,11 +1642,19 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                             // via the pure `should_keep_pill_visible_for_done`
                             // that this really is a completed-dictation
                             // transition before keeping the pill visible.
+                            // Safe to read here (rather than stale) because
+                            // of the generation check just above.
                             let previous = *app.state::<AppState>().pipeline_state.lock().unwrap();
-                            settle_idle_keeping_pill_for_done(&app, previous);
+                            settle_idle_keeping_pill_for_done(&app, previous, generation);
                         }
                     }
                     Err(err) => {
+                        // Issues #174/#175/#176: same gate as the Ok arm —
+                        // a stale pipeline failure from a superseded
+                        // dictation must not clobber the live one's state.
+                        if !generation_is_live(&app, generation) {
+                            return;
+                        }
                         eprintln!("bla: pipeline run failed: {err}");
                         emit_pipeline_error(&app, &errors::error_kind_for_pipeline_error(&err));
                         set_pipeline_state(&app, tray::PipelineState::Error);
@@ -1543,6 +1662,12 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
                 }
             }
             Err(msg) => {
+                // Issues #174/#175/#176: same gate — a superseded
+                // dictation's STT-build failure must not clobber the live
+                // one's state either.
+                if !generation_is_live(&app, generation) {
+                    return;
+                }
                 eprintln!("bla: {msg}");
                 emit_pipeline_error(&app, &errors::error_kind_for_build_stt_failure(&msg));
                 set_pipeline_state(&app, tray::PipelineState::Error);
@@ -1731,6 +1856,7 @@ pub fn run() {
                 tray_state_item: Mutex::new(Some(tray_state_item)),
                 tray_output_toggle_item: Mutex::new(Some(tray_toggle_item)),
                 pill_visibility_epoch: AtomicU64::new(0),
+                dictation_generation: AtomicU64::new(0),
                 hotkey_suspend_gen: Mutex::new(0),
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
