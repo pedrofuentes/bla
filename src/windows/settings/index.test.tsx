@@ -22,6 +22,7 @@ const BASE_SETTINGS: Settings = {
   file_path_template: "{{date:YYYY-MM-DD}}.md",
   launch_at_login: false,
   sound_cues: true,
+  retention_days: 0,
 };
 
 let mounted: Mounted | undefined;
@@ -39,6 +40,15 @@ beforeEach(() => {
       case "validate_hotkey":
         return Promise.resolve(undefined);
       case "set_settings":
+        return Promise.resolve(undefined);
+      // Issue #199: the History tab (mounted once its tab is clicked)
+      // searches on mount — mocked here so switching to it in these
+      // tab-bar tests doesn't reject through an unmocked command.
+      case "search_history":
+        return Promise.resolve([]);
+      case "copy_history_entry":
+      case "delete_history_entry":
+      case "clear_history":
         return Promise.resolve(undefined);
       default:
         return Promise.reject(new Error(`unmocked command ${command}`));
@@ -66,13 +76,25 @@ describe("SettingsWindow tab bar", () => {
     mounted = mount(<SettingsWindow />);
     await flush();
 
-    click(mounted.container.querySelector('[data-testid="tab-history"]')!);
+    click(mounted.container.querySelector('[data-testid="tab-dictionary"]')!);
     await flush();
 
     expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
     const placeholder = mounted.container.querySelector('[data-testid="placeholder-panel"]');
     expect(placeholder).not.toBeNull();
-    expect(placeholder?.textContent).toMatch(/history/i);
+    expect(placeholder?.textContent).toMatch(/dictionary/i);
+  });
+
+  it("switches to the real History panel when the History tab is clicked (issue #199)", async () => {
+    mounted = mount(<SettingsWindow />);
+    await flush();
+
+    click(mounted.container.querySelector('[data-testid="tab-history"]')!);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="placeholder-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="history-panel"]')).not.toBeNull();
   });
 
   it("switches back to the General panel", async () => {
