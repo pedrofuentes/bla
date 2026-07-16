@@ -276,9 +276,75 @@ mod tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn opening_an_in_memory_store_runs_migration_1_and_sets_user_version_to_1() {
+    fn opening_an_in_memory_store_runs_every_migration_and_sets_user_version_to_the_latest() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #163 (SNTL-20260713-bla-PR161-b26d368): the migration-idempotence
+    // test gap. Migration 1's SQL (`CREATE TABLE/INDEX IF NOT EXISTS`) is
+    // naturally idempotent, so re-running it was never observable —
+    // "reopening is idempotent" passed even with the
+    // `if *version <= current { continue; }` guard deleted, giving that
+    // guard zero discriminating coverage. `schema_migrations` is a ledger
+    // of exactly which versions have been applied, with `version` as a
+    // PRIMARY KEY: `INSERT INTO schema_migrations` is NOT idempotent, so a
+    // broken guard now surfaces as a hard `Store::open` error (a PRIMARY KEY
+    // violation) the very next time a DB is reopened, rather than silently
+    // re-running migration SQL with no visible effect.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn fresh_db_migration_ledger_records_every_migration_exactly_once_issue_163() {
+        let store = Store::open_in_memory().expect("open_in_memory should succeed");
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn reopening_a_store_twice_does_not_reapply_migrations_issue_163() {
+        // The discriminating case: if the version guard were ever silently
+        // broken, this SECOND open would attempt to re-run migration 1 and
+        // 2's SQL, including a second `INSERT INTO schema_migrations`,
+        // which would violate that table's PRIMARY KEY on `version` and
+        // turn this `.expect` into a panic — a failure visible right here,
+        // not just in a hypothetical future production reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+
+        {
+            Store::open(&path).expect("first open should succeed");
+        }
+        let store = Store::open(&path)
+            .expect("second open must not reapply migrations (would violate schema_migrations' PRIMARY KEY if the guard were broken)");
+
+        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn upgrading_a_pre_existing_v1_db_applies_only_migration_2_issue_163() {
+        // Simulates a real-world upgrade: a DB created by code that only
+        // knew about migration 1 (no `schema_migrations` ledger existed
+        // yet) is then opened by the current code. Migration 1 must NOT be
+        // re-applied (and isn't retroactively recorded in the ledger —
+        // only migrations that actually ran through this runner are); only
+        // migration 2 (dictionary) should apply.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0].1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        }
+
+        let store = Store::open(&path).expect("upgrade open should succeed");
+        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![2]);
+
+        // Migration 2's table is now actually usable.
+        let id = store.add_term("Kubernetes", 1_000).unwrap();
+        assert!(id > 0);
     }
 
     // -------------------------------------------------------------
@@ -319,14 +385,14 @@ mod tests {
 
         {
             let store = Store::open(&path).expect("first open should succeed");
-            assert_eq!(store.schema_version().unwrap(), 1);
+            assert_eq!(store.schema_version().unwrap(), 2);
         }
 
         // Re-opening an already-migrated DB must not error and must leave
         // user_version untouched — the migration runner is forward-only and
         // idempotent.
         let store = Store::open(&path).expect("second open should succeed");
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     // -------------------------------------------------------------
@@ -536,6 +602,109 @@ mod tests {
     // -------------------------------------------------------------
     // retention_cutoff_ms (pure)
     // -------------------------------------------------------------
+
+    // -------------------------------------------------------------
+    // Personal dictionary CRUD (issue #200, PRD AC-21, AC-37)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn add_term_then_list_terms_round_trips_the_term() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.add_term("Kubernetes", 1_000).unwrap();
+        assert!(id > 0);
+
+        let terms = store.list_terms().unwrap();
+        assert_eq!(
+            terms,
+            vec![DictionaryTerm {
+                id,
+                term: "Kubernetes".to_string(),
+                created_at_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn adding_a_term_twice_with_different_casing_is_a_case_insensitive_no_op_issue_160() {
+        // #160's schema note: `dictionary(term UNIQUE NOCASE)`. Adding
+        // "Kubernetes" then "kubernetes" must be a no-op/conflict, not two
+        // rows — the first-inserted casing and timestamp win.
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store.add_term("Kubernetes", 1_000).unwrap();
+        let second_id = store.add_term("kubernetes", 2_000).unwrap();
+
+        assert_eq!(
+            first_id, second_id,
+            "both calls must resolve to the same row"
+        );
+
+        let terms = store.list_terms().unwrap();
+        assert_eq!(
+            terms.len(),
+            1,
+            "a case-insensitive duplicate must not add a second row"
+        );
+        assert_eq!(
+            terms[0].term, "Kubernetes",
+            "the first-inserted casing must win"
+        );
+        assert_eq!(
+            terms[0].created_at_ms, 1_000,
+            "the first-inserted timestamp must win"
+        );
+    }
+
+    #[test]
+    fn distinct_terms_are_not_treated_as_duplicates() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_term("Kubernetes", 1_000).unwrap();
+        store.add_term("kubectl", 2_000).unwrap();
+
+        assert_eq!(store.list_terms().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_terms_orders_most_recently_added_first() {
+        // Issue #70's chosen tie-break policy (documented on
+        // `Store::list_terms`): when `build_initial_prompt`'s length cap
+        // means not every dictionary term fits Whisper's prompt budget,
+        // the most-recently-added terms should be the ones tried first.
+        let store = Store::open_in_memory().unwrap();
+        store.add_term("oldest", 1_000).unwrap();
+        store.add_term("middle", 2_000).unwrap();
+        store.add_term("newest", 3_000).unwrap();
+
+        let terms: Vec<String> = store
+            .list_terms()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert_eq!(terms, vec!["newest", "middle", "oldest"]);
+    }
+
+    #[test]
+    fn remove_term_removes_only_the_targeted_row() {
+        let store = Store::open_in_memory().unwrap();
+        let keep = store.add_term("keep", 1_000).unwrap();
+        let drop = store.add_term("drop", 2_000).unwrap();
+
+        store.remove_term(drop).unwrap();
+
+        let terms = store.list_terms().unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].id, keep);
+    }
+
+    #[test]
+    fn remove_term_on_a_nonexistent_id_is_a_noop() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_term("keep", 1_000).unwrap();
+
+        store.remove_term(999_999).unwrap();
+
+        assert_eq!(store.list_terms().unwrap().len(), 1);
+    }
 
     #[test]
     fn retention_cutoff_ms_of_zero_days_means_keep_forever() {
