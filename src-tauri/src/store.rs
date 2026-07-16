@@ -397,12 +397,47 @@ fn escape_like(input: &str) -> String {
 /// `retention_days == 0` means "keep forever" — `None`, not a cutoff of
 /// `now_ms`, so callers must treat `None` as "don't prune" rather than
 /// accidentally pruning everything.
-pub fn retention_cutoff_ms(now_ms: i64, retention_days: u32) -> Option<i64> {
+///
+/// `newest_row_ms` — [`Store::newest_history_timestamp`]'s result — is a
+/// clock-skew guard (issue #219, SNTL-20260715-bla-PR218-cc04f8b): a
+/// backward clock jump (or bad system time) can otherwise compute a cutoff
+/// in the apparent future relative to every row that actually exists, and
+/// `prune_history` would then delete all of history. Passing `None` (no
+/// rows to check against, or a caller that hasn't been updated) disables
+/// the guard and reproduces the pre-#219 behavior exactly — pruning an
+/// empty table deletes nothing regardless, so this is never unsafe. Given
+/// `Some(newest)`, two clamp/skip rules apply, in order:
+///
+/// 1. If `now_ms` is itself before `newest` — proof the clock has skewed
+///    backward relative to data that was already recorded (a row can only
+///    ever be inserted at `now_ms` at the time) — pruning is skipped
+///    entirely (`None`): `now` can no longer be trusted to compute *any*
+///    safe cutoff.
+/// 2. Otherwise, the raw cutoff is clamped so it never exceeds `newest` —
+///    guaranteeing the single most-recently-recorded row can never be
+///    pruned by a miscalculated cutoff, however large `now_ms` or
+///    `retention_days` turn out to be.
+pub fn retention_cutoff_ms(
+    now_ms: i64,
+    retention_days: u32,
+    newest_row_ms: Option<i64>,
+) -> Option<i64> {
     if retention_days == 0 {
         return None;
     }
     let retention_ms = i64::from(retention_days) * 24 * 60 * 60 * 1000;
-    Some(now_ms - retention_ms)
+    let raw_cutoff = now_ms - retention_ms;
+
+    if let Some(newest) = newest_row_ms {
+        if now_ms < newest {
+            return None;
+        }
+        if raw_cutoff > newest {
+            return Some(newest);
+        }
+    }
+
+    Some(raw_cutoff)
 }
 
 #[cfg(test)]

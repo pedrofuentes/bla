@@ -449,7 +449,12 @@ fn prune_history_for_retention(
     now_ms: i64,
     retention_days: u32,
 ) -> rusqlite::Result<usize> {
-    match store::retention_cutoff_ms(now_ms, retention_days) {
+    // Issue #219: the newest recorded row's timestamp feeds
+    // `retention_cutoff_ms`'s clock-skew guard (clamp/skip semantics) so a
+    // backwards clock jump can't compute a cutoff that mass-deletes
+    // history.
+    let newest_row_ms = store.newest_history_timestamp()?;
+    match store::retention_cutoff_ms(now_ms, retention_days, newest_row_ms) {
         Some(cutoff_ms) => store.prune_history(cutoff_ms),
         None => Ok(0),
     }
