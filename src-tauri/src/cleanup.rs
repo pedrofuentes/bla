@@ -943,6 +943,13 @@ mod ollama_tests {
         // field must be the raw input. A substring check would still pass
         // if the two were swapped (prompt: PROMPT, system: raw), which is a
         // real request-construction regression — this test must catch it.
+        //
+        // Issue #200: `OllamaCleanup` now sends `CLEANUP_PROMPT_V2`
+        // (rendered via `render_cleanup_prompt_v2`, empty dictionary here
+        // since `cleanup_with` doesn't attach one) as its system prompt —
+        // `CLEANUP_PROMPT_V2` supersedes `CLEANUP_PROMPT_V1` as the live
+        // prompt sent upstream, per the "add a new file, don't edit the old
+        // one" convention (see `CLEANUP_PROMPT_V2`'s doc comment).
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub);
         cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
@@ -952,7 +959,8 @@ mod ollama_tests {
             serde_json::from_str(&body).expect("request body must be valid JSON");
 
         assert_eq!(
-            parsed["system"], CLEANUP_PROMPT_V1,
+            parsed["system"],
+            render_cleanup_prompt_v2(&[]),
             "the `system` field must carry the rewrite-only prompt, not the transcript"
         );
         assert_eq!(
@@ -1136,5 +1144,49 @@ mod ollama_tests {
         for must_contain in ["never answer", "never add"] {
             assert!(lower.contains(must_contain));
         }
+    }
+
+    // -------------------------------------------------------------
+    // Issue #200 (PRD AC-21): OllamaCleanup::with_dictionary wiring —
+    // dictionary terms attached at construction reach the request actually
+    // sent to Ollama.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn with_dictionary_makes_the_request_carry_the_rendered_v2_prompt_for_those_terms() {
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub).with_dictionary(dictionary.clone());
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+
+        assert_eq!(
+            parsed["system"],
+            render_cleanup_prompt_v2(&dictionary),
+            "the system prompt must carry the attached dictionary's terms"
+        );
+        assert_ne!(
+            parsed["system"],
+            render_cleanup_prompt_v2(&[]),
+            "a non-empty dictionary must change the rendered prompt"
+        );
+    }
+
+    #[test]
+    fn without_with_dictionary_the_request_uses_an_empty_dictionary_rendering() {
+        // A call site that never attaches a dictionary (e.g. not yet
+        // updated) keeps working exactly as before #200 wired dictionary
+        // terms in: an empty-dictionary rendering of CLEANUP_PROMPT_V2.
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub);
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+        assert_eq!(parsed["system"], render_cleanup_prompt_v2(&[]));
     }
 }
