@@ -816,6 +816,46 @@ mod tests {
         assert_eq!(err, PathConfinementError::EscapesBaseDir);
     }
 
+    // -----------------------------------------------------------------
+    // Issue #180: the settings-window picker's "base folder / vault" field
+    // persists as `settings::Settings::file_base_dir`; `resolve_base_dir` is
+    // the pure decision `lib.rs::run_pipeline_in_background` (OS-integration
+    // glue, not unit-testable directly) delegates to when building
+    // `OutputMode::File`'s `base_dir` — previously hard-coded to
+    // `app_data_dir` with no way for the user to change it.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_base_dir_falls_back_to_app_data_dir_when_unset() {
+        let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
+        assert_eq!(resolve_base_dir("", app_data_dir), app_data_dir.to_path_buf());
+    }
+
+    #[test]
+    fn resolve_base_dir_falls_back_to_app_data_dir_when_blank() {
+        let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
+        assert_eq!(
+            resolve_base_dir("   ", app_data_dir),
+            app_data_dir.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn resolve_base_dir_uses_the_configured_vault_path_verbatim_when_set() {
+        let app_data_dir = Path::new("/Users/cofounder/Library/Application Support/bla");
+        let vault = "/Users/cofounder/Obsidian/Vault";
+        assert_eq!(resolve_base_dir(vault, app_data_dir), PathBuf::from(vault));
+    }
+
+    #[test]
+    fn resolve_base_dir_trims_surrounding_whitespace_off_a_configured_path() {
+        let app_data_dir = Path::new("/app-data");
+        assert_eq!(
+            resolve_base_dir("  /Users/cofounder/Obsidian/Vault  ", app_data_dir),
+            PathBuf::from("/Users/cofounder/Obsidian/Vault")
+        );
+    }
+
     #[test]
     fn confine_rejects_traversal_that_dips_below_base_even_if_it_would_return() {
         let base = PathBuf::from("/vault");
