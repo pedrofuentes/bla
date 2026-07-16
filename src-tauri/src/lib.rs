@@ -1455,8 +1455,13 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>) {
 
         let output_mode = match route_target {
             tray::OutputMode::CursorPaste => output::OutputMode::CursorPaste,
+            // Issue #180: `file_base_dir` is the settings-window picker's
+            // "base folder / vault" preference — `resolve_base_dir` (pure,
+            // unit-tested in output.rs) falls back to `app_data_dir` when
+            // it's unset, so a user who never opens the picker keeps the
+            // previous hard-coded behavior unchanged.
             tray::OutputMode::File => output::OutputMode::File {
-                base_dir: app_data_dir.clone(),
+                base_dir: output::resolve_base_dir(&settings.file_base_dir, &app_data_dir),
                 config: output::FileConfig {
                     path_template: settings.file_path_template.clone(),
                     timestamp_prefix_template: Some("{{time:HH:mm}} ".to_string()),
