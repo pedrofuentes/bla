@@ -78,6 +78,12 @@ pub mod models;
 pub mod output;
 pub mod pipeline;
 pub mod settings;
+// Private, mirroring `mod context;` above: pure trigger-matching logic
+// (issue #260) with no external caller yet — #263 wires it into the
+// pipeline/commands layer from inside this crate. Not `pub` because
+// nothing outside the crate needs `match_snippet` yet, same reasoning as
+// `context`'s own `resolve_tone_for_app`/`app_pattern_matches`.
+mod snippets;
 pub mod store;
 pub mod stt;
 pub mod tray;
