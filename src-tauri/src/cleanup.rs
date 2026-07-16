@@ -1018,4 +1018,86 @@ mod ollama_tests {
             );
         }
     }
+
+    // -------------------------------------------------------------
+    // Issue #200 (PRD AC-21, AC-36): CLEANUP_PROMPT_V2 — a new, versioned,
+    // rewrite-only prompt file carrying a {{DICTIONARY}} placeholder,
+    // substituted with the current dictionary terms at call time.
+    // CLEANUP_PROMPT_V1 stays untouched (MISSION §7: a prompt bump adds a
+    // new file, never edits the old one in place).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cleanup_prompt_v2_is_a_distinct_file_from_v1() {
+        assert_ne!(
+            CLEANUP_PROMPT_V2, CLEANUP_PROMPT_V1,
+            "cleanup_v2.txt must be its own file, not a copy-paste of cleanup_v1.txt"
+        );
+    }
+
+    #[test]
+    fn ac36_prompt_file_contains_the_rewrite_only_constraints() {
+        // Mirrors ac10_prompt_file_contains_the_rewrite_only_constraints
+        // above for CLEANUP_PROMPT_V2 — AC-36(b): cleanup_v2 must satisfy
+        // every rewrite-only constraint v1 does.
+        let prompt = CLEANUP_PROMPT_V2.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "filler",
+            "self-correction",
+            "punctuation",
+            "bullet",
+            "tone",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "cleanup_v2 prompt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_prompt_v2_contains_the_dictionary_placeholder() {
+        assert!(CLEANUP_PROMPT_V2.contains("{{DICTIONARY}}"));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v2_substitutes_the_placeholder_with_comma_joined_terms() {
+        // AC-36(a): comma-joined, consistent with build_initial_prompt's
+        // escaping rules — reused directly rather than reimplemented.
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let rendered = render_cleanup_prompt_v2(&dictionary);
+
+        assert!(
+            !rendered.contains("{{DICTIONARY}}"),
+            "the placeholder must be substituted, not left in the rendered prompt"
+        );
+        assert!(rendered.contains(&crate::stt::build_initial_prompt(&dictionary)));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v2_reuses_build_initial_prompts_escaping_rules() {
+        // A term containing a comma must be escaped the exact same way in
+        // both rendering paths, so the two can't silently drift apart.
+        let dictionary = vec!["Acme, Inc.".to_string()];
+        let rendered = render_cleanup_prompt_v2(&dictionary);
+        assert!(rendered.contains("Acme\\, Inc."));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v2_is_clean_when_the_dictionary_is_empty() {
+        // AC-36(a): "cleanly removed/empty when the dictionary is empty" —
+        // no leftover placeholder syntax and no rewrite-only constraint
+        // lost in the process.
+        let rendered = render_cleanup_prompt_v2(&[]);
+        assert!(!rendered.contains("{{DICTIONARY}}"));
+        assert!(!rendered.contains("{{"));
+        assert!(!rendered.contains("}}"));
+
+        let lower = rendered.to_lowercase();
+        for must_contain in ["never answer", "never add"] {
+            assert!(lower.contains(must_contain));
+        }
+    }
 }
