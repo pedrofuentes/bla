@@ -1013,6 +1013,212 @@ mod history_wiring_tests {
     }
 }
 
+/// AC-35 (PRD AC-21, issue #200): dictionary terms actually flow from the
+/// `Store` into the pipeline's `Stt::transcribe` call — the first thing to
+/// populate `TranscribeOpts.dictionary`/`OllamaCleanup`'s dictionary, both
+/// of which existed as an empty seam before this PR. Real whisper-gated
+/// recognition-accuracy coverage (does adding a term actually change what a
+/// real model transcribes) is `#[ignore]`d in `stt.rs` per that module's
+/// existing pattern (no model file in CI); this module proves the plumbing
+/// itself — never `#[ignore]`d — using `Store::open_in_memory()` and a spy
+/// `Stt` double, never a constructed `AppState` (Windows-CI hard rule).
+#[cfg(test)]
+mod dictionary_wiring_tests {
+    use super::*;
+    use crate::output::{Clipboard, PasteSynthesizer};
+    use std::cell::RefCell;
+    use std::io;
+    use std::time::Duration;
+
+    /// No-op `Clipboard`/`PasteSynthesizer` — these tests only drive the
+    /// file output target, so neither is ever actually exercised, but
+    /// `Pipeline` needs concrete types to construct (mirrors
+    /// `tests/acceptance.rs`'s `NoopClipboard`/`NoopPaste`).
+    struct NoopClipboard;
+    impl Clipboard for NoopClipboard {
+        fn get(&self) -> io::Result<String> {
+            Ok(String::new())
+        }
+        fn set(&self, _contents: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    struct NoopPaste;
+    impl PasteSynthesizer for NoopPaste {
+        fn synthesize_paste(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Spy `Stt`: records the `TranscribeOpts` it was actually called with
+    /// and returns a canned transcript. Unlike `stt::FakeStt` (which
+    /// ignores `opts` entirely and so can't discriminate "dictionary
+    /// attached" from "not"), this lets a test assert on exactly what
+    /// reached the transcription call.
+    struct SpyStt {
+        captured: RefCell<Option<stt::TranscribeOpts>>,
+    }
+    impl SpyStt {
+        fn new() -> Self {
+            Self {
+                captured: RefCell::new(None),
+            }
+        }
+    }
+    impl stt::Stt for SpyStt {
+        fn transcribe(
+            &self,
+            _samples: &[f32],
+            opts: &stt::TranscribeOpts,
+        ) -> Result<String, stt::SttError> {
+            *self.captured.borrow_mut() = Some(opts.clone());
+            Ok("canned transcript".to_string())
+        }
+    }
+
+    /// Mirrors `stt.rs`'s own `impl Stt for Arc<WhisperStt>` (issue #115):
+    /// lets a shared, `Rc`-wrapped `SpyStt` satisfy `Pipeline`'s `S: Stt`
+    /// bound while the test keeps its own handle to inspect `captured`
+    /// after `Pipeline::run` returns (a plain owned `SpyStt` would be moved
+    /// into the pipeline and become unreachable afterward).
+    impl stt::Stt for std::rc::Rc<SpyStt> {
+        fn transcribe(
+            &self,
+            samples: &[f32],
+            opts: &stt::TranscribeOpts,
+        ) -> Result<String, stt::SttError> {
+            self.as_ref().transcribe(samples, opts)
+        }
+    }
+
+    fn fixed_clock() -> output::Clock {
+        output::Clock {
+            year: 2026,
+            month: 7,
+            day: 15,
+            hour: 9,
+            minute: 0,
+        }
+    }
+
+    fn file_output_mode(dir: &tempfile::TempDir) -> output::OutputMode {
+        output::OutputMode::File {
+            base_dir: dir.path().to_path_buf(),
+            config: output::FileConfig {
+                path_template: "dictation.md".to_string(),
+                timestamp_prefix_template: None,
+            },
+        }
+    }
+
+    #[test]
+    fn dictionary_terms_for_pipeline_reads_store_terms_newest_first_ac35() {
+        let store = store::Store::open_in_memory().unwrap();
+        store.add_term("oldest", 1_000).unwrap();
+        store.add_term("newest", 2_000).unwrap();
+
+        let terms = dictionary_terms_for_pipeline(&store).unwrap();
+        assert_eq!(terms, vec!["newest".to_string(), "oldest".to_string()]);
+    }
+
+    #[test]
+    fn dictionary_terms_for_pipeline_is_empty_when_the_dictionary_is_empty_ac35() {
+        let store = store::Store::open_in_memory().unwrap();
+        assert_eq!(
+            dictionary_terms_for_pipeline(&store).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_dictionary_term_reaches_stts_transcribe_call_through_transcribe_opts_ac35() {
+        // The core AC-35 plumbing assertion, never #[ignore]d: a term added
+        // to the Store shows up in the TranscribeOpts the pipeline actually
+        // hands to Stt::transcribe.
+        let store = store::Store::open_in_memory().unwrap();
+        store.add_term("Kubernetes", 1_000).unwrap();
+        let dictionary = dictionary_terms_for_pipeline(&store).unwrap();
+
+        let spy = std::rc::Rc::new(SpyStt::new());
+        let dir = tempfile::tempdir().unwrap();
+        let opts = pipeline::PipelineOpts {
+            transcribe: stt::TranscribeOpts {
+                dictionary: dictionary.clone(),
+            },
+            tone: cleanup::Tone::Neutral,
+            output_mode: file_output_mode(&dir),
+            clock: fixed_clock(),
+            restore_delay: Duration::from_millis(0),
+        };
+        let pipeline = pipeline::Pipeline::new(
+            std::rc::Rc::clone(&spy),
+            cleanup::RegexCleanup,
+            NoopClipboard,
+            NoopPaste,
+            |_: Duration| {},
+        );
+
+        pipeline.run(&[0.0_f32; 16_000], &opts).unwrap();
+
+        let captured = spy
+            .captured
+            .borrow()
+            .clone()
+            .expect("Stt::transcribe must have been called");
+        assert_eq!(captured.dictionary, dictionary);
+        assert!(captured.initial_prompt().contains("Kubernetes"));
+    }
+
+    #[test]
+    fn pipeline_output_differs_between_no_dictionary_and_a_populated_dictionary_ac35() {
+        // AC-35: "comparing pipeline output with and without dictionary
+        // injection on the same fixture". FakeStt/SpyStt return a fixed
+        // canned transcript regardless of opts (a real model is what
+        // actually changes recognition — see stt.rs's #[ignore]d
+        // whisper-gated test for that), so "pipeline output" here is the
+        // rendered `initial_prompt` the transcription call receives, which
+        // is the one thing this pure/injected pipeline CAN observe
+        // changing as a direct, non-ignored proof the seam is wired.
+        let store = store::Store::open_in_memory().unwrap();
+
+        let empty_dictionary = dictionary_terms_for_pipeline(&store).unwrap();
+        store.add_term("Kubernetes", 1_000).unwrap();
+        let populated_dictionary = dictionary_terms_for_pipeline(&store).unwrap();
+
+        let run_with = |dictionary: Vec<String>| -> String {
+            let spy = std::rc::Rc::new(SpyStt::new());
+            let dir = tempfile::tempdir().unwrap();
+            let opts = pipeline::PipelineOpts {
+                transcribe: stt::TranscribeOpts { dictionary },
+                tone: cleanup::Tone::Neutral,
+                output_mode: file_output_mode(&dir),
+                clock: fixed_clock(),
+                restore_delay: Duration::from_millis(0),
+            };
+            let pipeline = pipeline::Pipeline::new(
+                std::rc::Rc::clone(&spy),
+                cleanup::RegexCleanup,
+                NoopClipboard,
+                NoopPaste,
+                |_: Duration| {},
+            );
+            pipeline.run(&[0.0_f32; 16_000], &opts).unwrap();
+            spy.captured
+                .borrow()
+                .clone()
+                .expect("Stt::transcribe must have been called")
+                .initial_prompt()
+        };
+
+        let without_dictionary = run_with(empty_dictionary);
+        let with_dictionary = run_with(populated_dictionary);
+
+        assert_eq!(without_dictionary, "");
+        assert_eq!(with_dictionary, "Kubernetes");
+        assert_ne!(without_dictionary, with_dictionary);
+    }
+}
+
 /// Loads persisted settings from the `tauri-plugin-store`-backed
 /// `settings.json`, translating a missing store/key to
 /// [`settings::SettingsLoadError::NotFound`] and a present-but-unparsable
