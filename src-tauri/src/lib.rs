@@ -179,6 +179,13 @@ pub(crate) struct AppState {
     /// builds; the default build has no `WhisperStt` to cache.
     #[cfg(feature = "whisper")]
     stt_cache: Mutex<Option<CachedStt>>,
+    /// Issue #198 (M3 PR 3.2): the headless SQLite history store (`store.rs`,
+    /// kickoff #160/#161), opened once at startup against the OS app-data
+    /// dir. `Mutex`-wrapped for the same reason every other shared field
+    /// here is: `rusqlite::Connection` is `!Sync`, and both Tauri command
+    /// handlers and the background pipeline thread
+    /// (`run_pipeline_in_background`) need to reach it.
+    store: Mutex<store::Store>,
 }
 
 /// Max capacity of the capture ring buffer: a generous 5 minutes at 16 kHz
@@ -1867,6 +1874,29 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                 );
                 match pipeline.run(&samples, &opts) {
                     Ok(outcome) => {
+                        // Issue #198 (AC-29): persist exactly one history
+                        // row for this completed run BEFORE the generation
+                        // check below — deliberately NOT gated on
+                        // `generation_is_live`. `Pipeline::run` returning
+                        // `Ok` means the text was already pasted/written by
+                        // this point, regardless of whether a newer
+                        // dictation has since superseded this one for UI
+                        // purposes; the generation gate exists to suppress
+                        // stale UI-visible effects (event emits, pill state,
+                        // settle spawns — see the comment on that check just
+                        // below), not to decide whether a dictation
+                        // "happened". Best-effort: a failure to persist is
+                        // logged (no transcript content — see `store.rs`'s
+                        // no-log invariant) but must never fail/hide the
+                        // completion the user already saw pasted.
+                        {
+                            let app_state = app.state::<AppState>();
+                            let store = app_state.store.lock().unwrap();
+                            if let Err(err) = record_history_entry(&store, now_ms(), &outcome, None)
+                            {
+                                eprintln!("bla: failed to persist history entry: {err}");
+                            }
+                        }
                         // Issues #174/#175/#176: this completion belongs to
                         // `generation` — check it's still the live dictation
                         // BEFORE touching any shared state (including
@@ -2100,6 +2130,35 @@ pub fn run() {
                 .on_menu_event(|app, event| handle_tray_menu_event(app, event.id().as_ref()))
                 .build(&handle)?;
 
+            // Issue #198 (M3 PR 3.2): open the headless history store
+            // against the OS app-data dir (MISSION §5: local SQLite only,
+            // nothing leaves the device). `Store::open` is non-fatal on
+            // failure — mirrors the hotkey-registration handling just below:
+            // a disk error here must not brick launch. Falling back to
+            // `open_in_memory` keeps every history command working for this
+            // session; the only degradation is that history won't survive a
+            // restart, which is strictly better than the app failing to
+            // start at all.
+            let history_db_path = app_data_dir.join("history.sqlite3");
+            let history_store = store::Store::open(&history_db_path).unwrap_or_else(|err| {
+                eprintln!(
+                    "bla: failed to open history store at {history_db_path:?}, falling back to \
+                     an in-memory store for this session (history will not persist across \
+                     restart): {err}"
+                );
+                store::Store::open_in_memory()
+                    .expect("in-memory SQLite open must succeed as a last-resort fallback")
+            });
+
+            // AC-31: prune on startup per the persisted retention_days
+            // setting, before the store is handed to any command/pipeline
+            // call site.
+            if let Err(err) =
+                prune_history_for_retention(&history_store, now_ms(), settings.retention_days)
+            {
+                eprintln!("bla: failed to prune history on startup: {err}");
+            }
+
             let state = AppState {
                 hotkeys: Mutex::new(hotkeys::StateMachine::new(
                     to_hotkey_mode(settings.recording_mode),
@@ -2123,6 +2182,7 @@ pub fn run() {
                 hotkey_suspend_gen: Mutex::new(0),
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
+                store: Mutex::new(history_store),
             };
             app.manage(state);
 
