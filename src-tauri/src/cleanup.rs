@@ -1269,6 +1269,44 @@ mod ollama_tests {
         assert!(CLEANUP_PROMPT_V2.contains("{{DICTIONARY}}"));
     }
 
+    // -------------------------------------------------------------
+    // Issue #229 (SNTL-20260715-bla-PR228-91784ea): rule 7's substantive
+    // anti-hallucination constraint — "never insert a dictionary term the
+    // speaker did not actually say" — was not pinned by any test. The
+    // generic `ac36_prompt_file_contains_the_rewrite_only_constraints`
+    // check above only asserts words also present elsewhere in the prompt
+    // (rule 1 already contains "never add"), so it can't tell rule 7 being
+    // deleted, or its specific "never insert a dictionary term the speaker
+    // did not actually say" wording being weakened, apart from the prompt
+    // staying green. Pin rule 7's actual text directly. The prompt file
+    // wraps prose at ~79 columns, so the assertion normalizes internal
+    // whitespace (collapses newlines/runs of spaces to one space) before
+    // matching the contiguous phrase — the intent is to survive an
+    // innocuous re-wrap while still failing if the substantive constraint
+    // is removed or watered down.
+    // -------------------------------------------------------------
+
+    /// Rule 7's exact anti-hallucination clause (issue #229), shared by
+    /// `cleanup_v2.txt` and `cleanup_v3.txt` — both prompt files' rule 7 is
+    /// word-for-word identical apart from the `{{DICTIONARY}}` placeholder
+    /// that follows it.
+    const RULE_7_ANTI_HALLUCINATION_CLAUSE: &str = "only correct the spelling of a term that is \
+         already present in some form in the transcript; never insert a dictionary term the \
+         speaker did not actually say";
+
+    #[test]
+    fn cleanup_prompt_v2_rule_7_forbids_inserting_unspoken_dictionary_terms_issue_229() {
+        let normalized = CLEANUP_PROMPT_V2
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains(RULE_7_ANTI_HALLUCINATION_CLAUSE),
+            "cleanup_v2 rule 7 must forbid inserting a dictionary term the speaker never said \
+             (anti-hallucination guard) — normalized prompt was: {normalized:?}"
+        );
+    }
+
     #[test]
     fn render_cleanup_prompt_v2_substitutes_the_placeholder_with_comma_joined_terms() {
         // AC-36(a): comma-joined, consistent with build_initial_prompt's
@@ -1405,6 +1443,23 @@ mod ollama_tests {
     fn cleanup_prompt_v3_contains_the_dictionary_and_tone_placeholders() {
         assert!(CLEANUP_PROMPT_V3.contains("{{DICTIONARY}}"));
         assert!(CLEANUP_PROMPT_V3.contains("{{TONE}}"));
+    }
+
+    #[test]
+    fn cleanup_prompt_v3_rule_7_forbids_inserting_unspoken_dictionary_terms_issue_229() {
+        // v3 carries the identical rule 7 inherited from v2 (issue #229) —
+        // pin the same anti-hallucination guarantee here too, so a v3-only
+        // edit can't silently weaken it while cleanup_v2.txt's own copy
+        // (and the test above) stay untouched.
+        let normalized = CLEANUP_PROMPT_V3
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains(RULE_7_ANTI_HALLUCINATION_CLAUSE),
+            "cleanup_v3 rule 7 must forbid inserting a dictionary term the speaker never said \
+             (anti-hallucination guard) — normalized prompt was: {normalized:?}"
+        );
     }
 
     #[test]
