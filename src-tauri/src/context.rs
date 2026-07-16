@@ -12,6 +12,159 @@
 //! hard rule (issue #165: no `AppState`/`tauri::Wry` types in `#[cfg(test)]`
 //! code) and this issue's own constraint (never a real `active-win-pos-rs`
 //! call in tests — see `FakeActiveAppSource` below).
+//!
+//! ## Privacy invariant (AC-43, MISSION §5/§7)
+//!
+//! [`ActiveAppName`] is a single-field newtype wrapping a `String` — the
+//! app's NAME only. It structurally cannot carry a window title, bounds, a
+//! process id, or any other screen-content-adjacent field: there is no
+//! second field for such data to live in, so widening this seam to expose
+//! more than a name is a visible, reviewable change to this exact type
+//! definition, not a quiet field addition elsewhere. This matters because
+//! reading a window's TITLE via `active-win-pos-rs` on macOS requires the
+//! Screen Recording permission (a title can reveal on-screen document/page
+//! content — the very thing this app promises never leaves the device,
+//! MISSION §5); the frontmost app's NAME comes from a lighter-weight OS API
+//! (NSWorkspace on macOS) and needs no such prompt (#160's plan). This
+//! module must never request Screen Recording, and never logs or persists a
+//! window title anywhere — only the app name/identifier needed for
+//! matching, exactly like `store::HistoryRow.app_name` and
+//! `store::ToneRule.app_pattern` already do.
+
+use crate::cleanup::Tone;
+use crate::store::{ToneProfile, ToneRule};
+
+/// The focused application's name — the ONLY OS-context data this seam
+/// exposes (AC-43). See this module's doc comment for the full privacy
+/// rationale. A bare tuple struct around one `String` rather than a
+/// multi-field struct: there is nowhere for a title/bounds/pid field to be
+/// added without changing this definition itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveAppName(pub String);
+
+/// Injected active-app detection seam (mirrors `cleanup::OllamaTransport`'s
+/// role for `OllamaCleanup`): production wiring uses
+/// [`RealActiveAppSource`]; tests use a fake that never touches a real
+/// window manager.
+pub(crate) trait ActiveAppSource {
+    /// The currently focused application's name, or `None` when detection
+    /// fails (no active window, permission denied, unsupported platform).
+    /// Callers must degrade to [`Tone::Neutral`] on `None` rather than
+    /// surface an error to the paste path — see [`resolve_tone_for_app`].
+    fn current(&self) -> Option<ActiveAppName>;
+}
+
+/// The real, `active-win-pos-rs`-backed [`ActiveAppSource`] — OS glue only,
+/// no decision-making. Reads exactly one field off the crate's
+/// `ActiveWindow` (`app_name`) and discards everything else (`title`,
+/// `process_path`, `window_id`, `process_id`, `position`) at this single
+/// call site, so a window title can never propagate past this line (AC-43).
+/// Any failure (no active window, permission denied) collapses to `None`
+/// silently — never logged, never panics — matching the privacy invariant
+/// and the "detection failure degrades to Neutral" contract.
+struct RealActiveAppSource;
+
+impl ActiveAppSource for RealActiveAppSource {
+    fn current(&self) -> Option<ActiveAppName> {
+        active_win_pos_rs::get_active_window()
+            .ok()
+            .map(|window| ActiveAppName(window.app_name))
+    }
+}
+
+/// Production entry point: detects the currently focused application's name
+/// via [`RealActiveAppSource`]. Called from `lib.rs`'s `StartRecording`
+/// handling — "matched at hotkey-press time" per issue #202's plan, i.e.
+/// before capture begins, not when it ends (the user may have already
+/// switched focus — e.g. to the recording pill itself — by then).
+pub(crate) fn detect_active_app_name() -> Option<ActiveAppName> {
+    RealActiveAppSource.current()
+}
+
+/// Maps a stored [`ToneProfile`] (issue #202's persistence-layer type,
+/// deliberately narrower than `Tone` — see `ToneProfile`'s own doc comment)
+/// to the [`Tone`] the pipeline actually dispatches on. Total and trivial by
+/// construction: every `ToneProfile` variant has exactly one corresponding
+/// `Tone` variant.
+fn tone_profile_to_tone(profile: ToneProfile) -> Tone {
+    match profile {
+        ToneProfile::Casual => Tone::Casual,
+        ToneProfile::Formal => Tone::Formal,
+        ToneProfile::Verbatim => Tone::Verbatim,
+    }
+}
+
+/// Pure glob/case-insensitive match of `pattern` (a `ToneRule::app_pattern`)
+/// against `app_name` (an [`ActiveAppName`]'s inner value). Issue #202's
+/// chosen rule-matching semantics (documented here since the issue left the
+/// exact choice to the implementer):
+///
+/// - **Case-insensitive**: app names' casing can vary subtly across OS
+///   versions/locales ("Mail" vs "mail"), and forcing users to match casing
+///   exactly would be a needless footgun for a feature that's supposed to
+///   reduce friction.
+/// - **Glob wildcards** (`*` matches any run of characters including none,
+///   `?` matches exactly one): a plain string is inherently supported too
+///   (a pattern with no wildcard characters is just an exact
+///   case-insensitive match) — one matcher handles both "Slack" (exact) and
+///   "Chrome*" (e.g. matching both "Google Chrome" and "Chrome Canary") or
+///   Windows-style "*.exe" patterns without a second code path.
+/// - Every other character in `pattern` is matched **literally**, including
+///   characters that are regex metacharacters (`.`, `(`, `)`, ...) — an app
+///   name like "Mail (Preview)" must be matchable by that exact literal
+///   pattern, not have its parentheses misinterpreted as a capture group.
+///
+/// Implemented by translating `pattern` into an anchored, case-insensitive
+/// `regex::Regex` (escaping every literal character, expanding `*`/`?`) —
+/// reuses the `regex` crate already in the dependency tree (`cleanup.rs`)
+/// rather than hand-rolling a second glob engine.
+fn app_pattern_matches(pattern: &str, app_name: &str) -> bool {
+    let mut regex_str = String::from("(?i)^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex_str.push_str(".*"),
+            '?' => regex_str.push('.'),
+            other => regex_str.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    regex_str.push('$');
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(app_name))
+        .unwrap_or(false)
+}
+
+/// The core dispatch decision (issue #202, PRD AC-22, AC-40): given the
+/// active app (or `None` on a detection failure) and the current
+/// `tone_rules` (in [`crate::store::Store::list_tone_rules`]'s insertion
+/// order), resolve the [`Tone`] `PipelineOpts::tone` should carry for this
+/// dictation.
+///
+/// - `app` is `None` (detection failed — no active window, permission
+///   denied) → [`Tone::Neutral`]. Never an error (AC-40/binding constraint:
+///   detection failure must degrade silently, not surface to the paste
+///   path).
+/// - No rule's `app_pattern` matches the app name → [`Tone::Neutral`] (the
+///   default; `Neutral` is deliberately never a value `tone_rules` itself
+///   stores — see `ToneProfile`'s doc comment).
+/// - The **first** matching rule (in `rules`' given order — i.e.
+///   insertion/id order, since `list_tone_rules` returns rows that way)
+///   wins. Precedence policy, documented since multiple overlapping
+///   patterns are possible (e.g. an exact "Slack" rule and a glob "S*"
+///   rule both matching "Slack"): first-configured rule wins, matching the
+///   order the user created rules in, rather than any implicit
+///   specificity ranking — simple, predictable, and consistent with how
+///   `list_tone_rules` is already ordered for the Tone tab (#203) to
+///   display.
+pub(crate) fn resolve_tone_for_app(app: Option<&ActiveAppName>, rules: &[ToneRule]) -> Tone {
+    let Some(app) = app else {
+        return Tone::Neutral;
+    };
+    rules
+        .iter()
+        .find(|rule| app_pattern_matches(&rule.app_pattern, &app.0))
+        .map(|rule| tone_profile_to_tone(rule.tone))
+        .unwrap_or(Tone::Neutral)
+}
 
 #[cfg(test)]
 mod tests {
@@ -94,9 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn app_pattern_star_matches_any_trailing_text() {
-        assert!(app_pattern_matches("Chrome*", "Google Chrome"));
+    fn app_pattern_star_matches_any_surrounding_text() {
+        // Anchored (^...$): "Chrome*" matches names STARTING with "Chrome"
+        // ("Chrome Canary") but not "Google Chrome" (which doesn't start
+        // with "Chrome") — that needs a leading wildcard too ("*Chrome*").
         assert!(app_pattern_matches("Chrome*", "Chrome Canary"));
+        assert!(!app_pattern_matches("Chrome*", "Google Chrome"));
+        assert!(app_pattern_matches("*Chrome*", "Google Chrome"));
         assert!(app_pattern_matches("*.exe", "notepad.exe"));
         assert!(!app_pattern_matches("Chrome*", "Firefox"));
     }
@@ -155,7 +312,7 @@ mod tests {
         let app = ActiveAppName("Google Chrome".to_string());
         let rules = vec![ToneRule {
             id: 1,
-            app_pattern: "Chrome*".to_string(),
+            app_pattern: "*Chrome*".to_string(),
             tone: ToneProfile::Formal,
             created_at_ms: 1_000,
         }];
