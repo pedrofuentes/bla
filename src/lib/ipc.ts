@@ -45,6 +45,30 @@ export interface Settings {
    * playback itself lands in PR 2.7, which reads this flag.
    */
   sound_cues: boolean;
+  /**
+   * Issue #198/#199: how many days of dictation history to keep before
+   * it's eligible for pruning — `0` means "keep forever", mirroring
+   * `settings::Settings::retention_days`/`store::retention_cutoff_ms`'s
+   * contract. Optional here for the same reason as `file_base_dir` above:
+   * TS object literals built before this field existed (e.g.
+   * `GeneralTab.test.tsx`'s `BASE_SETTINGS`, `settings-harness.tsx`'s
+   * fixtures) keep type-checking; treat a missing value as `0`.
+   */
+  retention_days?: number;
+}
+
+/**
+ * Mirrors `store::HistoryRow` (src-tauri/src/store.rs) — one row returned
+ * by `search_history`. Carries the user's own transcript text (`raw` /
+ * `cleaned`): sanctioned to render in the History tab (#199), but never
+ * `console.log`/persist it anywhere else (MISSION §5/§7).
+ */
+export interface HistoryRow {
+  id: number;
+  created_at_ms: number;
+  raw: string;
+  cleaned: string;
+  app_name?: string | null;
 }
 
 /** Mirrors `models::DownloadProgress` (src-tauri/src/models.rs). */
@@ -106,6 +130,22 @@ export interface Commands {
   suspend_hotkey: { args: { generation: number }; result: void };
   /** Mirrors `commands::resume_hotkey` (issue #181) — see `GeneralTab.tsx`. */
   resume_hotkey: { args: { generation: number }; result: void };
+  /**
+   * Mirrors `commands::search_history` (issue #198/#199) — substring
+   * search over dictation history, newest first, capped at `limit` rows.
+   * The History tab's (#199) sole source of rows to render.
+   */
+  search_history: { args: { query: string; limit: number }; result: HistoryRow[] };
+  /**
+   * Mirrors `commands::copy_history_entry` (issue #198/#199) — copies one
+   * entry's cleaned transcript to the clipboard; the clipboard routing is
+   * entirely backend-side (never a value this call returns or logs).
+   */
+  copy_history_entry: { args: { id: number }; result: void };
+  /** Mirrors `commands::delete_history_entry` (issue #198/#199). */
+  delete_history_entry: { args: { id: number }; result: void };
+  /** Mirrors `commands::clear_history` (issue #198/#199) — the History tab's "Clear all". */
+  clear_history: { result: void };
 }
 
 /**
