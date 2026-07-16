@@ -892,6 +892,72 @@ mod tests {
             ));
         }
     }
+
+    // -------------------------------------------------------------
+    // Issue #74: classify_ureq_error had zero branch coverage (StubTransport
+    // bypasses it entirely — it implements OllamaTransport directly rather
+    // than going through UreqTransport::post) and matched on substrings of
+    // the error's *rendered Display message*, which is fragile to
+    // ureq/OS wording changes. `ureq::Error: From<std::io::Error>` and
+    // `ureq::Response::new` are both public, so a real `ureq::Error` can be
+    // constructed here without a live network call.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn classify_ureq_error_maps_status_to_invalid_response() {
+        let response = ureq::Response::new(500, "Internal Server Error", "oops")
+            .expect("constructing a Response for the test");
+        let err = ureq::Error::Status(500, response);
+        assert_eq!(classify_ureq_error(err), TransportError::InvalidResponse);
+    }
+
+    #[test]
+    fn classify_ureq_error_maps_a_realistic_ureq_timeout_message_to_timeout() {
+        // The message ureq itself actually uses for a read/connect timeout
+        // (see ureq::stream::io_err_timeout) — both the old string-matching
+        // code and the typed check agree here; kept as a realistic
+        // regression anchor.
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out reading response");
+        let err: ureq::Error = io_err.into();
+        assert_eq!(classify_ureq_error(err), TransportError::Timeout);
+    }
+
+    #[test]
+    fn classify_ureq_error_maps_connection_refused_to_connection_failed() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 61)",
+        );
+        let err: ureq::Error = io_err.into();
+        assert_eq!(classify_ureq_error(err), TransportError::ConnectionFailed);
+    }
+
+    #[test]
+    fn classify_ureq_error_classifies_a_typed_timeout_correctly_even_without_the_word_timeout_in_the_message_issue_74() {
+        // The finding's core complaint: string-matching on the rendered
+        // message is fragile. A genuine io::ErrorKind::TimedOut whose
+        // message text doesn't happen to contain "timed out"/"timeout" (a
+        // differently-worded OS message, a future ureq/std wording change)
+        // must still classify as a timeout — proving classification is
+        // driven by the typed io::ErrorKind, not message substrings.
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline exceeded");
+        let err: ureq::Error = io_err.into();
+        assert_eq!(classify_ureq_error(err), TransportError::Timeout);
+    }
+
+    #[test]
+    fn classify_ureq_error_does_not_misclassify_a_non_timeout_error_that_merely_mentions_timeout_issue_74() {
+        // The inverse fragility: an error whose message happens to contain
+        // the substring "timeout" (e.g. a config-validation message) but
+        // whose actual io::ErrorKind is NOT TimedOut must not be
+        // misclassified as a timeout just because of that text.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid timeout configuration supplied",
+        );
+        let err: ureq::Error = io_err.into();
+        assert_eq!(classify_ureq_error(err), TransportError::ConnectionFailed);
+    }
 }
 
 #[cfg(test)]
