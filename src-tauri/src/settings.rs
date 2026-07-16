@@ -60,6 +60,12 @@ pub struct Settings {
     pub model_preset: ModelPreset,
     pub output_mode: OutputModeSetting,
     pub file_path_template: String,
+    /// The file-mode base directory / vault a dictation's templated path
+    /// resolves against (issue #180's settings-window picker — e.g. an
+    /// Obsidian vault folder). Empty by default: `output::resolve_base_dir`
+    /// falls back to the app-data dir when this is blank, so a user who
+    /// never opens the picker keeps the pre-#180 behavior unchanged.
+    pub file_base_dir: String,
     /// Whether bla should register itself to launch at OS login (issue
     /// #126, M2 PR 2.6). Defaults to `false` — autostart is opt-in, never
     /// silently enabled for a user who never asked for it. The actual OS
@@ -93,6 +99,7 @@ impl Default for Settings {
             model_preset: ModelPreset::LargeV3Turbo,
             output_mode: OutputModeSetting::Cursor,
             file_path_template: "{{date:YYYY-MM-DD}}.md".to_string(),
+            file_base_dir: String::new(),
             launch_at_login: false,
             sound_cues: true,
         }
