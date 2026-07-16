@@ -137,11 +137,11 @@ describe("PillWindow", () => {
     // is ACL-rejected, so onEvent rejects. It must not vanish as an unhandled
     // rejection that silently kills the whole UI (issue #182) — only the
     // feature that specific listener feeds should degrade.
-    onEvent.mockImplementation((event: string) =>
-      event === "audio-level"
-        ? Promise.reject(new Error("event.listen not allowed"))
-        : Promise.resolve(vi.fn()),
-    );
+    onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
+      if (event === "audio-level") return Promise.reject(new Error("event.listen not allowed"));
+      eventHandlers[event] = handler;
+      return Promise.resolve(vi.fn());
+    });
 
     mounted = mount(<PillWindow />);
     await flush();
@@ -154,11 +154,11 @@ describe("PillWindow", () => {
   });
 
   it("keeps the state dot alive (in place of the waveform) when only audio-level fails", async () => {
-    onEvent.mockImplementation((event: string) =>
-      event === "audio-level"
-        ? Promise.reject(new Error("event.listen not allowed"))
-        : Promise.resolve(vi.fn()),
-    );
+    onEvent.mockImplementation((event: string, handler: (payload: unknown) => void) => {
+      if (event === "audio-level") return Promise.reject(new Error("event.listen not allowed"));
+      eventHandlers[event] = handler;
+      return Promise.resolve(vi.fn());
+    });
 
     mounted = mount(<PillWindow />);
     await flush();
