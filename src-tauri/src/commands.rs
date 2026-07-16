@@ -353,6 +353,52 @@ pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// List every personal-dictionary term (issue #200, PRD AC-21),
+/// most-recently-added first. Thin wrapper over `store::Store::list_terms`;
+/// `DictionaryTerm` derives `Serialize` (see its doc comment) specifically
+/// so this command can hand rows to the frontend over Tauri IPC — the
+/// user's own Dictionary tab (#201).
+#[tauri::command]
+pub fn list_dictionary_terms(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::store::DictionaryTerm>, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .list_terms()
+        .map_err(|e| e.to_string())
+}
+
+/// Add a term to the personal dictionary (issue #200, PRD AC-21). Thin
+/// wrapper over `store::Store::add_term` — case-insensitively unique, so
+/// adding a term that already exists under a different case is a no-op,
+/// not an error (matches `Store::add_term`'s own contract). Returns the
+/// term's row id either way.
+#[tauri::command]
+pub fn add_dictionary_term(state: State<'_, AppState>, term: String) -> Result<i64, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .add_term(&term, now_ms())
+        .map_err(|e| e.to_string())
+}
+
+/// Remove a single dictionary term by id (issue #200, PRD AC-21). Thin
+/// wrapper over `store::Store::remove_term` — removing an id that doesn't
+/// exist is a no-op, not an error (matches `Store::remove_term`'s own
+/// contract).
+#[tauri::command]
+pub fn remove_dictionary_term(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .remove_term(id)
+        .map_err(|e| e.to_string())
+}
+
 /// Re-registers the current (persisted) hotkey as the global dictation
 /// shortcut (issue #181) — called whenever hotkey capture ends without a
 /// newly-committed *changed* chord already re-registering it via

@@ -287,6 +287,43 @@ pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// editing `cleanup_v1.txt` in place.
 pub const CLEANUP_PROMPT_V1: &str = include_str!("../prompts/cleanup_v1.txt");
 
+/// The M3 personal-dictionary-aware cleanup prompt (issue #200, PRD AC-21,
+/// AC-36). Supersedes `CLEANUP_PROMPT_V1` as `OllamaCleanup`'s live system
+/// prompt (see [`OllamaCleanup::with_dictionary`]) — per the same "add a new
+/// file, never edit the old one in place" convention as `CLEANUP_PROMPT_V1`'s
+/// own doc comment, `cleanup_v1.txt` stays on disk untouched (its own
+/// `ac10_prompt_file_contains_the_rewrite_only_constraints` regression test
+/// keeps protecting it structurally). Contains a `{{DICTIONARY}}`
+/// placeholder — see [`render_cleanup_prompt_v2`] for the substitution.
+pub const CLEANUP_PROMPT_V2: &str = include_str!("../prompts/cleanup_v2.txt");
+
+/// The `{{DICTIONARY}}` placeholder inside [`CLEANUP_PROMPT_V2`], substituted
+/// at call time by [`render_cleanup_prompt_v2`].
+const CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER: &str = "{{DICTIONARY}}";
+
+/// Renders [`CLEANUP_PROMPT_V2`] with `dictionary`'s current terms
+/// substituted into the `{{DICTIONARY}}` placeholder (issue #200, PRD
+/// AC-21, AC-36).
+///
+/// Terms are comma-joined using [`crate::stt::build_initial_prompt`] —
+/// reused directly rather than reimplemented, so this rendering path and
+/// Whisper's `initial_prompt` seam can't silently drift out of sync on
+/// escaping/collapsing rules (AC-36(a)). An empty dictionary substitutes a
+/// short "no terms" sentence rather than leaving a dangling, ungrammatical
+/// trailing fragment, so the rendered prompt reads cleanly either way.
+pub fn render_cleanup_prompt_v2(dictionary: &[String]) -> String {
+    let terms = crate::stt::build_initial_prompt(dictionary);
+    let dictionary_sentence = if terms.is_empty() {
+        "The user's dictionary is currently empty.".to_string()
+    } else {
+        format!("The user's current dictionary terms: {terms}.")
+    };
+    CLEANUP_PROMPT_V2.replace(
+        CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER,
+        &dictionary_sentence,
+    )
+}
+
 /// Errors an [`OllamaTransport`] may return. `OllamaCleanup::clean` maps
 /// every variant to [`CleanupError::Unreachable`] (AC-4) — transport
 /// internals never propagate past this module.
@@ -506,11 +543,16 @@ pub struct OllamaCleanup<T: OllamaTransport> {
     base_url: String,
     model: String,
     transport: T,
+    /// Personal-dictionary terms (issue #200, PRD AC-21) rendered into the
+    /// system prompt via [`render_cleanup_prompt_v2`]. Empty by default
+    /// (see [`Self::new`]) — attach terms with [`Self::with_dictionary`].
+    dictionary: Vec<String>,
 }
 
 impl<T: OllamaTransport> OllamaCleanup<T> {
     /// Builds an `OllamaCleanup` against `base_url` (no trailing slash
-    /// required — it's trimmed) using `model` and the given transport.
+    /// required — it's trimmed) using `model` and the given transport, with
+    /// no dictionary terms attached (see [`Self::with_dictionary`]).
     ///
     /// MISSION §5 invariant: `base_url` must resolve to the local machine
     /// (`localhost`/`127.0.0.1`/`[::1]`) — Ollama is the only permitted
@@ -524,6 +566,7 @@ impl<T: OllamaTransport> OllamaCleanup<T> {
             base_url: base_url.into(),
             model: model.into(),
             transport,
+            dictionary: Vec::new(),
         }
     }
 
@@ -532,10 +575,23 @@ impl<T: OllamaTransport> OllamaCleanup<T> {
         Self::new(DEFAULT_OLLAMA_BASE_URL, model, transport)
     }
 
+    /// Attaches personal-dictionary terms (issue #200, PRD AC-21) so every
+    /// subsequent [`Cleanup::clean`] call renders them into
+    /// [`CLEANUP_PROMPT_V2`]'s `{{DICTIONARY}}` placeholder via
+    /// [`render_cleanup_prompt_v2`]. Builder-style so existing call sites
+    /// that construct an `OllamaCleanup` without dictionary terms to pass
+    /// keep compiling unchanged (they get the empty-dictionary rendering,
+    /// which is still a complete, valid rewrite-only prompt).
+    pub fn with_dictionary(mut self, dictionary: Vec<String>) -> Self {
+        self.dictionary = dictionary;
+        self
+    }
+
     fn clean_via_ollama(&self, raw: &str) -> Result<String, CleanupError> {
+        let system_prompt = render_cleanup_prompt_v2(&self.dictionary);
         let request = GenerateRequest {
             model: &self.model,
-            system: CLEANUP_PROMPT_V1,
+            system: &system_prompt,
             prompt: raw,
             stream: false,
         };
@@ -906,6 +962,13 @@ mod ollama_tests {
         // field must be the raw input. A substring check would still pass
         // if the two were swapped (prompt: PROMPT, system: raw), which is a
         // real request-construction regression — this test must catch it.
+        //
+        // Issue #200: `OllamaCleanup` now sends `CLEANUP_PROMPT_V2`
+        // (rendered via `render_cleanup_prompt_v2`, empty dictionary here
+        // since `cleanup_with` doesn't attach one) as its system prompt —
+        // `CLEANUP_PROMPT_V2` supersedes `CLEANUP_PROMPT_V1` as the live
+        // prompt sent upstream, per the "add a new file, don't edit the old
+        // one" convention (see `CLEANUP_PROMPT_V2`'s doc comment).
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub);
         cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
@@ -915,7 +978,8 @@ mod ollama_tests {
             serde_json::from_str(&body).expect("request body must be valid JSON");
 
         assert_eq!(
-            parsed["system"], CLEANUP_PROMPT_V1,
+            parsed["system"],
+            render_cleanup_prompt_v2(&[]),
             "the `system` field must carry the rewrite-only prompt, not the transcript"
         );
         assert_eq!(
@@ -1017,5 +1081,131 @@ mod ollama_tests {
                 "prompt is missing required constraint: {must_contain:?}"
             );
         }
+    }
+
+    // -------------------------------------------------------------
+    // Issue #200 (PRD AC-21, AC-36): CLEANUP_PROMPT_V2 — a new, versioned,
+    // rewrite-only prompt file carrying a {{DICTIONARY}} placeholder,
+    // substituted with the current dictionary terms at call time.
+    // CLEANUP_PROMPT_V1 stays untouched (MISSION §7: a prompt bump adds a
+    // new file, never edits the old one in place).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cleanup_prompt_v2_is_a_distinct_file_from_v1() {
+        assert_ne!(
+            CLEANUP_PROMPT_V2, CLEANUP_PROMPT_V1,
+            "cleanup_v2.txt must be its own file, not a copy-paste of cleanup_v1.txt"
+        );
+    }
+
+    #[test]
+    fn ac36_prompt_file_contains_the_rewrite_only_constraints() {
+        // Mirrors ac10_prompt_file_contains_the_rewrite_only_constraints
+        // above for CLEANUP_PROMPT_V2 — AC-36(b): cleanup_v2 must satisfy
+        // every rewrite-only constraint v1 does.
+        let prompt = CLEANUP_PROMPT_V2.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "filler",
+            "self-correction",
+            "punctuation",
+            "bullet",
+            "tone",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "cleanup_v2 prompt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_prompt_v2_contains_the_dictionary_placeholder() {
+        assert!(CLEANUP_PROMPT_V2.contains("{{DICTIONARY}}"));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v2_substitutes_the_placeholder_with_comma_joined_terms() {
+        // AC-36(a): comma-joined, consistent with build_initial_prompt's
+        // escaping rules — reused directly rather than reimplemented.
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let rendered = render_cleanup_prompt_v2(&dictionary);
+
+        assert!(
+            !rendered.contains("{{DICTIONARY}}"),
+            "the placeholder must be substituted, not left in the rendered prompt"
+        );
+        assert!(rendered.contains(&crate::stt::build_initial_prompt(&dictionary)));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v2_reuses_build_initial_prompts_escaping_rules() {
+        // A term containing a comma must be escaped the exact same way in
+        // both rendering paths, so the two can't silently drift apart.
+        let dictionary = vec!["Acme, Inc.".to_string()];
+        let rendered = render_cleanup_prompt_v2(&dictionary);
+        assert!(rendered.contains("Acme\\, Inc."));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v2_is_clean_when_the_dictionary_is_empty() {
+        // AC-36(a): "cleanly removed/empty when the dictionary is empty" —
+        // no leftover placeholder syntax and no rewrite-only constraint
+        // lost in the process.
+        let rendered = render_cleanup_prompt_v2(&[]);
+        assert!(!rendered.contains("{{DICTIONARY}}"));
+        assert!(!rendered.contains("{{"));
+        assert!(!rendered.contains("}}"));
+
+        let lower = rendered.to_lowercase();
+        for must_contain in ["never answer", "never add"] {
+            assert!(lower.contains(must_contain));
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Issue #200 (PRD AC-21): OllamaCleanup::with_dictionary wiring —
+    // dictionary terms attached at construction reach the request actually
+    // sent to Ollama.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn with_dictionary_makes_the_request_carry_the_rendered_v2_prompt_for_those_terms() {
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub).with_dictionary(dictionary.clone());
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+
+        assert_eq!(
+            parsed["system"],
+            render_cleanup_prompt_v2(&dictionary),
+            "the system prompt must carry the attached dictionary's terms"
+        );
+        assert_ne!(
+            parsed["system"],
+            render_cleanup_prompt_v2(&[]),
+            "a non-empty dictionary must change the rendered prompt"
+        );
+    }
+
+    #[test]
+    fn without_with_dictionary_the_request_uses_an_empty_dictionary_rendering() {
+        // A call site that never attaches a dictionary (e.g. not yet
+        // updated) keeps working exactly as before #200 wired dictionary
+        // terms in: an empty-dictionary rendering of CLEANUP_PROMPT_V2.
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub);
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+        assert_eq!(parsed["system"], render_cleanup_prompt_v2(&[]));
     }
 }

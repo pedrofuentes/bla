@@ -38,17 +38,33 @@ use std::time::Duration;
 /// appending entries here — nothing about the runner itself needs to change.
 type Migration = (i64, &'static str);
 
-const MIGRATIONS: &[Migration] = &[(
-    1,
-    "CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY,
-        created_at_ms INTEGER NOT NULL,
-        raw TEXT NOT NULL,
-        cleaned TEXT NOT NULL,
-        app_name TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_history_created_at_ms ON history(created_at_ms);",
-)];
+const MIGRATIONS: &[Migration] = &[
+    (
+        1,
+        "CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY,
+            created_at_ms INTEGER NOT NULL,
+            raw TEXT NOT NULL,
+            cleaned TEXT NOT NULL,
+            app_name TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_history_created_at_ms ON history(created_at_ms);",
+    ),
+    (
+        2,
+        // Issue #200 (PRD AC-21), schema per #160's plan note:
+        // `dictionary(term UNIQUE NOCASE)`. `term`'s column-level `UNIQUE
+        // COLLATE NOCASE` constraint is what makes `add_term`'s
+        // case-insensitive de-duplication ("Kubernetes" then "kubernetes"
+        // is a no-op, not two rows) a property of the schema itself rather
+        // than something every caller has to remember to check for.
+        "CREATE TABLE IF NOT EXISTS dictionary (
+            id INTEGER PRIMARY KEY,
+            term TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at_ms INTEGER NOT NULL
+        );",
+    ),
+];
 
 /// A single dictation history entry (issue #160).
 ///
@@ -63,6 +79,26 @@ pub struct HistoryRow {
     pub raw: String,
     pub cleaned: String,
     pub app_name: Option<String>,
+}
+
+/// One term in the user's personal dictionary (issue #200, PRD AC-21):
+/// vocabulary — names, product names, jargon, acronyms — fed to Whisper's
+/// `initial_prompt` ([`crate::stt::build_initial_prompt`]) and to the
+/// `cleanup_v2` rewrite prompt ([`crate::cleanup::render_cleanup_prompt_v2`])
+/// to bias recognition and spelling correction toward the user's own words.
+///
+/// Derives `Debug` for test assertions only, mirroring [`HistoryRow`]'s own
+/// doc comment: dictionary terms are user content and stay under the same
+/// no-log invariant (MISSION §5/§7) as transcript text — nothing in this
+/// crate `println!`/`log!`s a `DictionaryTerm`. Also derives `Serialize`
+/// (like `HistoryRow`) so `commands::list_dictionary_terms` can hand rows to
+/// the frontend over Tauri IPC — the one sanctioned "leaves this module"
+/// path, the user's own Dictionary tab (#201).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DictionaryTerm {
+    pub id: i64,
+    pub term: String,
+    pub created_at_ms: i64,
 }
 
 /// Headless SQLite persistence layer wrapping a single [`rusqlite::Connection`].
@@ -127,7 +163,25 @@ impl Store {
     /// than the DB's current `user_version`, in order, each inside its own
     /// transaction. Forward-only and idempotent: re-running against an
     /// already-migrated DB applies nothing and errors on nothing.
+    ///
+    /// Issue #163 (SNTL-20260713-bla-PR161-b26d368): also maintains a
+    /// `schema_migrations` ledger recording exactly which versions have
+    /// been applied. Migration 1's SQL happens to be idempotent on its own
+    /// (`CREATE TABLE/INDEX IF NOT EXISTS`), so the `if *version <= current
+    /// { continue; }` guard below had no test that could actually tell it
+    /// apart from not existing at all. `INSERT INTO schema_migrations` is
+    /// deliberately NOT idempotent (`version` is a `PRIMARY KEY`): if that
+    /// guard is ever silently broken, a migration gets re-applied, its
+    /// ledger insert hits a PRIMARY KEY violation, and `Store::open`
+    /// returns `Err` instead of quietly re-running SQL with no visible
+    /// effect — a failure a test (or a real reopen) can observe directly.
     fn migrate(&mut self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY NOT NULL
+            );",
+        )?;
+
         let current: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -142,9 +196,26 @@ impl Store {
             // compile-time constant from MIGRATIONS, never user input, so
             // formatting it into the statement is safe.
             tx.execute_batch(&format!("PRAGMA user_version = {version};"))?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                params![version],
+            )?;
             tx.commit()?;
         }
         Ok(())
+    }
+
+    /// The set of migration versions [`Self::migrate`] has actually applied
+    /// through the `schema_migrations` ledger, oldest first — the
+    /// discriminating assertion issue #163 asks for (see `migrate`'s doc
+    /// comment).
+    #[cfg(test)]
+    fn applied_migration_versions(&self) -> SqliteResult<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
     }
 
     /// Insert a new history row and return its assigned row id.
@@ -235,6 +306,73 @@ impl Store {
             params![cutoff_ms],
         )
     }
+
+    /// The most recent `history` row's `created_at_ms`, or `None` if
+    /// `history` is empty. [`retention_cutoff_ms`]'s clock-skew guard
+    /// (issue #219) uses this to sanity-check the computed cutoff against
+    /// data that has actually been recorded.
+    pub fn newest_history_timestamp(&self) -> SqliteResult<Option<i64>> {
+        self.conn
+            .query_row("SELECT MAX(created_at_ms) FROM history", [], |row| {
+                row.get(0)
+            })
+    }
+
+    /// Add `term` to the personal dictionary (issue #200, PRD AC-21).
+    /// Case-insensitively unique (schema: `term UNIQUE COLLATE NOCASE`) —
+    /// adding a term that already exists under a different case
+    /// ("Kubernetes" then "kubernetes") is a no-op, not a second row or an
+    /// error: the first-inserted casing and `created_at_ms` win. Returns
+    /// the row id either way, so a caller always gets a stable id back for
+    /// the term it asked for, whether that add just happened or a
+    /// case-insensitive match already existed.
+    pub fn add_term(&self, term: &str, created_at_ms: i64) -> SqliteResult<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO dictionary (term, created_at_ms) VALUES (?1, ?2)",
+            params![term, created_at_ms],
+        )?;
+        // The column's own `COLLATE NOCASE` makes this lookup
+        // case-insensitive too, so this resolves to the existing row on a
+        // conflict without needing an explicit `COLLATE` in the query.
+        self.conn.query_row(
+            "SELECT id FROM dictionary WHERE term = ?1",
+            params![term],
+            |row| row.get(0),
+        )
+    }
+
+    /// All dictionary terms, most-recently-added first.
+    ///
+    /// Ordering is a deliberate policy choice (issue #70): `build_initial_prompt`
+    /// packs terms into Whisper's `initial_prompt` in the order it's given
+    /// and skips whichever ones don't fit the length cap. Feeding it terms
+    /// newest-first means that when the whole dictionary doesn't fit, it's
+    /// the OLDEST terms that get skipped — recently-added terms are more
+    /// likely to be what the user is actively dictating about (new jargon,
+    /// a name they just added), so they should win a place over older ones
+    /// rather than losing out to an arbitrary/insertion-order truncation.
+    pub fn list_terms(&self) -> SqliteResult<Vec<DictionaryTerm>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, term, created_at_ms FROM dictionary
+             ORDER BY created_at_ms DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DictionaryTerm {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                created_at_ms: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Remove a single dictionary term by id. Removing an id that doesn't
+    /// exist is a no-op, not an error (mirrors [`Self::delete_history`]).
+    pub fn remove_term(&self, id: i64) -> SqliteResult<()> {
+        self.conn
+            .execute("DELETE FROM dictionary WHERE id = ?1", params![id])?;
+        Ok(())
+    }
 }
 
 /// Escape LIKE metacharacters (`%`, `_`, and the escape character itself,
@@ -259,12 +397,47 @@ fn escape_like(input: &str) -> String {
 /// `retention_days == 0` means "keep forever" — `None`, not a cutoff of
 /// `now_ms`, so callers must treat `None` as "don't prune" rather than
 /// accidentally pruning everything.
-pub fn retention_cutoff_ms(now_ms: i64, retention_days: u32) -> Option<i64> {
+///
+/// `newest_row_ms` — [`Store::newest_history_timestamp`]'s result — is a
+/// clock-skew guard (issue #219, SNTL-20260715-bla-PR218-cc04f8b): a
+/// backward clock jump (or bad system time) can otherwise compute a cutoff
+/// in the apparent future relative to every row that actually exists, and
+/// `prune_history` would then delete all of history. Passing `None` (no
+/// rows to check against, or a caller that hasn't been updated) disables
+/// the guard and reproduces the pre-#219 behavior exactly — pruning an
+/// empty table deletes nothing regardless, so this is never unsafe. Given
+/// `Some(newest)`, two clamp/skip rules apply, in order:
+///
+/// 1. If `now_ms` is itself before `newest` — proof the clock has skewed
+///    backward relative to data that was already recorded (a row can only
+///    ever be inserted at `now_ms` at the time) — pruning is skipped
+///    entirely (`None`): `now` can no longer be trusted to compute *any*
+///    safe cutoff.
+/// 2. Otherwise, the raw cutoff is clamped so it never exceeds `newest` —
+///    guaranteeing the single most-recently-recorded row can never be
+///    pruned by a miscalculated cutoff, however large `now_ms` or
+///    `retention_days` turn out to be.
+pub fn retention_cutoff_ms(
+    now_ms: i64,
+    retention_days: u32,
+    newest_row_ms: Option<i64>,
+) -> Option<i64> {
     if retention_days == 0 {
         return None;
     }
     let retention_ms = i64::from(retention_days) * 24 * 60 * 60 * 1000;
-    Some(now_ms - retention_ms)
+    let raw_cutoff = now_ms - retention_ms;
+
+    if let Some(newest) = newest_row_ms {
+        if now_ms < newest {
+            return None;
+        }
+        if raw_cutoff > newest {
+            return Some(newest);
+        }
+    }
+
+    Some(raw_cutoff)
 }
 
 #[cfg(test)]
@@ -276,9 +449,75 @@ mod tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn opening_an_in_memory_store_runs_migration_1_and_sets_user_version_to_1() {
+    fn opening_an_in_memory_store_runs_every_migration_and_sets_user_version_to_the_latest() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #163 (SNTL-20260713-bla-PR161-b26d368): the migration-idempotence
+    // test gap. Migration 1's SQL (`CREATE TABLE/INDEX IF NOT EXISTS`) is
+    // naturally idempotent, so re-running it was never observable —
+    // "reopening is idempotent" passed even with the
+    // `if *version <= current { continue; }` guard deleted, giving that
+    // guard zero discriminating coverage. `schema_migrations` is a ledger
+    // of exactly which versions have been applied, with `version` as a
+    // PRIMARY KEY: `INSERT INTO schema_migrations` is NOT idempotent, so a
+    // broken guard now surfaces as a hard `Store::open` error (a PRIMARY KEY
+    // violation) the very next time a DB is reopened, rather than silently
+    // re-running migration SQL with no visible effect.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn fresh_db_migration_ledger_records_every_migration_exactly_once_issue_163() {
+        let store = Store::open_in_memory().expect("open_in_memory should succeed");
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn reopening_a_store_twice_does_not_reapply_migrations_issue_163() {
+        // The discriminating case: if the version guard were ever silently
+        // broken, this SECOND open would attempt to re-run migration 1 and
+        // 2's SQL, including a second `INSERT INTO schema_migrations`,
+        // which would violate that table's PRIMARY KEY on `version` and
+        // turn this `.expect` into a panic — a failure visible right here,
+        // not just in a hypothetical future production reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+
+        {
+            Store::open(&path).expect("first open should succeed");
+        }
+        let store = Store::open(&path)
+            .expect("second open must not reapply migrations (would violate schema_migrations' PRIMARY KEY if the guard were broken)");
+
+        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn upgrading_a_pre_existing_v1_db_applies_only_migration_2_issue_163() {
+        // Simulates a real-world upgrade: a DB created by code that only
+        // knew about migration 1 (no `schema_migrations` ledger existed
+        // yet) is then opened by the current code. Migration 1 must NOT be
+        // re-applied (and isn't retroactively recorded in the ledger —
+        // only migrations that actually ran through this runner are); only
+        // migration 2 (dictionary) should apply.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0].1).unwrap();
+            conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        }
+
+        let store = Store::open(&path).expect("upgrade open should succeed");
+        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![2]);
+
+        // Migration 2's table is now actually usable.
+        let id = store.add_term("Kubernetes", 1_000).unwrap();
+        assert!(id > 0);
     }
 
     // -------------------------------------------------------------
@@ -319,14 +558,14 @@ mod tests {
 
         {
             let store = Store::open(&path).expect("first open should succeed");
-            assert_eq!(store.schema_version().unwrap(), 1);
+            assert_eq!(store.schema_version().unwrap(), 2);
         }
 
         // Re-opening an already-migrated DB must not error and must leave
         // user_version untouched — the migration runner is forward-only and
         // idempotent.
         let store = Store::open(&path).expect("second open should succeed");
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
     }
 
     // -------------------------------------------------------------
@@ -537,15 +776,214 @@ mod tests {
     // retention_cutoff_ms (pure)
     // -------------------------------------------------------------
 
+    // -------------------------------------------------------------
+    // Personal dictionary CRUD (issue #200, PRD AC-21, AC-37)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn add_term_then_list_terms_round_trips_the_term() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.add_term("Kubernetes", 1_000).unwrap();
+        assert!(id > 0);
+
+        let terms = store.list_terms().unwrap();
+        assert_eq!(
+            terms,
+            vec![DictionaryTerm {
+                id,
+                term: "Kubernetes".to_string(),
+                created_at_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn adding_a_term_twice_with_different_casing_is_a_case_insensitive_no_op_issue_160() {
+        // #160's schema note: `dictionary(term UNIQUE NOCASE)`. Adding
+        // "Kubernetes" then "kubernetes" must be a no-op/conflict, not two
+        // rows — the first-inserted casing and timestamp win.
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store.add_term("Kubernetes", 1_000).unwrap();
+        let second_id = store.add_term("kubernetes", 2_000).unwrap();
+
+        assert_eq!(
+            first_id, second_id,
+            "both calls must resolve to the same row"
+        );
+
+        let terms = store.list_terms().unwrap();
+        assert_eq!(
+            terms.len(),
+            1,
+            "a case-insensitive duplicate must not add a second row"
+        );
+        assert_eq!(
+            terms[0].term, "Kubernetes",
+            "the first-inserted casing must win"
+        );
+        assert_eq!(
+            terms[0].created_at_ms, 1_000,
+            "the first-inserted timestamp must win"
+        );
+    }
+
+    #[test]
+    fn distinct_terms_are_not_treated_as_duplicates() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_term("Kubernetes", 1_000).unwrap();
+        store.add_term("kubectl", 2_000).unwrap();
+
+        assert_eq!(store.list_terms().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_terms_orders_most_recently_added_first() {
+        // Issue #70's chosen tie-break policy (documented on
+        // `Store::list_terms`): when `build_initial_prompt`'s length cap
+        // means not every dictionary term fits Whisper's prompt budget,
+        // the most-recently-added terms should be the ones tried first.
+        let store = Store::open_in_memory().unwrap();
+        store.add_term("oldest", 1_000).unwrap();
+        store.add_term("middle", 2_000).unwrap();
+        store.add_term("newest", 3_000).unwrap();
+
+        let terms: Vec<String> = store
+            .list_terms()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.term)
+            .collect();
+        assert_eq!(terms, vec!["newest", "middle", "oldest"]);
+    }
+
+    #[test]
+    fn remove_term_removes_only_the_targeted_row() {
+        let store = Store::open_in_memory().unwrap();
+        let keep = store.add_term("keep", 1_000).unwrap();
+        let drop = store.add_term("drop", 2_000).unwrap();
+
+        store.remove_term(drop).unwrap();
+
+        let terms = store.list_terms().unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].id, keep);
+    }
+
+    #[test]
+    fn remove_term_on_a_nonexistent_id_is_a_noop() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_term("keep", 1_000).unwrap();
+
+        store.remove_term(999_999).unwrap();
+
+        assert_eq!(store.list_terms().unwrap().len(), 1);
+    }
+
     #[test]
     fn retention_cutoff_ms_of_zero_days_means_keep_forever() {
-        assert_eq!(retention_cutoff_ms(1_000_000, 0), None);
+        assert_eq!(retention_cutoff_ms(1_000_000, 0, None), None);
     }
 
     #[test]
     fn retention_cutoff_ms_of_positive_days_subtracts_the_injected_now() {
         let now_ms: i64 = 10 * 24 * 60 * 60 * 1000; // day 10
-        let cutoff = retention_cutoff_ms(now_ms, 3).unwrap();
+        let cutoff = retention_cutoff_ms(now_ms, 3, None).unwrap();
         assert_eq!(cutoff, 7 * 24 * 60 * 60 * 1000); // day 7
+    }
+
+    // -------------------------------------------------------------
+    // Issue #219 (SNTL-20260715-bla-PR218-cc04f8b): clock-skew hardening.
+    // Without a guard, a backward clock jump (or bad system time) can make
+    // the retention cutoff computed from wall-clock `now_ms` land in the
+    // apparent future relative to every row that actually exists, and
+    // `prune_history` would then delete all of history. `retention_cutoff_ms`
+    // takes the newest recorded row's timestamp as a sanity check and
+    // applies clamp/skip semantics against it.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn retention_cutoff_ms_is_unaffected_by_the_guard_when_the_clock_is_sane() {
+        // Normal case: `now` is safely after the newest row, and the
+        // computed cutoff doesn't exceed it either — the guard must be a
+        // complete no-op here, identical to passing `None`.
+        let now_ms: i64 = 10 * 24 * 60 * 60 * 1000; // day 10
+        let newest_row_ms = 9 * 24 * 60 * 60 * 1000; // day 9
+        let cutoff = retention_cutoff_ms(now_ms, 3, Some(newest_row_ms)).unwrap();
+        assert_eq!(cutoff, 7 * 24 * 60 * 60 * 1000); // day 7, same as the unguarded case
+    }
+
+    #[test]
+    fn retention_cutoff_ms_skips_pruning_when_now_is_before_the_newest_recorded_row_issue_219() {
+        // Direct proof of a backward clock skew: `now` can never
+        // legitimately read earlier than a timestamp that was already
+        // recorded (rows are inserted at `now` at the time). When it does,
+        // "now" cannot be trusted to compute any cutoff at all, so pruning
+        // must be skipped entirely (`None`) rather than compute a
+        // plausible-looking but untrustworthy value.
+        let now_ms = 1_000;
+        let newest_row_ms = 5_000;
+        assert_eq!(retention_cutoff_ms(now_ms, 1, Some(newest_row_ms)), None);
+    }
+
+    #[test]
+    fn retention_cutoff_ms_clamps_to_the_newest_row_rather_than_exceeding_it_issue_219() {
+        // A `now_ms` far enough in the future (bad system time, or a
+        // corrected clock jump) can push the raw cutoff past every row
+        // that exists, which would otherwise prune all of history. The
+        // cutoff must never exceed the newest row's own timestamp, so that
+        // row (the most recent one) can never be pruned by a
+        // miscalculated cutoff.
+        let now_ms: i64 = 100_000_000;
+        let retention_days = 1; // 86_400_000 ms
+        let newest_row_ms = 5_000;
+        let raw_cutoff = now_ms - i64::from(retention_days) * 24 * 60 * 60 * 1000;
+        assert!(
+            raw_cutoff > newest_row_ms,
+            "test setup must actually exercise the clamp"
+        );
+
+        assert_eq!(
+            retention_cutoff_ms(now_ms, retention_days, Some(newest_row_ms)),
+            Some(newest_row_ms)
+        );
+    }
+
+    #[test]
+    fn newest_history_timestamp_is_none_for_an_empty_store() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.newest_history_timestamp().unwrap(), None);
+    }
+
+    #[test]
+    fn newest_history_timestamp_returns_the_max_created_at_ms() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_history(1_000, "a", "a.", None).unwrap();
+        store.insert_history(3_000, "b", "b.", None).unwrap();
+        store.insert_history(2_000, "c", "c.", None).unwrap();
+
+        assert_eq!(store.newest_history_timestamp().unwrap(), Some(3_000));
+    }
+
+    #[test]
+    fn clock_skew_backwards_jump_cannot_mass_delete_history_issue_219() {
+        // End-to-end discriminating test at the Store level: rows recorded
+        // with a correct clock, then a "now" that reads BEFORE those rows
+        // (simulating the clock having jumped backward since) must not
+        // delete anything, however large `retention_days` is.
+        let store = Store::open_in_memory().unwrap();
+        store.insert_history(10_000, "a", "a.", None).unwrap();
+        store.insert_history(20_000, "b", "b.", None).unwrap();
+        store.insert_history(30_000, "c", "c.", None).unwrap();
+
+        let skewed_now_ms = 5_000; // before every row above
+        let newest = store.newest_history_timestamp().unwrap();
+        let cutoff = retention_cutoff_ms(skewed_now_ms, 365, newest);
+        let deleted = match cutoff {
+            Some(cutoff_ms) => store.prune_history(cutoff_ms).unwrap(),
+            None => 0,
+        };
+
+        assert_eq!(deleted, 0, "a clock-skewed `now` must not prune anything");
+        assert_eq!(store.search_history("", 10).unwrap().len(), 3);
     }
 }

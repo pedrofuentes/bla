@@ -104,20 +104,31 @@ pub const INITIAL_PROMPT_MAX_CHARS: usize = 1024;
 /// Renders dictionary terms into the comma-separated string used as
 /// Whisper's `initial_prompt` (AC-21 / ADR-0004). Pure and deterministic:
 ///
+/// - NUL bytes inside a term are stripped (issue #69 — Rust `String`s can
+///   contain interior NULs, but a NUL surviving to whisper-rs's
+///   `set_initial_prompt` makes its internal `CString::new` reject it and
+///   panic; a term left empty by stripping is dropped like any other blank
+///   term).
 /// - Blank/whitespace-only terms are dropped.
 /// - Internal whitespace (including newlines/tabs) in each term collapses to
 ///   single spaces, so the prompt stays one line.
 /// - Terms are joined in the order given (callers control precedence) with
-///   `", "` as the separator.
+///   `", "` as the separator. Callers that want a specific tie-break under
+///   the length cap below control it by ordering `terms` accordingly (see
+///   `Store::list_terms`'s newest-first policy, issue #70).
 /// - A literal `\` or `,` inside a term is escaped (`\\`, `\,`) so the join
 ///   stays unambiguous.
-/// - The result is capped at [`INITIAL_PROMPT_MAX_CHARS`] bytes, dropping
-///   whole trailing terms rather than truncating one mid-term.
+/// - The result is capped at [`INITIAL_PROMPT_MAX_CHARS`] bytes. A term that
+///   doesn't fit is *skipped*, not treated as an end-of-input signal (issue
+///   #70) — an earlier oversized term no longer silently drops every term
+///   that follows it; whatever combination of terms fits, in the given
+///   order, is what's rendered.
 pub fn build_initial_prompt(terms: &[String]) -> String {
     let mut rendered = String::new();
 
     for term in terms {
-        let collapsed = term.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sanitized: String = term.chars().filter(|&c| c != '\0').collect();
+        let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
         if collapsed.is_empty() {
             continue;
         }
@@ -125,7 +136,7 @@ pub fn build_initial_prompt(terms: &[String]) -> String {
 
         let separator_len = if rendered.is_empty() { 0 } else { 2 };
         if rendered.len() + separator_len + escaped.len() > INITIAL_PROMPT_MAX_CHARS {
-            break;
+            continue;
         }
 
         if !rendered.is_empty() {
@@ -312,6 +323,71 @@ mod whisper_integration_tests {
             .expect("transcription should succeed");
         println!("transcribed: {text:?}");
     }
+
+    /// AC-35 (PRD AC-21, issue #200): the real, whisper-gated half of "a
+    /// dictionary term absent from a fixture WAV's default transcription is
+    /// correctly recognized once added to the dictionary and injected into
+    /// Whisper's `initial_prompt`". `#[ignore]`d for the same reason as
+    /// `transcribes_a_real_model` above — no model file (or, here, no
+    /// speech fixture) is available in CI — the always-on,
+    /// never-`#[ignore]`d dictionary-PLUMBING assertion (does the term
+    /// actually reach `TranscribeOpts`/`initial_prompt`) lives in
+    /// `lib.rs::dictionary_wiring_tests`, which needs neither a model nor a
+    /// WAV file to run.
+    ///
+    /// `BLA_TEST_DICTIONARY_FIXTURE_WAV` should point at a synthetic
+    /// (TTS-generated, per ADR-0007 — never a real recording) 16 kHz mono
+    /// WAV containing speech of a term the base model is known to
+    /// mis-transcribe without help (an uncommon proper noun/acronym is a
+    /// good choice), e.g.:
+    ///
+    /// ```sh
+    /// BLA_TEST_WHISPER_MODEL=/path/to/ggml-model.bin \
+    /// BLA_TEST_DICTIONARY_FIXTURE_WAV=/path/to/fixture.wav \
+    /// BLA_TEST_DICTIONARY_TERM=Kubernetes \
+    ///   cargo test --features whisper -- --ignored dictionary_term_improves_recognition_on_a_real_model
+    /// ```
+    #[test]
+    #[ignore = "requires a downloaded whisper.cpp model file and a speech fixture WAV; not available in CI"]
+    fn dictionary_term_improves_recognition_on_a_real_model() {
+        let model_path = std::env::var("BLA_TEST_WHISPER_MODEL")
+            .expect("set BLA_TEST_WHISPER_MODEL to a whisper.cpp model file path");
+        let fixture_path = std::env::var("BLA_TEST_DICTIONARY_FIXTURE_WAV")
+            .expect("set BLA_TEST_DICTIONARY_FIXTURE_WAV to a synthetic speech fixture WAV path");
+        let term = std::env::var("BLA_TEST_DICTIONARY_TERM")
+            .expect("set BLA_TEST_DICTIONARY_TERM to the term the fixture speaks");
+
+        let mut reader = hound::WavReader::open(&fixture_path).expect("fixture WAV should open");
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("sample should decode") as f32 / i16::MAX as f32)
+            .collect();
+
+        let stt = WhisperStt::new(&model_path).expect("model should load");
+
+        let without_dictionary = stt
+            .transcribe(&samples, &TranscribeOpts::default())
+            .expect("transcription without a dictionary should succeed");
+        let with_dictionary = stt
+            .transcribe(
+                &samples,
+                &TranscribeOpts {
+                    dictionary: vec![term.clone()],
+                },
+            )
+            .expect("transcription with a dictionary should succeed");
+
+        assert!(
+            !without_dictionary.contains(&term),
+            "test fixture setup: the default transcription already contains {term:?} \
+             ({without_dictionary:?}) — pick a fixture/term the base model actually mis-transcribes"
+        );
+        assert!(
+            with_dictionary.contains(&term),
+            "AC-35: injecting {term:?} into the dictionary should recover it in the \
+             transcription, got {with_dictionary:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +474,67 @@ mod tests {
             assert_eq!(part.len(), 100);
         }
         assert!(!prompt.is_empty());
+    }
+
+    // -------------------------------------------------------------
+    // Issue #69 (Sentinel, sentinel-pr64-9ced7e6 finding 1): a NUL byte in a
+    // dictionary term survives to `CString::new` inside whisper-rs's
+    // `set_initial_prompt` and panics there — Rust `String`s can contain
+    // interior NULs (they aren't C strings), so `build_initial_prompt` must
+    // strip them before any term reaches that call.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn nul_bytes_inside_a_term_are_stripped_rather_than_reaching_the_rendered_prompt_issue_69() {
+        assert_eq!(
+            build_initial_prompt(&terms(&["foo\0bar"])),
+            "foobar",
+            "a NUL byte must be stripped, not passed through to a value \
+             whisper-rs's CString::new would reject/panic on"
+        );
+    }
+
+    #[test]
+    fn a_term_consisting_only_of_nul_bytes_is_dropped_like_a_blank_term_issue_69() {
+        assert_eq!(
+            build_initial_prompt(&terms(&["\0\0\0", "kubectl"])),
+            "kubectl"
+        );
+    }
+
+    #[test]
+    fn nul_bytes_do_not_survive_alongside_other_escaping_rules_issue_69() {
+        assert_eq!(
+            build_initial_prompt(&terms(&["Ac\0me, Inc."])),
+            "Acme\\, Inc."
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #70 (Sentinel, sentinel-pr64-9ced7e6 finding 2): once one term
+    // overflowed the length cap, `build_initial_prompt` used to `break` out
+    // of the loop entirely, silently dropping every subsequent term
+    // regardless of whether it would have fit — an order-dependent loss the
+    // caller can't predict. It must instead skip the oversized term and
+    // keep trying to pack whatever still fits.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn an_oversized_term_is_skipped_rather_than_dropping_every_later_term_issue_70() {
+        let oversized = "x".repeat(INITIAL_PROMPT_MAX_CHARS + 1);
+        let prompt = build_initial_prompt(&terms(&[&oversized, "kubectl"]));
+        assert_eq!(
+            prompt, "kubectl",
+            "a later term that fits must survive an earlier oversized term, \
+             not be silently dropped by a `break`"
+        );
+    }
+
+    #[test]
+    fn multiple_terms_still_pack_around_a_mid_list_oversized_term_issue_70() {
+        let oversized = "x".repeat(INITIAL_PROMPT_MAX_CHARS + 1);
+        let prompt = build_initial_prompt(&terms(&["alpha", &oversized, "beta", "gamma"]));
+        assert_eq!(prompt, "alpha, beta, gamma");
     }
 
     #[test]
