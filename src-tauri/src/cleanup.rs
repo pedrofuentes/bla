@@ -543,11 +543,16 @@ pub struct OllamaCleanup<T: OllamaTransport> {
     base_url: String,
     model: String,
     transport: T,
+    /// Personal-dictionary terms (issue #200, PRD AC-21) rendered into the
+    /// system prompt via [`render_cleanup_prompt_v2`]. Empty by default
+    /// (see [`Self::new`]) — attach terms with [`Self::with_dictionary`].
+    dictionary: Vec<String>,
 }
 
 impl<T: OllamaTransport> OllamaCleanup<T> {
     /// Builds an `OllamaCleanup` against `base_url` (no trailing slash
-    /// required — it's trimmed) using `model` and the given transport.
+    /// required — it's trimmed) using `model` and the given transport, with
+    /// no dictionary terms attached (see [`Self::with_dictionary`]).
     ///
     /// MISSION §5 invariant: `base_url` must resolve to the local machine
     /// (`localhost`/`127.0.0.1`/`[::1]`) — Ollama is the only permitted
@@ -561,6 +566,7 @@ impl<T: OllamaTransport> OllamaCleanup<T> {
             base_url: base_url.into(),
             model: model.into(),
             transport,
+            dictionary: Vec::new(),
         }
     }
 
@@ -569,10 +575,23 @@ impl<T: OllamaTransport> OllamaCleanup<T> {
         Self::new(DEFAULT_OLLAMA_BASE_URL, model, transport)
     }
 
+    /// Attaches personal-dictionary terms (issue #200, PRD AC-21) so every
+    /// subsequent [`Cleanup::clean`] call renders them into
+    /// [`CLEANUP_PROMPT_V2`]'s `{{DICTIONARY}}` placeholder via
+    /// [`render_cleanup_prompt_v2`]. Builder-style so existing call sites
+    /// that construct an `OllamaCleanup` without dictionary terms to pass
+    /// keep compiling unchanged (they get the empty-dictionary rendering,
+    /// which is still a complete, valid rewrite-only prompt).
+    pub fn with_dictionary(mut self, dictionary: Vec<String>) -> Self {
+        self.dictionary = dictionary;
+        self
+    }
+
     fn clean_via_ollama(&self, raw: &str) -> Result<String, CleanupError> {
+        let system_prompt = render_cleanup_prompt_v2(&self.dictionary);
         let request = GenerateRequest {
             model: &self.model,
-            system: CLEANUP_PROMPT_V1,
+            system: &system_prompt,
             prompt: raw,
             stream: false,
         };
