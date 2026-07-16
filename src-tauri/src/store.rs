@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn opening_an_in_memory_store_runs_every_migration_and_sets_user_version_to_the_latest() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     // -------------------------------------------------------------
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn fresh_db_migration_ledger_records_every_migration_exactly_once_issue_163() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2]);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -491,18 +491,18 @@ mod tests {
         let store = Store::open(&path)
             .expect("second open must not reapply migrations (would violate schema_migrations' PRIMARY KEY if the guard were broken)");
 
-        assert_eq!(store.schema_version().unwrap(), 2);
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2]);
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
-    fn upgrading_a_pre_existing_v1_db_applies_only_migration_2_issue_163() {
+    fn upgrading_a_pre_existing_v1_db_applies_only_migration_2_and_3_issue_163() {
         // Simulates a real-world upgrade: a DB created by code that only
         // knew about migration 1 (no `schema_migrations` ledger existed
         // yet) is then opened by the current code. Migration 1 must NOT be
         // re-applied (and isn't retroactively recorded in the ledger —
         // only migrations that actually ran through this runner are); only
-        // migration 2 (dictionary) should apply.
+        // migrations 2 (dictionary) and 3 (tone_rules) should apply.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.sqlite3");
         {
@@ -512,12 +512,196 @@ mod tests {
         }
 
         let store = Store::open(&path).expect("upgrade open should succeed");
-        assert_eq!(store.schema_version().unwrap(), 2);
-        assert_eq!(store.applied_migration_versions().unwrap(), vec![2]);
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![2, 3]);
 
         // Migration 2's table is now actually usable.
         let id = store.add_term("Kubernetes", 1_000).unwrap();
         assert!(id > 0);
+        // Migration 3's table is now actually usable too.
+        let rule_id = store
+            .upsert_tone_rule("Notes", ToneProfile::Casual, 1_000)
+            .unwrap();
+        assert!(rule_id > 0);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #202 (PRD AC-22, M3 per-app tone): migration 3 — `tone_rules`.
+    // Mirrors #163's discriminating pattern for this new migration.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn upgrading_a_pre_existing_v2_db_applies_only_migration_3_issue_202() {
+        // A DB already migrated to v2 by code that predates tone_rules
+        // (issue #200's own state) must, on the next open, apply ONLY
+        // migration 3 — not re-run 1/2.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite3");
+        {
+            let store = Store::open(&path).expect("v1+v2 open should succeed");
+            assert_eq!(store.schema_version().unwrap(), 3);
+        }
+        // Roll the on-disk DB back to pretend it only ever reached v2: undo
+        // migration 3's ledger row and table, then reset user_version.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE tone_rules;
+                 DELETE FROM schema_migrations WHERE version = 3;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).expect("upgrade open should succeed");
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.applied_migration_versions().unwrap(), vec![1, 2, 3]);
+
+        let rule_id = store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        assert!(rule_id > 0);
+    }
+
+    #[test]
+    fn tone_rules_check_constraint_rejects_a_value_outside_the_three_profiles_ac41() {
+        // AC-41: the CHECK constraint restricts `tone` to exactly
+        // casual/formal/verbatim at the schema level — defense in depth
+        // beneath the Rust `ToneProfile` enum (which can never construct an
+        // invalid value in the first place), proven here via a raw INSERT
+        // that bypasses the typed API entirely.
+        let store = Store::open_in_memory().unwrap();
+        let result = store.raw_execute_for_test(
+            "INSERT INTO tone_rules (app_pattern, tone, created_at_ms) \
+             VALUES ('Bogus App', 'sarcastic', 1000)",
+        );
+        assert!(
+            result.is_err(),
+            "a tone value outside the three profiles must be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn upsert_then_list_tone_rules_round_trips_the_rule_ac41() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        assert!(id > 0);
+
+        let rules = store.list_tone_rules().unwrap();
+        assert_eq!(
+            rules,
+            vec![ToneRule {
+                id,
+                app_pattern: "Slack".to_string(),
+                tone: ToneProfile::Casual,
+                created_at_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn upsert_tone_rule_with_the_same_pattern_updates_the_tone_in_place_ac41() {
+        // "upsert": re-submitting the same app_pattern with a different
+        // tone must UPDATE the existing rule, not add a second row — an
+        // edited rule takes effect on the very next dictation with no
+        // restart required (AC-41).
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        let second_id = store
+            .upsert_tone_rule("Slack", ToneProfile::Formal, 2_000)
+            .unwrap();
+
+        assert_eq!(first_id, second_id, "both calls must resolve to the same row");
+
+        let rules = store.list_tone_rules().unwrap();
+        assert_eq!(rules.len(), 1, "an edit must not add a second row");
+        assert_eq!(rules[0].tone, ToneProfile::Formal, "the new tone must win");
+    }
+
+    #[test]
+    fn upsert_tone_rule_matches_the_pattern_case_insensitively_like_the_dictionary_does() {
+        // Mirrors the dictionary's `UNIQUE COLLATE NOCASE` semantics
+        // (issue #160's schema note, applied here to app_pattern): re-
+        // upserting under a different case must resolve to the same row,
+        // not create a duplicate.
+        let store = Store::open_in_memory().unwrap();
+        let first_id = store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        let second_id = store
+            .upsert_tone_rule("slack", ToneProfile::Formal, 2_000)
+            .unwrap();
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(store.list_tone_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn distinct_app_patterns_are_not_treated_as_duplicates_ac41() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        store
+            .upsert_tone_rule("Mail", ToneProfile::Formal, 2_000)
+            .unwrap();
+
+        assert_eq!(store.list_tone_rules().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_tone_rules_orders_by_insertion_order() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        store
+            .upsert_tone_rule("Mail", ToneProfile::Formal, 2_000)
+            .unwrap();
+        store
+            .upsert_tone_rule("Terminal", ToneProfile::Verbatim, 3_000)
+            .unwrap();
+
+        let patterns: Vec<String> = store
+            .list_tone_rules()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.app_pattern)
+            .collect();
+        assert_eq!(patterns, vec!["Slack", "Mail", "Terminal"]);
+    }
+
+    #[test]
+    fn delete_tone_rule_removes_only_the_targeted_row_ac41() {
+        let store = Store::open_in_memory().unwrap();
+        let keep = store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+        let drop = store
+            .upsert_tone_rule("Mail", ToneProfile::Formal, 2_000)
+            .unwrap();
+
+        store.delete_tone_rule(drop).unwrap();
+
+        let rules = store.list_tone_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, keep);
+    }
+
+    #[test]
+    fn delete_tone_rule_on_a_nonexistent_id_is_a_noop_ac41() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_tone_rule("Slack", ToneProfile::Casual, 1_000)
+            .unwrap();
+
+        store.delete_tone_rule(999_999).unwrap();
+
+        assert_eq!(store.list_tone_rules().unwrap().len(), 1);
     }
 
     // -------------------------------------------------------------
