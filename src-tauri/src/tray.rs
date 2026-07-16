@@ -137,6 +137,32 @@ pub fn should_keep_pill_visible_for_done(previous: &PipelineState) -> bool {
     )
 }
 
+/// Whether a completed dictation's settle should take the visible-for-
+/// notice path (`settle_idle_keeping_pill_for_notice`, [`PILL_NOTICE_DURATION`]
+/// = 5s) rather than the plain "done" path
+/// ([`should_keep_pill_visible_for_done`] +
+/// `settle_idle_keeping_pill_for_done`, [`DONE_PILL_DURATION`] = 1.5s)
+/// (issue #220).
+///
+/// There are now two independent reasons a completed dictation carries an
+/// informational toast that needs the *longer* window to be seen:
+/// AC-4/ADR-0005's Ollama-fallback notice (`cleanup_fell_back`, PR #135),
+/// and issue #220's history-persist-failure notice
+/// (`history_persist_failed` — `Store::insert_history` failed, so this
+/// dictation's row is missing from history even though the text itself
+/// was already pasted/written). Either alone routes through the notice
+/// path; the plain "done" path is reserved for a dictation with **no**
+/// toast to show, where the shorter 1.5s confirmation window is enough.
+/// Pure/total — `run_pipeline_in_background` passes both booleans it
+/// already computed, so this stays unit-testable without constructing an
+/// `AppState` (issue #165's Windows-CI hard rule).
+///
+/// [`PILL_NOTICE_DURATION`]: crate::PILL_NOTICE_DURATION
+/// [`DONE_PILL_DURATION`]: crate::DONE_PILL_DURATION
+pub fn should_settle_with_notice(cleanup_fell_back: bool, history_persist_failed: bool) -> bool {
+    cleanup_fell_back || history_persist_failed
+}
+
 /// Race-safe guard for a delayed pill-hide started by a "keep the pill
 /// visible for a while, then maybe hide it" settle (issue #155; Sentinel 🔴
 /// on PR #137's re-review). `settle_idle_keeping_pill_for_notice` (AC-4
@@ -244,6 +270,18 @@ mod tests {
         // no "done" confirmation is owed.
         assert!(!should_keep_pill_visible_for_done(&PipelineState::Idle));
         assert!(!should_keep_pill_visible_for_done(&PipelineState::Error));
+    }
+
+    #[test]
+    fn should_settle_with_notice_true_when_either_toast_condition_holds_issue_220() {
+        // Neither: no toast to show — plain "done" path.
+        assert!(!should_settle_with_notice(false, false));
+        // Ollama-fallback notice only (PR #135's existing case).
+        assert!(should_settle_with_notice(true, false));
+        // History-persist-failure notice only (issue #220's new case).
+        assert!(should_settle_with_notice(false, true));
+        // Both at once — still the notice path, not double-counted.
+        assert!(should_settle_with_notice(true, true));
     }
 
     #[test]

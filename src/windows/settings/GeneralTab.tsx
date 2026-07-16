@@ -15,6 +15,7 @@ import {
 import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
 import { applySettingsPatch, revertPatchedFields } from "../../lib/settingsPatch";
 import { validatePathTemplate } from "../../lib/pathTemplate";
+import { validateBaseDir } from "../../lib/baseDir";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
 
@@ -112,6 +113,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
  * `..`) shows an inline error instead of ever reaching `set_settings` — not
  * a replacement for the Rust-side guard, which still confines every
  * dictation regardless of what this lets through.
+ *
+ * Issue #210 (Sentinel SNTL-20260715-bla-PR204-86572a1 🟡 on PR #204): the
+ * base-folder field gates persistence the same way, via `validateBaseDir`
+ * (`src/lib/baseDir.ts`) — the opposite property from the template
+ * validator (this field must be *absolute*, not relative).
+ * `output::resolve_base_dir` uses the configured string verbatim (never
+ * expanding `~`, never resolving relative to anything but the process's
+ * CWD at write time), so a relative value here would silently write into
+ * an unexpected — and inconsistent-across-launches — location.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -130,6 +140,7 @@ export function GeneralTab() {
   // committed on blur rather than auto-applying per keystroke. Seeded once
   // from the first loaded `settings` (see `fileFieldsInitializedRef` below).
   const [baseDirDraft, setBaseDirDraft] = useState("");
+  const [baseDirError, setBaseDirError] = useState<string | null>(null);
   const [templateDraft, setTemplateDraft] = useState("");
   const [templateError, setTemplateError] = useState<string | null>(null);
 
@@ -538,10 +549,23 @@ export function GeneralTab() {
 
   // ---- Issue #180: file-mode output picker (base folder + path template) ----
 
+  const handleBaseDirChange = useCallback((value: string) => {
+    setBaseDirDraft(value);
+    const result = validateBaseDir(value);
+    setBaseDirError(result.valid ? null : result.reason);
+  }, []);
+
   const commitBaseDir = useCallback(() => {
     const current = settingsRef.current;
     if (!current) return;
     const value = baseDirDraft.trim();
+    const result = validateBaseDir(value);
+    if (!result.valid) {
+      // Invalid: show the error, and withhold persisting it — mirrors
+      // `commitTemplate`'s withhold-on-invalid behavior (issue #210).
+      setBaseDirError(result.reason);
+      return;
+    }
     if (value === (current.file_base_dir ?? "")) return;
     void applySettingsChange({ file_base_dir: value });
   }, [baseDirDraft, applySettingsChange]);
@@ -715,16 +739,28 @@ export function GeneralTab() {
                 type="text"
                 value={baseDirDraft}
                 placeholder="Defaults to bla's app-data folder"
-                onChange={(e) => setBaseDirDraft(e.target.value)}
+                onChange={(e) => handleBaseDirChange(e.target.value)}
                 onBlur={commitBaseDir}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") e.currentTarget.blur();
                 }}
-                className="rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
+                className={`rounded-md border bg-white px-3 py-2 text-sm focus:outline-none dark:bg-neutral-950 ${
+                  baseDirError
+                    ? "border-red-500 focus:border-red-500"
+                    : "border-neutral-300 focus:border-blue-500 dark:border-neutral-700"
+                }`}
               />
               <p className="text-xs text-neutral-500 dark:text-neutral-400">
                 e.g. your Obsidian vault's path. Leave blank to use bla's app-data folder.
               </p>
+              {baseDirError && (
+                <p
+                  data-testid="file-base-dir-error"
+                  className="text-xs text-red-600 dark:text-red-400"
+                >
+                  {baseDirError}
+                </p>
+              )}
             </div>
 
             <div className="flex flex-col gap-1">

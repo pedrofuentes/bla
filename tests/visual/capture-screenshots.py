@@ -69,6 +69,19 @@ def capture(base_url: str) -> None:
                 path=str(OUT_DIR / f"settings-output-invalid-template-{scheme}.png"),
             )
 
+            # ---- invalid-base-dir error state: type a relative path, blur ----
+            # (issue #210 — mirrors the invalid-template capture above.)
+            page.goto(f"{base_url}/tests/visual/settings-harness.html?fixture=file-mode")
+            page.wait_for_selector('[data-testid="file-output-fields"]')
+            base_dir_input = page.locator('[data-testid="file-base-dir-input"]')
+            base_dir_input.click()
+            base_dir_input.fill("Obsidian/Vault")
+            page.locator('[data-testid="file-path-template-input"]').click()  # blur the base-dir field
+            page.wait_for_selector('[data-testid="file-base-dir-error"]')
+            page.screenshot(
+                path=str(OUT_DIR / f"settings-output-invalid-base-dir-{scheme}.png"),
+            )
+
             context.close()
 
         browser.close()

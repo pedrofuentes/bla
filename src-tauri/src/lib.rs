@@ -2338,11 +2338,24 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                         // stale UI-visible effects (event emits, pill state,
                         // settle spawns — see the comment on that check just
                         // below), not to decide whether a dictation
-                        // "happened". Best-effort: a failure to persist is
-                        // logged (no transcript content — see `store.rs`'s
-                        // no-log invariant) but must never fail/hide the
-                        // completion the user already saw pasted.
-                        {
+                        // "happened".
+                        //
+                        // Issue #220 (Sentinel SNTL-20260715-bla-PR218-cc04f8b
+                        // 🟡): a failure here is still ALWAYS logged
+                        // (`eprintln!`, no transcript content — see
+                        // `store.rs`'s no-log invariant) and must never
+                        // fail/hide the completion the user already saw
+                        // pasted — but it's also captured in
+                        // `history_persist_failed` so it CAN be surfaced as
+                        // a toast below, once the generation gate has run.
+                        // The insert itself stays unconditional (never
+                        // skipped for a stale generation, matching the row
+                        // itself never being dropped for one); only the
+                        // *toast* is gated, same as every other UI-visible
+                        // effect this function emits — a stale generation's
+                        // toast would otherwise render over whatever a
+                        // newer, already-live dictation's pill is showing.
+                        let history_persist_failed = {
                             let app_state = app.state::<AppState>();
                             let store = app_state.store.lock().unwrap();
                             // Issue #202: `active_app_name` is the same
@@ -2351,12 +2364,14 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                             // through to the history row too (app NAME
                             // only, never a window title — AC-43).
                             let app_name = active_app_name.as_ref().map(|a| a.0.as_str());
-                            if let Err(err) =
-                                record_history_entry(&store, now_ms(), &outcome, app_name)
-                            {
-                                eprintln!("bla: failed to persist history entry: {err}");
+                            match record_history_entry(&store, now_ms(), &outcome, app_name) {
+                                Ok(_) => false,
+                                Err(err) => {
+                                    eprintln!("bla: failed to persist history entry: {err}");
+                                    true
+                                }
                             }
-                        }
+                        };
                         // Issues #174/#175/#176: this completion belongs to
                         // `generation` — check it's still the live dictation
                         // BEFORE touching any shared state (including
@@ -2370,6 +2385,14 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                         if !generation_is_live(&app, generation) {
                             return;
                         }
+                        // Issue #220: surfaced here (post-gate) rather than
+                        // inside the block above, alongside the Ollama
+                        // fallback notice just below — same reasoning:
+                        // informational, emitted alongside a successful
+                        // completion, never in place of one.
+                        if history_persist_failed {
+                            emit_pipeline_error(&app, &errors::ErrorKind::HistoryPersistFailed);
+                        }
                         // Issue #126 (M2 PR 2.4), AC-4/ADR-0005: the Ollama
                         // fallback is informational, not a failure — the
                         // dictation already completed and pasted/wrote
@@ -2377,6 +2400,16 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                         // transition, never in place of it.
                         if outcome.cleanup_fell_back {
                             emit_pipeline_error(&app, &errors::ErrorKind::OllamaUnreachable);
+                        }
+                        // Issue #220: either informational toast above needs
+                        // the longer notice-visible window to actually be
+                        // seen — `should_settle_with_notice` is the shared
+                        // pure decision (previously just `cleanup_fell_back`
+                        // alone).
+                        if tray::should_settle_with_notice(
+                            outcome.cleanup_fell_back,
+                            history_persist_failed,
+                        ) {
                             // Sentinel 🔴-2 (PR #135): a plain Idle transition
                             // would hide the pill immediately, leaving this
                             // informational toast on a hidden window. Keep the

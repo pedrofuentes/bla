@@ -18,10 +18,13 @@
 //! **Semantics** (issue #126 kickoff): [`ErrorKind::OllamaUnreachable`] is
 //! informational — the AC-4/ADR-0005 `RegexCleanup` fallback still pastes,
 //! so this kind is emitted *alongside* a successful pipeline outcome, never
-//! in place of one. [`ErrorKind::ModelMissing`] and
-//! [`ErrorKind::MicPermissionDenied`] are blocking: the pipeline could not
-//! run this dictation at all. [`ErrorKind::is_blocking`] captures that
-//! distinction for callers (the toast UI, `lib.rs`'s emit sites).
+//! in place of one. [`ErrorKind::HistoryPersistFailed`] (issue #220) is
+//! likewise informational — the dictation already pasted/wrote
+//! successfully; only the secondary `Store::insert_history` write failed.
+//! [`ErrorKind::ModelMissing`] and [`ErrorKind::MicPermissionDenied`] are
+//! blocking: the pipeline could not run this dictation at all.
+//! [`ErrorKind::is_blocking`] captures that distinction for callers (the
+//! toast UI, `lib.rs`'s emit sites).
 
 use serde::Serialize;
 
@@ -46,6 +49,16 @@ pub enum ErrorKind {
     /// (`audio::CaptureError`) — most commonly OS mic-permission denial.
     /// Blocking.
     MicPermissionDenied,
+    /// A completed dictation's history row failed to persist
+    /// (`Store::insert_history`, issue #220) — the dictation itself already
+    /// succeeded (pasted/written) by the time this can fire, so this is
+    /// informational, not a pipeline failure. Carries no data from the
+    /// underlying `rusqlite::Error` (HARD RULE, module doc) — not even a
+    /// sanitized code: every other zero-payload kind here (this one
+    /// included) already conveys everything the user needs to know via its
+    /// fixed `message`, and a SQLite error code is not itself user content
+    /// but still isn't worth a second wire field for a toast this generic.
+    HistoryPersistFailed,
     /// Anything else. `message` is always a fixed, kind-derived string (see
     /// the module doc HARD RULE) — never the wrapped error's own text.
     Other { message: String },
@@ -54,9 +67,14 @@ pub enum ErrorKind {
 impl ErrorKind {
     /// True for kinds that mean the pipeline could not run this dictation at
     /// all, as opposed to [`ErrorKind::OllamaUnreachable`] (purely
-    /// informational — the AC-4 fallback still pastes).
+    /// informational — the AC-4 fallback still pastes) or
+    /// [`ErrorKind::HistoryPersistFailed`] (also purely informational —
+    /// issue #220's dictation-succeeded-but-history-row-lost case).
     pub fn is_blocking(&self) -> bool {
-        !matches!(self, ErrorKind::OllamaUnreachable)
+        !matches!(
+            self,
+            ErrorKind::OllamaUnreachable | ErrorKind::HistoryPersistFailed
+        )
     }
 
     /// The static, kind-derived message safe to show the user / emit over
@@ -72,6 +90,9 @@ impl ErrorKind {
             ErrorKind::MicPermissionDenied => {
                 "Microphone access is unavailable or was denied.".to_string()
             }
+            ErrorKind::HistoryPersistFailed => {
+                "Couldn't save this dictation to history.".to_string()
+            }
             ErrorKind::Other { message } => message.clone(),
         }
     }
@@ -83,6 +104,7 @@ impl ErrorKind {
             ErrorKind::ModelMissing => "ModelMissing",
             ErrorKind::OllamaUnreachable => "OllamaUnreachable",
             ErrorKind::MicPermissionDenied => "MicPermissionDenied",
+            ErrorKind::HistoryPersistFailed => "HistoryPersistFailed",
             ErrorKind::Other { .. } => "Other",
         }
     }
@@ -184,6 +206,27 @@ mod tests {
     #[test]
     fn ollama_unreachable_is_informational_not_blocking() {
         assert!(!ErrorKind::OllamaUnreachable.is_blocking());
+    }
+
+    // -------------------------------------------------------------
+    // Issue #220 (Sentinel SNTL-20260715-bla-PR218-cc04f8b 🟡): a completed
+    // dictation's history-row persist failure is informational — the
+    // dictation itself already succeeded (pasted/written) by the time
+    // `Store::insert_history` runs, so this is a heads-up about a
+    // secondary, non-fatal loss (the history row), not a failure of the
+    // pipeline run.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn history_persist_failed_is_informational_not_blocking() {
+        assert!(!ErrorKind::HistoryPersistFailed.is_blocking());
+    }
+
+    #[test]
+    fn history_persist_failed_carries_a_static_kind_and_message() {
+        let event = PipelineErrorEvent::from(&ErrorKind::HistoryPersistFailed);
+        assert_eq!(event.kind, "HistoryPersistFailed");
+        assert!(!event.message.is_empty());
     }
 
     #[test]
