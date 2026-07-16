@@ -33,15 +33,50 @@ use std::time::Duration;
 
 /// Controls how aggressively a [`Cleanup`] implementation rewrites the raw
 /// transcript.
+///
+/// Issue #202 (PRD AC-22, M3 per-app tone): `Casual`/`Formal` are new flat
+/// variants alongside the pre-existing `Neutral`/`Verbatim` pair — the
+/// chosen representation over a parallel "style" dimension bolted onto a
+/// separate field. Rationale (recorded here since the type shape *is* the
+/// design decision):
+///
+/// - Every [`Cleanup`] implementation already dispatches on `Tone` via one
+///   exhaustive `match` (see [`RegexCleanup::clean`] /
+///   [`OllamaCleanup::clean`]); a flat enum keeps that pattern exactly as
+///   it is, just with two more arms the compiler forces every existing and
+///   future implementation to handle.
+/// - `Verbatim`'s bypass semantics are already "a `Tone` value that changes
+///   *which code path* runs, not a parameter fed to one shared path" — a
+///   parallel dimension (e.g. `struct ToneProfile { style: Style, bypass:
+///   bool }`) would have to reconstruct that same bypass-vs-not split
+///   internally anyway, for no reduction in cases handled.
+/// - Persistence (`store::ToneProfile`, migration 3) only ever needs to
+///   store one of `casual`/`formal`/`verbatim` (never `neutral`, which is
+///   the *absence* of a matching rule) — a flat `Tone` enum on the cleanup
+///   side and a separate, intentionally narrower `store::ToneProfile` on
+///   the persistence side map cleanly onto each other
+///   (`context::tone_profile_to_tone`) without forcing either module to
+///   know about a value it should never be able to represent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     /// Default cleanup pass: filler removal, spacing, capitalization,
     /// sentence-final punctuation (and, for LLM-backed implementations,
-    /// self-correction resolution — see ADR-0005).
+    /// self-correction resolution — see ADR-0005). Also the tone dispatched
+    /// when no `tone_rules` entry matches the active app (issue #202) — it
+    /// is deliberately never a value stored in `tone_rules` itself.
     Neutral,
     /// Bypasses cleanup entirely: the raw transcript is returned essentially
-    /// untouched. Reserved for the M3 verbatim tone profile (PRD AC-22).
+    /// untouched. The M3 verbatim tone profile (PRD AC-22).
     Verbatim,
+    /// Casual, conversational rewrite style (issue #202, PRD AC-22).
+    /// `RegexCleanup` has no style-adaptive logic of its own (a
+    /// deterministic, non-LLM baseline) and applies the same transform as
+    /// `Neutral`; `OllamaCleanup` selects a tone-specific instruction in its
+    /// rendered prompt (see [`render_cleanup_prompt_v3`]).
+    Casual,
+    /// Formal, professional rewrite style (issue #202, PRD AC-22). Same
+    /// `RegexCleanup`/`OllamaCleanup` split as [`Self::Casual`].
+    Formal,
 }
 
 /// Errors a [`Cleanup`] implementation may return.
@@ -118,7 +153,11 @@ impl Cleanup for RegexCleanup {
     fn clean(&self, raw: &str, tone: Tone) -> Result<String, CleanupError> {
         match tone {
             Tone::Verbatim => Ok(raw.to_string()),
-            Tone::Neutral => Ok(clean_text(raw)),
+            // Issue #202: RegexCleanup has no style-adaptive logic (it's a
+            // deterministic, non-LLM baseline) — Casual/Formal get the same
+            // transform as Neutral. Real tone differentiation is
+            // OllamaCleanup's job (see render_cleanup_prompt_v3).
+            Tone::Neutral | Tone::Casual | Tone::Formal => Ok(clean_text(raw)),
         }
     }
 }
@@ -322,6 +361,63 @@ pub fn render_cleanup_prompt_v2(dictionary: &[String]) -> String {
         CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER,
         &dictionary_sentence,
     )
+}
+
+/// The M3 per-app-tone-aware cleanup prompt (issue #202, PRD AC-22).
+/// Supersedes `CLEANUP_PROMPT_V2` as `OllamaCleanup`'s live system prompt
+/// (see [`OllamaCleanup::clean`]) — per the same "add a new file, never
+/// edit the old one in place" convention as `CLEANUP_PROMPT_V2`'s own doc
+/// comment, `cleanup_v2.txt` (and `cleanup_v1.txt`) stay on disk untouched,
+/// still protected by their own regression tests even though production no
+/// longer sends them. Contains both the `{{DICTIONARY}}` placeholder
+/// (unchanged from v2) and a new `{{TONE}}` placeholder — see
+/// [`render_cleanup_prompt_v3`] for the substitution.
+pub const CLEANUP_PROMPT_V3: &str = include_str!("../prompts/cleanup_v3.txt");
+
+/// The `{{TONE}}` placeholder inside [`CLEANUP_PROMPT_V3`], substituted at
+/// call time by [`render_cleanup_prompt_v3`] with a tone-specific
+/// writing-style instruction (or cleanly removed under [`Tone::Neutral`]).
+const CLEANUP_PROMPT_V3_TONE_PLACEHOLDER: &str = "{{TONE}}";
+
+/// Renders [`CLEANUP_PROMPT_V3`] with `dictionary`'s current terms
+/// substituted into `{{DICTIONARY}}` (identical rendering to
+/// [`render_cleanup_prompt_v2`]) and a `tone`-specific writing-style
+/// instruction substituted into `{{TONE}}` (issue #202, PRD AC-22).
+///
+/// `Tone::Neutral` substitutes an empty string — no extra instruction, so
+/// the rendered prompt reads exactly as it did before this tone dispatch
+/// existed. `Tone::Verbatim` also substitutes an empty string: in
+/// production this function is never actually called for `Verbatim`
+/// (`OllamaCleanup::clean` bypasses the transport — and this render call —
+/// entirely for that tone, mirroring `RegexCleanup`), but the function
+/// itself stays total (pure, no panics) rather than relying on callers to
+/// never pass it, so it's safe to call directly in a test.
+pub fn render_cleanup_prompt_v3(dictionary: &[String], tone: Tone) -> String {
+    let terms = crate::stt::build_initial_prompt(dictionary);
+    let dictionary_sentence = if terms.is_empty() {
+        "The user's dictionary is currently empty.".to_string()
+    } else {
+        format!("The user's current dictionary terms: {terms}.")
+    };
+    let tone_sentence = match tone {
+        Tone::Neutral | Tone::Verbatim => String::new(),
+        Tone::Casual => {
+            "The requested tone for this rewrite is casual: write in a relaxed, conversational \
+             style — contractions and informal phrasing are fine."
+                .to_string()
+        }
+        Tone::Formal => {
+            "The requested tone for this rewrite is formal: write in a polished, professional \
+             style — avoid contractions and casual phrasing."
+                .to_string()
+        }
+    };
+    CLEANUP_PROMPT_V3
+        .replace(CLEANUP_PROMPT_V3_TONE_PLACEHOLDER, &tone_sentence)
+        .replace(
+            CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER,
+            &dictionary_sentence,
+        )
 }
 
 /// Errors an [`OllamaTransport`] may return. `OllamaCleanup::clean` maps
@@ -587,8 +683,8 @@ impl<T: OllamaTransport> OllamaCleanup<T> {
         self
     }
 
-    fn clean_via_ollama(&self, raw: &str) -> Result<String, CleanupError> {
-        let system_prompt = render_cleanup_prompt_v2(&self.dictionary);
+    fn clean_via_ollama(&self, raw: &str, tone: Tone) -> Result<String, CleanupError> {
+        let system_prompt = render_cleanup_prompt_v3(&self.dictionary, tone);
         let request = GenerateRequest {
             model: &self.model,
             system: &system_prompt,
@@ -614,7 +710,7 @@ impl<T: OllamaTransport> Cleanup for OllamaCleanup<T> {
     fn clean(&self, raw: &str, tone: Tone) -> Result<String, CleanupError> {
         match tone {
             Tone::Verbatim => Ok(raw.to_string()),
-            Tone::Neutral => self.clean_via_ollama(raw),
+            Tone::Neutral | Tone::Casual | Tone::Formal => self.clean_via_ollama(raw, tone),
         }
     }
 }
@@ -756,13 +852,40 @@ mod tests {
         assert_no_real_network_transport::<StubTransport>();
     }
 
+    // -------------------------------------------------------------
+    // Issue #202 (PRD AC-22, M3 per-app tone): `Tone::Casual`/`Tone::Formal`
+    // are new flat variants alongside `Neutral`/`Verbatim` — the deliberate
+    // design choice (documented on `Tone` itself and in this PR's body) over
+    // a parallel "style" dimension, since it keeps every `Cleanup`
+    // implementation's dispatch as a single exhaustive match on one enum,
+    // exactly like `Verbatim` already works. `RegexCleanup` has no
+    // style-adaptive logic of its own (it's a deterministic, non-LLM
+    // baseline) — under `Casual`/`Formal` it applies the exact same
+    // transform as `Neutral`. Real style differentiation is
+    // `OllamaCleanup`'s job (see `ollama_tests` below, `cleanup_v3.txt`'s
+    // `{{TONE}}` placeholder).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn regex_cleanup_casual_and_formal_tones_use_the_same_transform_as_neutral_issue_202() {
+        let cleanup = RegexCleanup;
+        for (description, raw, expected) in CASES {
+            for tone in [Tone::Casual, Tone::Formal] {
+                let got = cleanup
+                    .clean(raw, tone)
+                    .unwrap_or_else(|e| panic!("{description} ({tone:?}): Err({e:?})"));
+                assert_eq!(&got, expected, "case failed: {description} ({tone:?})");
+            }
+        }
+    }
+
     #[test]
     fn regex_cleanup_never_returns_unreachable() {
         // RegexCleanup is the always-available baseline (ADR-0005) — it must
         // never surface the Unreachable variant reserved for the future
         // Ollama-backed implementation (issue #20).
         let cleanup = RegexCleanup;
-        for tone in [Tone::Neutral, Tone::Verbatim] {
+        for tone in [Tone::Neutral, Tone::Verbatim, Tone::Casual, Tone::Formal] {
             assert!(!matches!(
                 cleanup.clean("um, test", tone),
                 Err(CleanupError::Unreachable)
@@ -890,6 +1013,24 @@ mod ollama_tests {
     }
 
     #[test]
+    fn ollama_cleanup_casual_and_formal_tones_reach_the_transport_unlike_verbatim_issue_202() {
+        // Issue #202: unlike Verbatim, Casual/Formal are LLM-rewritten tones
+        // (they select a tone-specific instruction in the rendered prompt —
+        // see the render_cleanup_prompt_v3 tests below) — the transport MUST
+        // be reached for both, in contrast with the Verbatim bypass proven
+        // just above.
+        for tone in [Tone::Casual, Tone::Formal] {
+            let stub = StubTransport::succeeding("Hello world.");
+            let cleanup = cleanup_with(stub);
+            cleanup.clean("hello world", tone).unwrap();
+            assert!(
+                cleanup.transport.captured.borrow().is_some(),
+                "{tone:?} must reach the transport, unlike Verbatim"
+            );
+        }
+    }
+
+    #[test]
     fn ollama_cleanup_targets_the_configured_base_url() {
         let stub = StubTransport::succeeding("Hello world.");
         let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", stub);
@@ -963,12 +1104,14 @@ mod ollama_tests {
         // if the two were swapped (prompt: PROMPT, system: raw), which is a
         // real request-construction regression — this test must catch it.
         //
-        // Issue #200: `OllamaCleanup` now sends `CLEANUP_PROMPT_V2`
-        // (rendered via `render_cleanup_prompt_v2`, empty dictionary here
-        // since `cleanup_with` doesn't attach one) as its system prompt —
-        // `CLEANUP_PROMPT_V2` supersedes `CLEANUP_PROMPT_V1` as the live
-        // prompt sent upstream, per the "add a new file, don't edit the old
-        // one" convention (see `CLEANUP_PROMPT_V2`'s doc comment).
+        // Issue #202: `OllamaCleanup` now sends `CLEANUP_PROMPT_V3` (rendered
+        // via `render_cleanup_prompt_v3`, empty dictionary + `Tone::Neutral`
+        // here since `cleanup_with` doesn't attach a dictionary and this
+        // call uses the neutral tone) as its system prompt — `CLEANUP_PROMPT_V3`
+        // supersedes `CLEANUP_PROMPT_V2` as the live prompt sent upstream,
+        // per the "add a new file, don't edit the old one" convention (see
+        // `CLEANUP_PROMPT_V3`'s doc comment). `CLEANUP_PROMPT_V2` stays on
+        // disk untouched, still protected by its own regression tests below.
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub);
         cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
@@ -979,7 +1122,7 @@ mod ollama_tests {
 
         assert_eq!(
             parsed["system"],
-            render_cleanup_prompt_v2(&[]),
+            render_cleanup_prompt_v3(&[], Tone::Neutral),
             "the `system` field must carry the rewrite-only prompt, not the transcript"
         );
         assert_eq!(
@@ -1172,7 +1315,7 @@ mod ollama_tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn with_dictionary_makes_the_request_carry_the_rendered_v2_prompt_for_those_terms() {
+    fn with_dictionary_makes_the_request_carry_the_rendered_v3_prompt_for_those_terms() {
         let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub).with_dictionary(dictionary.clone());
@@ -1184,12 +1327,12 @@ mod ollama_tests {
 
         assert_eq!(
             parsed["system"],
-            render_cleanup_prompt_v2(&dictionary),
+            render_cleanup_prompt_v3(&dictionary, Tone::Neutral),
             "the system prompt must carry the attached dictionary's terms"
         );
         assert_ne!(
             parsed["system"],
-            render_cleanup_prompt_v2(&[]),
+            render_cleanup_prompt_v3(&[], Tone::Neutral),
             "a non-empty dictionary must change the rendered prompt"
         );
     }
@@ -1198,7 +1341,7 @@ mod ollama_tests {
     fn without_with_dictionary_the_request_uses_an_empty_dictionary_rendering() {
         // A call site that never attaches a dictionary (e.g. not yet
         // updated) keeps working exactly as before #200 wired dictionary
-        // terms in: an empty-dictionary rendering of CLEANUP_PROMPT_V2.
+        // terms in: an empty-dictionary rendering of CLEANUP_PROMPT_V3.
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub);
         cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
@@ -1206,6 +1349,142 @@ mod ollama_tests {
         let (_, body) = cleanup.transport.captured_request();
         let parsed: serde_json::Value =
             serde_json::from_str(&body).expect("request body must be valid JSON");
-        assert_eq!(parsed["system"], render_cleanup_prompt_v2(&[]));
+        assert_eq!(
+            parsed["system"],
+            render_cleanup_prompt_v3(&[], Tone::Neutral)
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #202 (PRD AC-22, M3 per-app tone): CLEANUP_PROMPT_V3 — a new,
+    // versioned, rewrite-only prompt file carrying both the `{{DICTIONARY}}`
+    // placeholder (unchanged from v2) and a new `{{TONE}}` placeholder,
+    // substituted with a tone-specific writing-style instruction (or
+    // cleanly removed for `Tone::Neutral`) at call time. `CLEANUP_PROMPT_V2`
+    // stays untouched (MISSION §7: a prompt bump adds a new file, never
+    // edits the old one in place) — its own regression tests above keep
+    // protecting it even though production no longer sends it.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cleanup_prompt_v3_is_a_distinct_file_from_v1_and_v2() {
+        assert_ne!(
+            CLEANUP_PROMPT_V3, CLEANUP_PROMPT_V1,
+            "cleanup_v3.txt must be its own file, not a copy-paste of cleanup_v1.txt"
+        );
+        assert_ne!(
+            CLEANUP_PROMPT_V3, CLEANUP_PROMPT_V2,
+            "cleanup_v3.txt must be its own file, not a copy-paste of cleanup_v2.txt"
+        );
+    }
+
+    #[test]
+    fn ac_v3_prompt_file_contains_the_rewrite_only_constraints() {
+        // Mirrors ac10_prompt_file_contains_the_rewrite_only_constraints /
+        // ac36_prompt_file_contains_the_rewrite_only_constraints above for
+        // CLEANUP_PROMPT_V3: cleanup_v3 must satisfy every rewrite-only
+        // constraint v1/v2 do.
+        let prompt = CLEANUP_PROMPT_V3.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "filler",
+            "self-correction",
+            "punctuation",
+            "bullet",
+            "tone",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "cleanup_v3 prompt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_prompt_v3_contains_the_dictionary_and_tone_placeholders() {
+        assert!(CLEANUP_PROMPT_V3.contains("{{DICTIONARY}}"));
+        assert!(CLEANUP_PROMPT_V3.contains("{{TONE}}"));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v3_still_substitutes_the_dictionary_placeholder() {
+        // AC-36(a)'s guarantee carries forward unchanged into v3.
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let rendered = render_cleanup_prompt_v3(&dictionary, Tone::Neutral);
+
+        assert!(!rendered.contains("{{DICTIONARY}}"));
+        assert!(rendered.contains(&crate::stt::build_initial_prompt(&dictionary)));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v3_always_substitutes_the_tone_placeholder() {
+        for tone in [Tone::Neutral, Tone::Casual, Tone::Formal, Tone::Verbatim] {
+            let rendered = render_cleanup_prompt_v3(&[], tone);
+            assert!(
+                !rendered.contains("{{TONE}}"),
+                "{tone:?}: the tone placeholder must always be substituted"
+            );
+            assert!(!rendered.contains("{{"));
+            assert!(!rendered.contains("}}"));
+        }
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v3_casual_and_formal_tones_produce_distinct_style_instructions() {
+        // Issue #202: this is the one place tone actually changes the
+        // rendered prompt text — `Casual` and `Formal` must each add a
+        // concrete, distinct writing-style instruction, and neither must
+        // collide with the other or with the neutral (no extra instruction)
+        // rendering.
+        let neutral = render_cleanup_prompt_v3(&[], Tone::Neutral);
+        let casual = render_cleanup_prompt_v3(&[], Tone::Casual);
+        let formal = render_cleanup_prompt_v3(&[], Tone::Formal);
+
+        assert_ne!(casual, neutral, "casual must add a tone instruction");
+        assert_ne!(formal, neutral, "formal must add a tone instruction");
+        assert_ne!(
+            casual, formal,
+            "casual and formal must differ from each other"
+        );
+
+        assert!(casual.to_lowercase().contains("casual"));
+        assert!(formal.to_lowercase().contains("formal"));
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v3_neutral_tone_adds_no_extra_style_instruction() {
+        // Neutral tone renders v3 exactly like an "empty tone slot" — no
+        // casual/formal wording leaks in, and every rewrite-only constraint
+        // is still present.
+        let rendered = render_cleanup_prompt_v3(&[], Tone::Neutral);
+        let lower = rendered.to_lowercase();
+        assert!(!lower.contains("casual"));
+        assert!(!lower.contains("formal"));
+        for must_contain in ["never answer", "never add"] {
+            assert!(lower.contains(must_contain));
+        }
+    }
+
+    #[test]
+    fn ollama_cleanup_sends_a_distinct_system_prompt_per_tone_issue_202() {
+        // End-to-end (through OllamaCleanup, not just the pure render
+        // function): Casual and Formal must each reach the transport with
+        // their own tone-specific system prompt.
+        for (tone, must_contain) in [(Tone::Casual, "casual"), (Tone::Formal, "formal")] {
+            let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+            let cleanup = cleanup_with(stub);
+            cleanup.clean(FIXTURE_RAW, tone).unwrap();
+
+            let (_, body) = cleanup.transport.captured_request();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("request body must be valid JSON");
+            let system = parsed["system"]
+                .as_str()
+                .expect("system field must be a string");
+
+            assert_eq!(system, render_cleanup_prompt_v3(&[], tone));
+            assert!(system.to_lowercase().contains(must_contain));
+        }
     }
 }

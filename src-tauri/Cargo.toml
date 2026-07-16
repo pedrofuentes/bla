@@ -65,6 +65,13 @@ tauri-plugin-autostart = "2"
 rusqlite = { version = "0.40.1", default-features = false, features = [
   "bundled",
 ] }
+# `context.rs`'s active-app detection (issue #202, MISSION §3: pre-approved
+# stack). Cross-platform (macOS/Windows/Linux) via the crate's own
+# target-specific dependencies — no extra system libraries needed beyond
+# what `whisper-rs`/`enigo`/`tauri` already require on each platform.
+# `context.rs` reads only `ActiveWindow::app_name`, never `.title` (AC-43 —
+# see that module's doc comment for why).
+active-win-pos-rs = "0.11"
 
 [dev-dependencies]
 static_assertions = "1.1.0"
