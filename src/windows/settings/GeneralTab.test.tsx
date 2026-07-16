@@ -1344,6 +1344,132 @@ describe("GeneralTab", () => {
       expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
     });
 
+    it("shows an inline error and withholds persisting a relative base folder", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "Obsidian/Vault");
+      await flush();
+
+      // Mirrors the path-template field's negative assertion (#209): typing
+      // alone (pre-blur) must not commit — this control is blur-commit, not
+      // per-keystroke. The `await flush()` above is load-bearing: without
+      // it, this would pass vacuously regardless of the guard.
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
+      blur(baseDirInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-base-dir-error"]')?.textContent,
+      ).toMatch(/absolute/i);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "set_settings",
+        expect.objectContaining({
+          settings: expect.objectContaining({ file_base_dir: "Obsidian/Vault" }),
+        }),
+      );
+    });
+
+    it("shows an inline error and withholds persisting a tilde-prefixed base folder", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "~/Obsidian/Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="file-base-dir-error"]')?.textContent,
+      ).toMatch(/~/);
+      expect(invoke).not.toHaveBeenCalledWith(
+        "set_settings",
+        expect.objectContaining({
+          settings: expect.objectContaining({ file_base_dir: "~/Obsidian/Vault" }),
+        }),
+      );
+    });
+
+    it("clears the base-folder error and persists once an invalid value is corrected to an absolute path", async () => {
+      setupInvoke({
+        get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      focus(baseDirInput);
+      typeInto(baseDirInput, "Obsidian/Vault");
+      blur(baseDirInput);
+      await flush();
+      expect(
+        mounted.container.querySelector('[data-testid="file-base-dir-error"]'),
+      ).not.toBeNull();
+
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "/Users/cofounder/Obsidian/Vault");
+      blur(baseDirInput);
+      await flush();
+
+      expect(mounted.container.querySelector('[data-testid="file-base-dir-error"]')).toBeNull();
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: {
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "/Users/cofounder/Obsidian/Vault",
+        },
+      });
+    });
+
+    it("does not treat an empty base folder as invalid (falls back to the app-data folder)", async () => {
+      setupInvoke({
+        get_settings: () => ({
+          ...BASE_SETTINGS,
+          output_mode: "File",
+          file_base_dir: "/Users/cofounder/Obsidian/Vault",
+        }),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const baseDirInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="file-base-dir-input"]',
+      )!;
+      invoke.mockClear();
+      focus(baseDirInput);
+      typeInto(baseDirInput, "");
+      blur(baseDirInput);
+      await flush();
+
+      expect(mounted.container.querySelector('[data-testid="file-base-dir-error"]')).toBeNull();
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: { ...BASE_SETTINGS, output_mode: "File", file_base_dir: "" },
+      });
+    });
+
     it("persists a changed, valid path template on blur", async () => {
       setupInvoke({
         get_settings: () => ({ ...BASE_SETTINGS, output_mode: "File" }),
