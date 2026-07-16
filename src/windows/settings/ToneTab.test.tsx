@@ -457,4 +457,51 @@ describe("ToneTab (AC-44: edit a rule's tone)", () => {
     // The stale first response must not clobber the later selection.
     expect(select.value).toBe("verbatim");
   });
+
+  it("does not let a stale REJECT clobber a newer, already-applied edit to the same rule (#238, editGenRef guard)", async () => {
+    // Unlike the resolve/resolve race above (which never reaches the catch
+    // branch at all, since a `.then()` never touches `rules`), this drives
+    // the FIRST (stale) request to REJECT and the SECOND (newer) request to
+    // RESOLVE — exercising the guard at ToneTab.tsx:215, inside `.catch`,
+    // which reverts the row to that request's own captured `previousTone`.
+    const resolvers: Array<{ resolve: (id: number) => void; reject: (err: Error) => void }> = [];
+    setupInvoke({
+      upsert_tone_rule: () =>
+        new Promise<number>((resolve, reject) => {
+          resolvers.push({ resolve, reject });
+        }),
+    });
+
+    mounted = mount(<ToneTab />);
+    await flush();
+
+    const select = mounted.container.querySelector<HTMLSelectElement>(
+      '[data-testid="tone-rule-tone-select-1"]',
+    )!;
+
+    // First edit: formal -> casual (this request will REJECT, and stays
+    // pending until after the second edit's success below).
+    change(select, "casual");
+    await flush();
+    // Second edit fired before the first's response arrives: casual -> verbatim.
+    change(select, "verbatim");
+    await flush();
+
+    expect(resolvers).toHaveLength(2);
+
+    // The newer (second) edit succeeds first — the row settles on "verbatim".
+    resolvers[1].resolve(2);
+    await flush();
+    expect(select.value).toBe("verbatim");
+
+    // The older (first, now-stale) edit's REJECTION arrives late. Without
+    // the per-row generation guard, this `.catch` would revert the row to
+    // its OWN captured `previousTone` ("formal") and show a row-scoped
+    // error — clobbering the newer, already-applied "verbatim" value.
+    resolvers[0].reject(new Error("some raw backend detail"));
+    await flush();
+
+    expect(select.value).toBe("verbatim");
+    expect(mounted.container.querySelector('[data-testid="tone-rule-edit-error-1"]')).toBeNull();
+  });
 });
