@@ -400,6 +400,67 @@ mod tests {
         assert!(!prompt.is_empty());
     }
 
+    // -------------------------------------------------------------
+    // Issue #69 (Sentinel, sentinel-pr64-9ced7e6 finding 1): a NUL byte in a
+    // dictionary term survives to `CString::new` inside whisper-rs's
+    // `set_initial_prompt` and panics there — Rust `String`s can contain
+    // interior NULs (they aren't C strings), so `build_initial_prompt` must
+    // strip them before any term reaches that call.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn nul_bytes_inside_a_term_are_stripped_rather_than_reaching_the_rendered_prompt_issue_69() {
+        assert_eq!(
+            build_initial_prompt(&terms(&["foo\0bar"])),
+            "foobar",
+            "a NUL byte must be stripped, not passed through to a value \
+             whisper-rs's CString::new would reject/panic on"
+        );
+    }
+
+    #[test]
+    fn a_term_consisting_only_of_nul_bytes_is_dropped_like_a_blank_term_issue_69() {
+        assert_eq!(
+            build_initial_prompt(&terms(&["\0\0\0", "kubectl"])),
+            "kubectl"
+        );
+    }
+
+    #[test]
+    fn nul_bytes_do_not_survive_alongside_other_escaping_rules_issue_69() {
+        assert_eq!(
+            build_initial_prompt(&terms(&["Ac\0me, Inc."])),
+            "Acme\\, Inc."
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Issue #70 (Sentinel, sentinel-pr64-9ced7e6 finding 2): once one term
+    // overflowed the length cap, `build_initial_prompt` used to `break` out
+    // of the loop entirely, silently dropping every subsequent term
+    // regardless of whether it would have fit — an order-dependent loss the
+    // caller can't predict. It must instead skip the oversized term and
+    // keep trying to pack whatever still fits.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn an_oversized_term_is_skipped_rather_than_dropping_every_later_term_issue_70() {
+        let oversized = "x".repeat(INITIAL_PROMPT_MAX_CHARS + 1);
+        let prompt = build_initial_prompt(&terms(&[&oversized, "kubectl"]));
+        assert_eq!(
+            prompt, "kubectl",
+            "a later term that fits must survive an earlier oversized term, \
+             not be silently dropped by a `break`"
+        );
+    }
+
+    #[test]
+    fn multiple_terms_still_pack_around_a_mid_list_oversized_term_issue_70() {
+        let oversized = "x".repeat(INITIAL_PROMPT_MAX_CHARS + 1);
+        let prompt = build_initial_prompt(&terms(&["alpha", &oversized, "beta", "gamma"]));
+        assert_eq!(prompt, "alpha, beta, gamma");
+    }
+
     #[test]
     fn transcribe_opts_initial_prompt_delegates_to_build_initial_prompt() {
         let opts = TranscribeOpts {
