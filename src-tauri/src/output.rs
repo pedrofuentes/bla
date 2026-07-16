@@ -39,6 +39,20 @@
 //! `EnigoPaste` are now live. `dead_code` stays allowed at module scope for
 //! any item not yet reached from those call sites (e.g. surface kept for the
 //! M2 settings UI).
+//!
+//! Command-mode selection capture/replace (issue #257, AC-48): `CopySynthesizer`
+//! (real impl `EnigoCopy`) mirrors `PasteSynthesizer`/`EnigoPaste` one key
+//! over (`C` vs `V`, same platform modifier via `paste_modifier`).
+//! `capture_selection` saves the pre-copy clipboard, synthesizes copy, and
+//! returns both the captured selection and that pre-copy value
+//! (`CapturedSelection`, itself asserted no-log alongside `ClipboardPayload`
+//! in `clipboard_payload_trait_assertions`); `replace_selection` writes the
+//! transformed text, synthesizes paste, and restores the ORIGINAL pre-copy
+//! clipboard passed back in — not the intermediate captured-selection value
+//! that sat on the clipboard while the instruction was being transformed —
+//! reusing the same skip-on-change `should_restore_clipboard` decision as
+//! `paste_via_clipboard_swap`. No hotkey/pipeline wiring yet — that's #259;
+//! `dead_code` covers this surface until then.
 #![allow(dead_code)]
 
 use std::fs;
@@ -65,6 +79,15 @@ pub trait Clipboard {
 /// Implemented for real via `enigo` in [`EnigoPaste`].
 pub trait PasteSynthesizer {
     fn synthesize_paste(&self) -> io::Result<()>;
+}
+
+/// Thin OS-glue seam for synthesizing the copy keystroke (Cmd+C / Ctrl+C) —
+/// command mode's way of capturing the user's active selection (issue #257,
+/// AC-48). Mirrors [`PasteSynthesizer`] exactly, one key over. Implemented
+/// for real via `enigo` in [`EnigoCopy`]; [`capture_selection`] is the pure
+/// consumer, fakeable in tests without a real clipboard or keystroke.
+pub trait CopySynthesizer {
+    fn synthesize_copy(&self) -> io::Result<()>;
 }
 
 /// A calendar date + wall-clock time, injected wherever templating or
@@ -280,6 +303,116 @@ pub fn paste_via_clipboard_swap(
     }
 }
 
+/// The result of [`capture_selection`] (issue #257, AC-48): the captured
+/// selection text, for the command-mode transform (a sibling PR) to consume
+/// as untrusted CONTENT-channel input, plus the clipboard's contents from
+/// *before* the capturing copy keystroke ran.
+///
+/// `pre_copy_clipboard` — not `selection` — is what must be handed to
+/// [`replace_selection`] afterward: it's the value the user actually had on
+/// their clipboard prior to command mode touching it at all, and the one
+/// that needs restoring once the transformed text has been pasted in.
+/// Restoring `selection` instead would silently replace the user's real
+/// clipboard contents with a copy of the text command mode just consumed —
+/// exactly the bug this type's two-field split exists to make structurally
+/// hard to write.
+///
+/// Carries its fields as [`ClipboardPayload`], so it inherits the same
+/// never-`Debug`/`Display`/`Serialize` no-log guarantee (asserted
+/// separately below in `clipboard_payload_trait_assertions`, since a
+/// wrapping struct's own trait impls aren't implied by its fields').
+pub struct CapturedSelection {
+    /// The captured selection text — command mode's content-channel input.
+    pub selection: ClipboardPayload,
+    /// The clipboard's contents immediately before the capturing copy
+    /// keystroke ran; thread this back into [`replace_selection`] verbatim.
+    pub pre_copy_clipboard: ClipboardPayload,
+}
+
+/// Command-mode selection capture (issue #257, AC-48): save the clipboard's
+/// current (pre-copy) contents, synthesize the copy keystroke to pull the
+/// user's active selection onto the clipboard, then read it back — without
+/// touching the clipboard again afterward. The selection is left sitting on
+/// the clipboard; [`replace_selection`] is what eventually overwrites and
+/// then restores it.
+///
+/// Reads the clipboard exactly twice (before and after the copy keystroke)
+/// and never writes to it — the OS, reacting to the synthesized keystroke
+/// while some other app holds focus and a selection, is what actually puts
+/// the selection on the clipboard, not this function.
+///
+/// `clipboard`/`copy` are the thin OS-glue seams (real impls:
+/// [`SystemClipboard`]/[`EnigoCopy`]) — this function's own logic is pure
+/// dispatch over them, fakeable in tests exactly like
+/// [`paste_via_clipboard_swap`] above.
+///
+/// Instruction/content channel separation: the returned selection is
+/// untrusted CONTENT-channel input for command mode's transform (a sibling
+/// PR). This function only moves bytes — it never parses or interprets
+/// them.
+pub fn capture_selection(
+    clipboard: &impl Clipboard,
+    copy: &impl CopySynthesizer,
+) -> io::Result<CapturedSelection> {
+    let pre_copy_clipboard = clipboard.get()?;
+    copy.synthesize_copy()?;
+    let selection = clipboard.get()?;
+    Ok(CapturedSelection {
+        selection: ClipboardPayload::new(selection),
+        pre_copy_clipboard: ClipboardPayload::new(pre_copy_clipboard),
+    })
+}
+
+/// Command-mode selection replace (issue #257, AC-48): write `transformed`
+/// to the clipboard, synthesize the paste keystroke, wait `restore_delay`,
+/// then restore `pre_copy_clipboard` — the clipboard's contents from
+/// *before* [`capture_selection`] ran, threaded back in by the caller
+/// unchanged — unless [`should_restore_clipboard`] detects that something
+/// else wrote to the clipboard meanwhile (the same skip-on-change safety
+/// [`paste_via_clipboard_swap`] already provides for AC-9).
+///
+/// The one way this differs from [`paste_via_clipboard_swap`]: that
+/// function reads "what to restore" fresh off the clipboard at the top of
+/// its own call, which is correct for plain dictation (nothing else has
+/// touched the clipboard yet). Here, by the time replace runs, the
+/// clipboard has already been through a capture — it currently holds the
+/// mid-flow captured-selection value, not the user's original contents — so
+/// the restore target has to be the value [`capture_selection`] saved
+/// earlier, passed in explicitly, not whatever `clipboard.get()` would
+/// return right now.
+pub fn replace_selection(
+    clipboard: &impl Clipboard,
+    paste: &impl PasteSynthesizer,
+    sleep: impl FnOnce(Duration),
+    pre_copy_clipboard: ClipboardPayload,
+    transformed: ClipboardPayload,
+    restore_delay: Duration,
+) -> io::Result<()> {
+    let restore_to = pre_copy_clipboard.into_inner();
+    let text = transformed.into_inner();
+    clipboard.set(&text)?;
+
+    if let Err(paste_err) = paste.synthesize_paste() {
+        let _ = clipboard.set(&restore_to);
+        return Err(paste_err);
+    }
+
+    sleep(restore_delay);
+
+    match clipboard.get() {
+        Ok(observed) => {
+            if should_restore_clipboard(&text, &observed) {
+                clipboard.set(&restore_to)?;
+            }
+            Ok(())
+        }
+        Err(observe_err) => {
+            let _ = clipboard.set(&restore_to);
+            Err(observe_err)
+        }
+    }
+}
+
 /// Real system clipboard via `arboard`. Thin OS glue (AGENTS.md
 /// OS-integration exemption) — no decisions here, just reading/writing the
 /// platform clipboard; [`should_restore_clipboard`] and
@@ -301,13 +434,14 @@ impl Clipboard for SystemClipboard {
     }
 }
 
-/// The modifier key synthesized alongside `V` for a platform's native paste
-/// shortcut: `Cmd+V` on macOS, `Ctrl+V` everywhere else (Windows, Linux).
-/// Pure, `cfg`-selected lookup — no `enigo` call, no OS handle — so the
-/// per-platform choice is unit-tested directly (issue #98) rather than only
-/// implied by an inline `#[cfg]` inside [`EnigoPaste::synthesize_paste`].
-/// Exactly one of the two `cfg`-gated definitions below is compiled for any
-/// given target.
+/// The modifier key synthesized alongside `V` (or, via [`EnigoCopy`],
+/// alongside `C` — the same modifier drives both native shortcuts on every
+/// supported platform) for a platform's native paste/copy shortcut: `Cmd` on
+/// macOS, `Ctrl` everywhere else (Windows, Linux). Pure, `cfg`-selected
+/// lookup — no `enigo` call, no OS handle — so the per-platform choice is
+/// unit-tested directly (issue #98) rather than only implied by an inline
+/// `#[cfg]` inside [`EnigoPaste::synthesize_paste`]. Exactly one of the two
+/// `cfg`-gated definitions below is compiled for any given target.
 #[cfg(target_os = "macos")]
 pub const fn paste_modifier() -> enigo::Key {
     enigo::Key::Meta
@@ -339,6 +473,37 @@ impl PasteSynthesizer for EnigoPaste {
             .map_err(|e| io::Error::other(e.to_string()))?;
         enigo
             .key(Key::Unicode('v'), Direction::Click)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        enigo
+            .key(modifier, Direction::Release)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Real synthetic Cmd+C (macOS) / Ctrl+C (Windows, Linux) via `enigo` —
+/// command mode's selection-capture keystroke (issue #257, AC-48). Thin OS
+/// glue (AGENTS.md OS-integration exemption), structured identically to
+/// [`EnigoPaste`] one key over: synthesizes exactly one keystroke combo,
+/// reusing [`paste_modifier`] (pure, unit-tested, and — despite its name —
+/// the correct modifier for both platform shortcuts) to pick the modifier;
+/// no decision logic lives in this impl.
+pub struct EnigoCopy;
+
+impl CopySynthesizer for EnigoCopy {
+    fn synthesize_copy(&self) -> io::Result<()> {
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+
+        let mut enigo =
+            Enigo::new(&Settings::default()).map_err(|e| io::Error::other(e.to_string()))?;
+
+        let modifier = paste_modifier();
+
+        enigo
+            .key(modifier, Direction::Press)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        enigo
+            .key(Key::Unicode('c'), Direction::Click)
             .map_err(|e| io::Error::other(e.to_string()))?;
         enigo
             .key(modifier, Direction::Release)
