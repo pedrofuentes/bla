@@ -239,6 +239,25 @@ describe("PillWindow pipeline-error toast", () => {
     expect(toast?.className).not.toContain("red");
   });
 
+  it("renders an informational toast for HistoryPersistFailed (issue #220)", async () => {
+    mounted = mount(<PillWindow />);
+    await flush();
+
+    fire("pipeline-error", {
+      kind: "HistoryPersistFailed",
+      message: "Couldn't save this dictation to history.",
+    } satisfies PipelineErrorEvent);
+
+    const toast = mounted.container.querySelector('[role="status"]');
+    expect(toast).not.toBeNull();
+    expect(toast?.textContent).toContain("Couldn't save this dictation to history");
+    // Informational tone is styled distinctly (blue), not the blocking red —
+    // the dictation itself already succeeded (pasted); only the secondary
+    // history-row write failed.
+    expect(toast?.className).toContain("blue");
+    expect(toast?.className).not.toContain("red");
+  });
+
   it("renders a blocking toast for ModelMissing", async () => {
     mounted = mount(<PillWindow />);
     await flush();
