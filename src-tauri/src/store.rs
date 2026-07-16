@@ -18,9 +18,16 @@
 //! storage, but it is never logged — no `Debug`/`log!`/`println!` of row
 //! contents anywhere in this module or its call sites. [`HistoryRow`]
 //! derives `Debug` only because tests assert on it; nothing here prints one.
+//! It also derives `Serialize` (issue #198) so `commands::search_history`
+//! can hand rows to the frontend over Tauri IPC — the one sanctioned
+//! "leaves this module" path for history text (the History tab the user
+//! opens to browse their own dictations, #199), distinct from logging: IPC
+//! payloads never pass through `eprintln!`/`log!`/an emitted error event.
 
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use serde::Serialize;
 use std::path::Path;
+use std::time::Duration;
 
 /// One forward-only migration: the `user_version` it brings the schema to,
 /// and the SQL that gets it there. Idempotent by construction — the runner
@@ -49,7 +56,7 @@ const MIGRATIONS: &[Migration] = &[(
 /// logs/prints a `HistoryRow` (MISSION §5/§7: raw/cleaned dictation text
 /// must never be logged, even though storing it in local SQLite is
 /// sanctioned).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HistoryRow {
     pub id: i64,
     pub created_at_ms: i64,
@@ -84,6 +91,14 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> SqliteResult<Self> {
+        // Issue #162 (SNTL-20260713-bla-PR161-b26d368): set explicitly,
+        // before `migrate()`, so a transient lock on the real on-disk DB
+        // this connection is about to be wired to on the dictation hot path
+        // (second app instance — no single-instance guard exists; a
+        // crash-relaunch race; an OS indexer/backup read lock) makes the
+        // next write BLOCK AND RETRY for up to 5s instead of failing
+        // immediately with `SQLITE_BUSY` and dropping a history row.
+        conn.busy_timeout(Duration::from_secs(5))?;
         let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -96,6 +111,16 @@ impl Store {
     fn schema_version(&self) -> SqliteResult<i64> {
         self.conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
+    }
+
+    /// The connection's current `PRAGMA busy_timeout`, in milliseconds — the
+    /// value issue #162's test asserts against to confirm
+    /// [`Self::from_connection`] sets it before any caller can observe a
+    /// default of `0`.
+    #[cfg(test)]
+    fn busy_timeout_ms(&self) -> SqliteResult<i64> {
+        self.conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
     }
 
     /// Apply every migration in [`MIGRATIONS`] whose version is greater
@@ -163,6 +188,27 @@ impl Store {
             })
         })?;
         rows.collect()
+    }
+
+    /// Fetch a single history row by id, or `None` if no row has that id.
+    /// Issue #198 (AC-30): `copy_history_entry` uses this to read a row's
+    /// `cleaned` text before routing it through the clipboard.
+    pub fn get_history(&self, id: i64) -> SqliteResult<Option<HistoryRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, created_at_ms, raw, cleaned, app_name FROM history WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(HistoryRow {
+                        id: row.get(0)?,
+                        created_at_ms: row.get(1)?,
+                        raw: row.get(2)?,
+                        cleaned: row.get(3)?,
+                        app_name: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Delete a single history row by id. Deleting an id that doesn't exist
@@ -233,6 +279,37 @@ mod tests {
     fn opening_an_in_memory_store_runs_migration_1_and_sets_user_version_to_1() {
         let store = Store::open_in_memory().expect("open_in_memory should succeed");
         assert_eq!(store.schema_version().unwrap(), 1);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #162 (SNTL-20260713-bla-PR161-b26d368): `from_connection` never
+    // called `Connection::busy_timeout` explicitly, so a transient lock
+    // (second app instance, crash-relaunch race, OS indexer/backup read
+    // lock) could make the next write fail immediately with `SQLITE_BUSY`
+    // and drop a history row, instead of blocking up to `busy_timeout` for
+    // the lock to clear.
+    //
+    // Note on this test's red/green shape: as vendored, rusqlite 0.40.1
+    // already calls `sqlite3_busy_timeout(db, 5000)` unconditionally inside
+    // `InnerConnection::open_with_flags` (see
+    // `inner_connection.rs`) — so this assertion is green even before
+    // `from_connection` makes the call explicit below. The explicit call is
+    // still required per #162: it's a documented contract this crate owns
+    // rather than an incidental upstream default an unrelated future
+    // rusqlite bump could silently change, and it's what a reviewer
+    // (Sentinel) can see and verify at this call site without reading
+    // rusqlite's internals.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn opening_a_store_sets_a_five_second_busy_timeout_issue_162() {
+        let store = Store::open_in_memory().expect("open_in_memory should succeed");
+        assert_eq!(
+            store.busy_timeout_ms().unwrap(),
+            5_000,
+            "busy_timeout must be set to 5s so a transient lock blocks and retries instead of \
+             failing the write immediately with SQLITE_BUSY"
+        );
     }
 
     #[test]
@@ -336,6 +413,42 @@ mod tests {
         let results = store.search_history("file_name", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].raw, "file_name here");
+    }
+
+    // -------------------------------------------------------------
+    // get_history (issue #198, AC-30): copy_history_entry needs to fetch a
+    // single row by id to read its `cleaned` text before routing it through
+    // the clipboard.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn get_history_returns_the_row_matching_the_given_id() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_history(1_000, "hello world", "Hello, world.", Some("Notes"))
+            .unwrap();
+
+        let row = store.get_history(id).unwrap();
+        assert_eq!(
+            row,
+            Some(HistoryRow {
+                id,
+                created_at_ms: 1_000,
+                raw: "hello world".to_string(),
+                cleaned: "Hello, world.".to_string(),
+                app_name: Some("Notes".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn get_history_returns_none_for_an_id_that_does_not_exist() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_history(1_000, "alpha", "alpha.", None)
+            .unwrap();
+
+        assert_eq!(store.get_history(999).unwrap(), None);
     }
 
     // -------------------------------------------------------------

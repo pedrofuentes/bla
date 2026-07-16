@@ -11,10 +11,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
-    apply_settings_to_state, is_settings_window, model_registry_entries, output_mode_toggle_label,
-    react_to_transition, register_hotkey, save_settings_to_store, set_settings_with_rollback,
-    should_resume_hotkey, spec_for_preset, to_models_preset, to_tray_output_mode,
-    unregister_hotkey, AppState, ModelRegistryEntry,
+    apply_settings_to_state, copy_history_entry_text, is_settings_window, model_registry_entries,
+    now_ms, output_mode_toggle_label, prune_history_for_retention, react_to_transition,
+    register_hotkey, save_settings_to_store, set_settings_with_rollback, should_resume_hotkey,
+    spec_for_preset, to_models_preset, to_tray_output_mode, unregister_hotkey, AppState,
+    ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -129,12 +130,30 @@ pub fn set_settings(
         }
     }
 
+    // Issue #198 (AC-31): captured before `apply_settings_to_state` moves
+    // `settings` below — prune runs AFTER settings are durably persisted
+    // (register-before-persist already succeeded above), so a lowered
+    // retention window takes effect on this same save rather than waiting
+    // for the next startup.
+    let retention_days = settings.retention_days;
+
     // Unit-tested in lib.rs::apply_settings_tests; a mode change that
     // interrupts an in-flight session yields Cancelled, which
     // react_to_transition turns into stop-capture + discard-audio (the same
     // handling as the debounce/focus-loss cancel paths).
     let transition = apply_settings_to_state(&state, settings);
     react_to_transition(&app, transition);
+
+    // Issue #198 (AC-31): best-effort, same as the autostart glue above —
+    // settings are already persisted at this point, so a prune failure must
+    // never fail the save the user just made.
+    {
+        let store = state.store.lock().unwrap();
+        if let Err(err) = prune_history_for_retention(&store, now_ms(), retention_days) {
+            eprintln!("bla: failed to prune history after a settings save: {err}");
+        }
+    }
+
     Ok(())
 }
 
@@ -272,6 +291,66 @@ pub fn suspend_hotkey(
     unregister_hotkey(window.app_handle()).map_err(|e| e.to_string())?;
     *state.hotkey_suspend_gen.lock().unwrap() = generation;
     Ok(())
+}
+
+/// Substring search over dictation history (AC-30, issue #198), newest
+/// first, capped at `limit` rows. Thin wrapper over
+/// `store::Store::search_history`; `HistoryRow` derives `Serialize` (see its
+/// doc comment) specifically so this command can hand rows to the frontend
+/// over Tauri IPC — the sanctioned "leaves local SQLite" path for history
+/// text (the user's own History tab, #199).
+#[tauri::command]
+pub fn search_history(
+    state: State<'_, AppState>,
+    query: String,
+    limit: usize,
+) -> Result<Vec<crate::store::HistoryRow>, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .search_history(&query, limit)
+        .map_err(|e| e.to_string())
+}
+
+/// Copy one history entry's cleaned transcript to the clipboard (AC-30,
+/// issue #198). Thin `AppState`-shaped wrapper over the pure
+/// `copy_history_entry_text`, which does the actual `Store::get_history` +
+/// `output::Clipboard`/`ClipboardPayload` handoff — that function is what's
+/// unit-tested (see `history_wiring_tests` in `lib.rs`) against
+/// `Store::open_in_memory()` and a fake `Clipboard`, never a constructed
+/// `AppState`.
+#[tauri::command]
+pub fn copy_history_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let store = state.store.lock().unwrap();
+    copy_history_entry_text(&store, &crate::output::SystemClipboard, id)
+}
+
+/// Delete a single history entry by id (AC-30, issue #198). Thin wrapper
+/// over `store::Store::delete_history` — deleting an id that doesn't exist
+/// is a no-op, not an error (matches `Store::delete_history`'s own
+/// contract).
+#[tauri::command]
+pub fn delete_history_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .delete_history(id)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete every history entry (AC-30, issue #198). Thin wrapper over
+/// `store::Store::clear_history` — the History tab's (#199) "Clear all"
+/// action.
+#[tauri::command]
+pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .clear_history()
+        .map_err(|e| e.to_string())
 }
 
 /// Re-registers the current (persisted) hotkey as the global dictation

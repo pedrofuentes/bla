@@ -179,6 +179,13 @@ pub(crate) struct AppState {
     /// builds; the default build has no `WhisperStt` to cache.
     #[cfg(feature = "whisper")]
     stt_cache: Mutex<Option<CachedStt>>,
+    /// Issue #198 (M3 PR 3.2): the headless SQLite history store (`store.rs`,
+    /// kickoff #160/#161), opened once at startup against the OS app-data
+    /// dir. `Mutex`-wrapped for the same reason every other shared field
+    /// here is: `rusqlite::Connection` is `!Sync`, and both Tauri command
+    /// handlers and the background pipeline thread
+    /// (`run_pipeline_in_background`) need to reach it.
+    store: Mutex<store::Store>,
 }
 
 /// Max capacity of the capture ring buffer: a generous 5 minutes at 16 kHz
@@ -359,6 +366,106 @@ fn should_reuse_cached_stt(
     wanted: &settings::ModelPreset,
 ) -> bool {
     cached == Some(wanted)
+}
+
+/// Persist exactly one history row for a completed dictation (AC-29, issue
+/// #198) — the pure, injectable decision `run_pipeline_in_background` calls
+/// for every `Pipeline::run` that returns `Ok(outcome)`. Takes `store` and
+/// `created_at_ms` as plain injected values (rather than reading them off
+/// `AppState`/the real clock) so this is unit-testable via
+/// `Store::open_in_memory()` without constructing an `AppState` (issue
+/// #165's Windows-CI hard rule: no `AppState` literals in `#[cfg(test)]`
+/// code).
+///
+/// **Placement rationale (issue #198, interaction with the #174/#175/#176
+/// generation-id mechanism, PR #214):** the call site in
+/// `run_pipeline_in_background` invokes this BEFORE checking
+/// `generation_is_live` — `Pipeline::run`'s `Ok(outcome)` means the text was
+/// already pasted/written by the time this runs, regardless of whether this
+/// dictation's generation is still the live one. A stale generation drops
+/// only UI-visible effects (event emits, pill state writes, settle spawns —
+/// see `run_pipeline_in_background`'s own comments on that gate); it must
+/// NOT drop the history row, or a dictation whose text was genuinely pasted
+/// would silently be missing from history. `app_name` is `None` for now —
+/// `context.rs`'s active-app detection is still a stub, not wired into the
+/// pipeline; a later PR threads a real value through once it lands.
+fn record_history_entry(
+    store: &store::Store,
+    created_at_ms: i64,
+    outcome: &pipeline::Outcome,
+    app_name: Option<&str>,
+) -> rusqlite::Result<i64> {
+    store.insert_history(
+        created_at_ms,
+        &outcome.raw_transcript,
+        &outcome.cleaned_transcript,
+        app_name,
+    )
+}
+
+/// Copy a history entry's cleaned transcript to the clipboard (AC-30, issue
+/// #198), routed through the existing `output::Clipboard`/
+/// `ClipboardPayload` seam so the text is never handed to a caller as a bare
+/// `String` that could end up in a log call — mirrors
+/// `output::paste_via_clipboard_swap`'s own `payload.into_inner()` ->
+/// `clipboard.set()` handoff, minus the save/restore dance (this is a
+/// "copy", not the dictation cursor-paste path). Pure/injectable — takes
+/// `store` and `clipboard` directly rather than reading `AppState`, so it's
+/// unit-testable via `Store::open_in_memory()` + a fake `Clipboard` without
+/// constructing an `AppState`.
+///
+/// The error path (`id` not found) never reads or touches the clipboard at
+/// all, so a copy of a since-deleted entry can't leave stale/wrong text on
+/// the clipboard.
+fn copy_history_entry_text(
+    store: &store::Store,
+    clipboard: &impl output::Clipboard,
+    id: i64,
+) -> Result<(), String> {
+    let row = store
+        .get_history(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no history entry with id {id}"))?;
+    let payload = output::ClipboardPayload::new(row.cleaned);
+    clipboard
+        .set(&payload.into_inner())
+        .map_err(|e| e.to_string())
+}
+
+/// Prune history rows older than the retention cutoff (AC-31, issue #198):
+/// computes the cutoff via `store::retention_cutoff_ms` and calls
+/// `Store::prune_history` only when it returns `Some` (i.e.
+/// `retention_days > 0`) — `retention_days == 0` ("keep forever") is a
+/// deliberate no-op, never touching a row, rather than treating `None` as
+/// "prune from the epoch". Pure/injectable — takes `store` and `now_ms`
+/// directly (rather than reading `AppState`/the real clock) so it's
+/// unit-testable via `Store::open_in_memory()` without constructing an
+/// `AppState`. Called from both the startup path (`run`'s `.setup()`) and
+/// `commands::set_settings` whenever `retention_days` is in effect, so a
+/// freshly-lowered retention window takes effect on the next save, not only
+/// after a restart.
+fn prune_history_for_retention(
+    store: &store::Store,
+    now_ms: i64,
+    retention_days: u32,
+) -> rusqlite::Result<usize> {
+    match store::retention_cutoff_ms(now_ms, retention_days) {
+        Some(cutoff_ms) => store.prune_history(cutoff_ms),
+        None => Ok(0),
+    }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch — the one
+/// place `record_history_entry`/`prune_history_for_retention`'s real
+/// call sites read the system clock (mirrors `real_clock`'s module-doc
+/// convention just below: OS-glue callers inject a plain value into pure
+/// functions rather than those functions reading the clock themselves).
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 #[cfg(test)]
@@ -735,6 +842,169 @@ mod mapping_tests {
         assert!(registers.is_empty());
         assert_eq!(persists, 1);
         assert!(rollbacks.is_empty());
+    }
+}
+
+/// Issue #198 tests for the AppState-free history-capture pure functions
+/// (AC-29/AC-30/AC-31): `record_history_entry`, `copy_history_entry_text`,
+/// `prune_history_for_retention`. Mirrors `apply_settings_tests`'s pattern
+/// (issue #165) — real `store::Store::open_in_memory()` (no fake needed,
+/// same as `store.rs`'s own tests) plus a local fake `output::Clipboard`,
+/// never a constructed `AppState`.
+#[cfg(test)]
+mod history_wiring_tests {
+    use super::*;
+    use crate::output::Clipboard as _;
+    use std::cell::RefCell;
+
+    /// Fake clipboard for `copy_history_entry_text` tests — mirrors
+    /// `output.rs`'s own private `FakeClipboard` (not reachable from here:
+    /// it's under `output`'s `#[cfg(test)] mod tests`), an in-memory cell
+    /// with no real OS clipboard access.
+    struct FakeClipboard {
+        contents: RefCell<String>,
+    }
+
+    impl FakeClipboard {
+        fn new(initial: &str) -> Self {
+            Self {
+                contents: RefCell::new(initial.to_string()),
+            }
+        }
+    }
+
+    impl output::Clipboard for FakeClipboard {
+        fn get(&self) -> std::io::Result<String> {
+            Ok(self.contents.borrow().clone())
+        }
+
+        fn set(&self, contents: &str) -> std::io::Result<()> {
+            *self.contents.borrow_mut() = contents.to_string();
+            Ok(())
+        }
+    }
+
+    fn synthetic_outcome(raw: &str, cleaned: &str) -> pipeline::Outcome {
+        pipeline::Outcome {
+            raw_transcript: raw.to_string(),
+            cleaned_transcript: cleaned.to_string(),
+            cleanup_fell_back: false,
+            output: output::OutputOutcome::Pasted,
+        }
+    }
+
+    // -------------------------------------------------------------
+    // AC-29: record_history_entry — exactly one Store::insert_history call
+    // per completed pipeline run, carrying raw + cleaned transcript.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn record_history_entry_persists_the_outcomes_raw_and_cleaned_transcript_ac29() {
+        let store = store::Store::open_in_memory().unwrap();
+        let outcome = synthetic_outcome("raw synthetic dictation", "Cleaned synthetic dictation.");
+
+        let id = record_history_entry(&store, 1_000, &outcome, None).unwrap();
+
+        let rows = store.search_history("synthetic", 10).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one row must be inserted");
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].created_at_ms, 1_000);
+        assert_eq!(rows[0].raw, "raw synthetic dictation");
+        assert_eq!(rows[0].cleaned, "Cleaned synthetic dictation.");
+    }
+
+    #[test]
+    fn record_history_entry_carries_the_app_name_when_given_ac29() {
+        let store = store::Store::open_in_memory().unwrap();
+        let outcome = synthetic_outcome("raw", "cleaned");
+
+        record_history_entry(&store, 1_000, &outcome, Some("Notes")).unwrap();
+
+        let rows = store.search_history("raw", 10).unwrap();
+        assert_eq!(rows[0].app_name.as_deref(), Some("Notes"));
+    }
+
+    #[test]
+    fn record_history_entry_called_once_per_outcome_never_double_inserts_ac29() {
+        let store = store::Store::open_in_memory().unwrap();
+        let outcome = synthetic_outcome("raw once", "cleaned once");
+
+        record_history_entry(&store, 1_000, &outcome, None).unwrap();
+
+        let rows = store.search_history("once", 10).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a single completed run must produce exactly one history row"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // AC-30: copy_history_entry_text — routes the entry's cleaned text
+    // through the Clipboard/ClipboardPayload seam, never a bare String that
+    // could be logged.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn copy_history_entry_text_sets_the_clipboard_to_the_entrys_cleaned_text_ac30() {
+        let store = store::Store::open_in_memory().unwrap();
+        let id = store
+            .insert_history(1_000, "raw synthetic", "Cleaned synthetic.", None)
+            .unwrap();
+        let clipboard = FakeClipboard::new("");
+
+        copy_history_entry_text(&store, &clipboard, id).unwrap();
+
+        assert_eq!(clipboard.get().unwrap(), "Cleaned synthetic.");
+    }
+
+    #[test]
+    fn copy_history_entry_text_errors_for_an_unknown_id_without_touching_the_clipboard_ac30() {
+        let store = store::Store::open_in_memory().unwrap();
+        let clipboard = FakeClipboard::new("untouched");
+
+        let result = copy_history_entry_text(&store, &clipboard, 999);
+
+        assert!(result.is_err());
+        assert_eq!(clipboard.get().unwrap(), "untouched");
+    }
+
+    // -------------------------------------------------------------
+    // AC-31: prune_history_for_retention — computes the cutoff and prunes
+    // only when retention_days > 0; a no-op (never touches rows) at 0.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn prune_history_for_retention_prunes_rows_older_than_the_cutoff_ac31() {
+        let store = store::Store::open_in_memory().unwrap();
+        let day_ms: i64 = 24 * 60 * 60 * 1000;
+        let now_ms = 10 * day_ms;
+        store
+            .insert_history(day_ms, "too old", "too old.", None)
+            .unwrap();
+        store
+            .insert_history(9 * day_ms, "recent enough", "recent enough.", None)
+            .unwrap();
+
+        let deleted = prune_history_for_retention(&store, now_ms, 3).unwrap();
+
+        assert_eq!(deleted, 1);
+        let remaining = store.search_history("", 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].raw, "recent enough");
+    }
+
+    #[test]
+    fn prune_history_for_retention_is_a_no_op_when_retention_days_is_zero_ac31() {
+        let store = store::Store::open_in_memory().unwrap();
+        store
+            .insert_history(0, "keep forever", "keep forever.", None)
+            .unwrap();
+
+        let deleted = prune_history_for_retention(&store, 999_999_999_999, 0).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(store.search_history("", 10).unwrap().len(), 1);
     }
 }
 
@@ -1604,6 +1874,29 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                 );
                 match pipeline.run(&samples, &opts) {
                     Ok(outcome) => {
+                        // Issue #198 (AC-29): persist exactly one history
+                        // row for this completed run BEFORE the generation
+                        // check below — deliberately NOT gated on
+                        // `generation_is_live`. `Pipeline::run` returning
+                        // `Ok` means the text was already pasted/written by
+                        // this point, regardless of whether a newer
+                        // dictation has since superseded this one for UI
+                        // purposes; the generation gate exists to suppress
+                        // stale UI-visible effects (event emits, pill state,
+                        // settle spawns — see the comment on that check just
+                        // below), not to decide whether a dictation
+                        // "happened". Best-effort: a failure to persist is
+                        // logged (no transcript content — see `store.rs`'s
+                        // no-log invariant) but must never fail/hide the
+                        // completion the user already saw pasted.
+                        {
+                            let app_state = app.state::<AppState>();
+                            let store = app_state.store.lock().unwrap();
+                            if let Err(err) = record_history_entry(&store, now_ms(), &outcome, None)
+                            {
+                                eprintln!("bla: failed to persist history entry: {err}");
+                            }
+                        }
                         // Issues #174/#175/#176: this completion belongs to
                         // `generation` — check it's still the live dictation
                         // BEFORE touching any shared state (including
@@ -1764,6 +2057,10 @@ pub fn run() {
             commands::model_registry,
             commands::suspend_hotkey,
             commands::resume_hotkey,
+            commands::search_history,
+            commands::copy_history_entry,
+            commands::delete_history_entry,
+            commands::clear_history,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1837,6 +2134,35 @@ pub fn run() {
                 .on_menu_event(|app, event| handle_tray_menu_event(app, event.id().as_ref()))
                 .build(&handle)?;
 
+            // Issue #198 (M3 PR 3.2): open the headless history store
+            // against the OS app-data dir (MISSION §5: local SQLite only,
+            // nothing leaves the device). `Store::open` is non-fatal on
+            // failure — mirrors the hotkey-registration handling just below:
+            // a disk error here must not brick launch. Falling back to
+            // `open_in_memory` keeps every history command working for this
+            // session; the only degradation is that history won't survive a
+            // restart, which is strictly better than the app failing to
+            // start at all.
+            let history_db_path = app_data_dir.join("history.sqlite3");
+            let history_store = store::Store::open(&history_db_path).unwrap_or_else(|err| {
+                eprintln!(
+                    "bla: failed to open history store at {history_db_path:?}, falling back to \
+                     an in-memory store for this session (history will not persist across \
+                     restart): {err}"
+                );
+                store::Store::open_in_memory()
+                    .expect("in-memory SQLite open must succeed as a last-resort fallback")
+            });
+
+            // AC-31: prune on startup per the persisted retention_days
+            // setting, before the store is handed to any command/pipeline
+            // call site.
+            if let Err(err) =
+                prune_history_for_retention(&history_store, now_ms(), settings.retention_days)
+            {
+                eprintln!("bla: failed to prune history on startup: {err}");
+            }
+
             let state = AppState {
                 hotkeys: Mutex::new(hotkeys::StateMachine::new(
                     to_hotkey_mode(settings.recording_mode),
@@ -1860,6 +2186,7 @@ pub fn run() {
                 hotkey_suspend_gen: Mutex::new(0),
                 #[cfg(feature = "whisper")]
                 stt_cache: Mutex::new(None),
+                store: Mutex::new(history_store),
             };
             app.manage(state);
 
