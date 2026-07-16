@@ -2,10 +2,11 @@
  * Settings window tab definitions (issue #126, M2 PR 2.5).
  *
  * A single source of truth for the tab bar so `index.tsx` doesn't hardcode
- * tab IDs/labels twice (bar + panel switch). Only `"general"` has real
- * content in this increment — the rest render a shared "coming soon"
- * placeholder (see `index.tsx`) so the tab bar's final shape is in place
- * without pulling forward History/Dictionary/Tone/Snippets' actual UI.
+ * tab IDs/labels twice (bar + panel switch). `"general"` (#126), `"history"`
+ * (#199), and `"dictionary"` (#201) have real content; `"tone"` and
+ * `"snippets"` still render a shared "coming soon" placeholder (see
+ * `index.tsx`) so the tab bar's final shape is in place without pulling
+ * forward their actual UI ahead of their own M3+ increments.
  */
 export type TabId = "general" | "history" | "dictionary" | "tone" | "snippets";
 
