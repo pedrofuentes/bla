@@ -55,6 +55,11 @@ beforeEach(() => {
       // tab-bar tests doesn't reject through an unmocked command.
       case "list_dictionary_terms":
         return Promise.resolve([]);
+      // Issue #203: the Tone tab (mounted once its tab is clicked) lists
+      // rules on mount — mocked here so switching to it in these tab-bar
+      // tests doesn't reject through an unmocked command.
+      case "list_tone_rules":
+        return Promise.resolve([]);
       default:
         return Promise.reject(new Error(`unmocked command ${command}`));
     }
@@ -81,13 +86,13 @@ describe("SettingsWindow tab bar", () => {
     mounted = mount(<SettingsWindow />);
     await flush();
 
-    click(mounted.container.querySelector('[data-testid="tab-tone"]')!);
+    click(mounted.container.querySelector('[data-testid="tab-snippets"]')!);
     await flush();
 
     expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
     const placeholder = mounted.container.querySelector('[data-testid="placeholder-panel"]');
     expect(placeholder).not.toBeNull();
-    expect(placeholder?.textContent).toMatch(/tone/i);
+    expect(placeholder?.textContent).toMatch(/snippets/i);
   });
 
   it("switches to the real Dictionary panel when the Dictionary tab is clicked (issue #201)", async () => {
@@ -114,11 +119,23 @@ describe("SettingsWindow tab bar", () => {
     expect(mounted.container.querySelector('[data-testid="history-panel"]')).not.toBeNull();
   });
 
-  it("switches back to the General panel", async () => {
+  it("switches to the real Tone panel when the Tone tab is clicked (issue #203)", async () => {
     mounted = mount(<SettingsWindow />);
     await flush();
 
     click(mounted.container.querySelector('[data-testid="tab-tone"]')!);
+    await flush();
+
+    expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="placeholder-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="tone-panel"]')).not.toBeNull();
+  });
+
+  it("switches back to the General panel", async () => {
+    mounted = mount(<SettingsWindow />);
+    await flush();
+
+    click(mounted.container.querySelector('[data-testid="tab-snippets"]')!);
     await flush();
     click(mounted.container.querySelector('[data-testid="tab-general"]')!);
     await flush();

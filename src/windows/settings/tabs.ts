@@ -3,10 +3,10 @@
  *
  * A single source of truth for the tab bar so `index.tsx` doesn't hardcode
  * tab IDs/labels twice (bar + panel switch). `"general"` (#126), `"history"`
- * (#199), and `"dictionary"` (#201) have real content; `"tone"` and
- * `"snippets"` still render a shared "coming soon" placeholder (see
+ * (#199), `"dictionary"` (#201), and `"tone"` (#203) have real content;
+ * `"snippets"` still renders a shared "coming soon" placeholder (see
  * `index.tsx`) so the tab bar's final shape is in place without pulling
- * forward their actual UI ahead of their own M3+ increments.
+ * forward its actual UI ahead of its own M3+ increment.
  */
 export type TabId = "general" | "history" | "dictionary" | "tone" | "snippets";
 

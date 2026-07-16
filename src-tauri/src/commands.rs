@@ -421,7 +421,18 @@ pub fn list_tone_rules(state: State<'_, AppState>) -> Result<Vec<crate::store::T
 /// the very next dictation with no restart required (the next
 /// `run_pipeline_in_background` call reads `list_tone_rules` fresh; there
 /// is no cache to invalidate). Returns the rule's row id either way.
-#[tauri::command]
+///
+/// `rename_all = "snake_case"` (SNTL-20260715-bla-PR237-18ff735 🔴): every
+/// other command in this file only has single-word (or already-camelCase-
+/// identical) argument names, so tauri-macros' default camelCase-on-the-
+/// wire behavior never surfaced — this is the first multi-word snake_case
+/// arg name (`app_pattern`) in the file. Without this attribute the wire
+/// expects `appPattern`, but the frontend (`src/lib/ipc.ts`/`ToneTab.tsx`,
+/// #203) sends `app_pattern` — every add/edit call would reject in the real
+/// app despite passing entirely mocked-IPC Vitest coverage. Keeps this
+/// crate's snake_case-on-wire convention explicit rather than relying on
+/// having no multi-word arg name to accidentally dodge the mismatch.
+#[tauri::command(rename_all = "snake_case")]
 pub fn upsert_tone_rule(
     state: State<'_, AppState>,
     app_pattern: String,
