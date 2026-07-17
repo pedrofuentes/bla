@@ -25,6 +25,10 @@ vi.mock("../../lib/ipc", () => ({
   onEvent: (...args: unknown[]) => onEvent(...args),
 }));
 
+// The production flag is off for v0.4. Keep the existing command-mode
+// interaction coverage running against the dormant enabled path.
+vi.mock("../../lib/features", () => ({ COMMAND_MODE_ENABLED: true }));
+
 /**
  * Handlers/unlisten-spies captured by the default `onEvent` mock (PR #134
  * Sentinel finding 9: the previous stub resolved without ever recording the

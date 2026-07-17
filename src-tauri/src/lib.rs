@@ -2674,6 +2674,29 @@ mod command_dispatch_tests {
     }
 }
 
+#[cfg(test)]
+mod command_mode_flag_tests {
+    use std::cell::Cell;
+
+    use super::{register_command_hotkey_at_startup, should_handle_command_key_event};
+
+    #[test]
+    fn startup_skips_command_hotkey_registration_when_command_mode_is_disabled() {
+        let registration_calls = Cell::new(0);
+
+        register_command_hotkey_at_startup(|| {
+            registration_calls.set(registration_calls.get() + 1);
+        });
+
+        assert_eq!(registration_calls.get(), 0);
+    }
+
+    #[test]
+    fn command_key_event_returns_before_dispatch_when_command_mode_is_disabled() {
+        assert!(!should_handle_command_key_event());
+    }
+}
+
 /// Loads persisted settings from the `tauri-plugin-store`-backed
 /// `settings.json`, translating a missing store/key to
 /// [`settings::SettingsLoadError::NotFound`] and a present-but-unparsable
