@@ -64,3 +64,53 @@ export function chordFromKeyboardEvent(e: KeyboardEvent): string | null {
 
   return [...modifiers, mainKey].join("+");
 }
+
+/**
+ * Issue #281 (ac7-p0): the allowed trigger-key range for the COMMAND-MODE
+ * hotkey specifically — F1 through F24 — mirroring the Rust-side allowlist
+ * in `src-tauri/src/hotkeys.rs::is_function_key` exactly (same 24 tokens,
+ * same F1-F24 rationale documented there: a function key never produces a
+ * text character, so a keydown the OS/plugin leaks to the focused app while
+ * the chord is held can't clobber a selection the way #281's
+ * `Ctrl+Shift+O` -> `"oooo"` repro did; F1-F12 are included alongside the
+ * "preferred" F13-F24 safe range because most laptop keyboards have no
+ * physical F13+ key, and F1-F12 are equally safe from the character-leak
+ * perspective).
+ */
+const FUNCTION_KEY_TOKENS = new Set(
+  Array.from({ length: 24 }, (_, i) => `F${i + 1}`),
+);
+
+export type CommandHotkeyKeysetValidation = { valid: true } | { valid: false; reason: string };
+
+/**
+ * Client-side half of #281's defense in depth for the command-mode hotkey
+ * field: rejects a captured chord whose trigger (last, non-modifier) token
+ * isn't a function key, with the same "why" explanation shown regardless of
+ * whether this client-side check or the backend `validate_command_hotkey`
+ * command (`commands::validate_command_hotkey` ->
+ * `hotkeys::validate_command_hotkey_keyset`) is what actually catches it —
+ * this is a fast, synchronous, no-IPC-round-trip check the picker runs
+ * immediately on a just-captured chord; the backend command is still the
+ * authoritative check `set_settings` relies on before persisting (a bad
+ * value must never persist even if this client-side check were somehow
+ * bypassed).
+ *
+ * Operates on the accelerator string [`chordFromKeyboardEvent`] produces
+ * (modifiers joined with `+`, trigger key last) — NOT on an arbitrary
+ * string, so it doesn't need to independently re-parse the full accelerator
+ * grammar the way the Rust validator does (that parse already happened when
+ * the chord was captured).
+ */
+export function validateCommandHotkeyKeyset(chord: string): CommandHotkeyKeysetValidation {
+  const trigger = chord.split("+").pop() ?? "";
+  if (FUNCTION_KEY_TOKENS.has(trigger)) {
+    return { valid: true };
+  }
+  return {
+    valid: false,
+    reason:
+      "Command mode needs a function key (like F13) so the key press won't type into your " +
+      "document if it leaks to the focused app while the chord is held.",
+  };
+}
