@@ -1277,7 +1277,14 @@ mod tests {
         let clipboard = FakeClipboard::new("pre-copy clipboard contents");
         let copy = FakeCopy::new(&clipboard, "captured selection text");
 
-        let captured = capture_selection(&clipboard, &copy).unwrap();
+        let captured = capture_selection(
+            &clipboard,
+            &copy,
+            |_interval| {},
+            Duration::ZERO,
+            DEFAULT_CAPTURE_MAX_POLLS,
+        )
+        .unwrap();
 
         assert!(*copy.called.borrow());
         assert_eq!(captured.selection.into_inner(), "captured selection text");
@@ -1295,13 +1302,141 @@ mod tests {
         let clipboard = FakeClipboard::new("pre-copy clipboard contents");
         let copy = FakeCopy::new(&clipboard, "captured selection text");
 
-        capture_selection(&clipboard, &copy).unwrap();
+        capture_selection(
+            &clipboard,
+            &copy,
+            |_interval| {},
+            Duration::ZERO,
+            DEFAULT_CAPTURE_MAX_POLLS,
+        )
+        .unwrap();
 
         assert_eq!(
             clipboard.get().unwrap(),
             "captured selection text",
             "capture must not touch the clipboard again after reading the selection"
         );
+    }
+
+    /// A clipboard whose `get()` returns a scripted sequence of values, one
+    /// per call, clamping at the final entry once the script is exhausted.
+    /// Models the Windows selection-capture race (ac7-p0, #296/#278): after
+    /// the synthesized copy keystroke, the focused app hasn't serviced it and
+    /// written the selection yet, so the first few reads still return the
+    /// stale pre-copy value before the real selection finally lands. `set()`
+    /// is a no-op — `capture_selection` never writes, and the copy keystroke
+    /// here is driven by the script, not by the copy synthesizer.
+    struct ScriptedClipboard {
+        reads: Vec<String>,
+        next: RefCell<usize>,
+    }
+
+    impl ScriptedClipboard {
+        fn new(reads: &[&str]) -> Self {
+            Self {
+                reads: reads.iter().map(|s| s.to_string()).collect(),
+                next: RefCell::new(0),
+            }
+        }
+    }
+
+    impl Clipboard for ScriptedClipboard {
+        fn get(&self) -> io::Result<String> {
+            let mut next = self.next.borrow_mut();
+            let idx = (*next).min(self.reads.len() - 1);
+            *next += 1;
+            Ok(self.reads[idx].clone())
+        }
+
+        fn set(&self, _contents: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A copy synthesizer that only records that it fired — it never writes
+    /// the clipboard, because the [`ScriptedClipboard`] it's paired with drives
+    /// the read sequence directly (modeling the OS, not our code, populating
+    /// the clipboard in response to the keystroke).
+    struct NoopCopy {
+        called: RefCell<bool>,
+    }
+
+    impl NoopCopy {
+        fn new() -> Self {
+            Self {
+                called: RefCell::new(false),
+            }
+        }
+    }
+
+    impl CopySynthesizer for NoopCopy {
+        fn synthesize_copy(&self) -> io::Result<()> {
+            *self.called.borrow_mut() = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn capture_selection_polls_until_the_selection_lands_after_the_copy_keystroke() {
+        // ac7-p0 (#296/#278): on Windows the focused app hasn't serviced the
+        // synthesized copy keystroke by the time we first re-read, so the
+        // clipboard still holds the stale pre-copy value ("prior") for the
+        // first couple of reads before the real selection lands. The pre-copy
+        // read consumes the first scripted value; the post-copy poll must keep
+        // re-reading (while the read is unchanged from pre-copy) until the
+        // selection differs, rather than accepting the first stale read.
+        let clipboard = ScriptedClipboard::new(&[
+            "prior",                  // pre-copy read
+            "prior",                  // first post-copy poll: not serviced yet
+            "prior",                  // second poll: still stale
+            "the captured selection", // selection has now landed
+        ]);
+        let copy = NoopCopy::new();
+
+        let captured = capture_selection(
+            &clipboard,
+            &copy,
+            |_interval| {},
+            Duration::ZERO,
+            DEFAULT_CAPTURE_MAX_POLLS,
+        )
+        .unwrap();
+
+        assert!(*copy.called.borrow());
+        assert_eq!(
+            captured.selection.into_inner(),
+            "the captured selection",
+            "capture must poll past the stale pre-copy reads for the selection to land"
+        );
+        assert_eq!(captured.pre_copy_clipboard.into_inner(), "prior");
+    }
+
+    #[test]
+    fn capture_selection_returns_the_last_read_when_polls_exhaust_without_change() {
+        // Edge case (b): the clipboard never changes from the (empty) pre-copy
+        // value within the poll budget — e.g. the user pressed the hotkey with
+        // nothing selected, so the copy keystroke leaves the clipboard alone.
+        // Capture must return the last (still-empty) read as-is so
+        // `captured_selection_is_usable` can surface the clear "no usable
+        // selection" error — no clobber, no spinning forever.
+        let clipboard = ScriptedClipboard::new(&[""]);
+        let copy = NoopCopy::new();
+
+        let captured = capture_selection(
+            &clipboard,
+            &copy,
+            |_interval| {},
+            Duration::ZERO,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(
+            captured.selection.into_inner(),
+            "",
+            "an unchanged (blank) clipboard must be returned as-is after the polls exhaust"
+        );
+        assert_eq!(captured.pre_copy_clipboard.into_inner(), "");
     }
 
     #[test]
