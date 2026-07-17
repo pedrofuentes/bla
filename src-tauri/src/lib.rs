@@ -1028,6 +1028,323 @@ mod mapping_tests {
         assert_eq!(persists, 1);
         assert!(rollbacks.is_empty());
     }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-2b757bf finding 🔴 3:
+    // `set_two_hotkeys_with_rollback` extends `set_settings_with_rollback`
+    // to TWO independent hotkey slots sharing one persisted `Settings` blob
+    // and ONE OS accelerator registry. The prior bug: `commands::set_settings`
+    // fully processed the dictation slot (unregister its prior, register its
+    // new value) BEFORE touching the command slot — so a swap-style save
+    // (new-dictation == current-command's still-live value) hit "already
+    // registered" on the OS's shared keyspace, and the ensuing rollback tore
+    // out the command slot's live binding, leaving it dead until restart
+    // with settings.json disagreeing with the OS. The fix: unregister BOTH
+    // changed priors before registering EITHER new value.
+    // -------------------------------------------------------------
+
+    /// Simulates the OS's single shared accelerator registry: `register`
+    /// fails if the accelerator is already live, `unregister` is
+    /// idempotent. Makes the swap test below a genuine regression check —
+    /// it only passes under the fixed (unregister-both-first) ordering.
+    struct SharedRegistry {
+        live: std::cell::RefCell<std::collections::HashSet<String>>,
+    }
+    impl SharedRegistry {
+        fn new(initial: &[&str]) -> Self {
+            Self {
+                live: std::cell::RefCell::new(initial.iter().map(|s| s.to_string()).collect()),
+            }
+        }
+        fn unregister(&self, h: &str) {
+            self.live.borrow_mut().remove(h);
+        }
+        fn register(&self, h: &str) -> Result<(), String> {
+            if self.live.borrow().contains(h) {
+                return Err(format!("{h} already registered"));
+            }
+            self.live.borrow_mut().insert(h.to_string());
+            Ok(())
+        }
+        fn is_live(&self, h: &str) -> bool {
+            self.live.borrow().contains(h)
+        }
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_unregisters_both_priors_before_registering_either_new_value_sntl_pr274()
+     {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let unregister_log = Rc::clone(&log);
+        let dictation_log = Rc::clone(&log);
+        let command_log = Rc::clone(&log);
+        let persist_log = Rc::clone(&log);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregister_log.borrow_mut().push(format!("unregister:{h}")),
+            |h| {
+                dictation_log
+                    .borrow_mut()
+                    .push(format!("register_dictation:{h}"));
+                Ok(())
+            },
+            |h| {
+                command_log
+                    .borrow_mut()
+                    .push(format!("register_command:{h}"));
+                Ok(())
+            },
+            || {
+                persist_log.borrow_mut().push("persist".to_string());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        let calls = log.borrow().clone();
+        let unregister_a = calls
+            .iter()
+            .position(|c| c == "unregister:PriorA")
+            .unwrap();
+        let unregister_c = calls
+            .iter()
+            .position(|c| c == "unregister:PriorC")
+            .unwrap();
+        let register_b = calls
+            .iter()
+            .position(|c| c == "register_dictation:NewB")
+            .unwrap();
+        let register_d = calls
+            .iter()
+            .position(|c| c == "register_command:NewD")
+            .unwrap();
+        assert!(
+            unregister_a < register_b,
+            "both priors must be unregistered before either new value is registered"
+        );
+        assert!(
+            unregister_c < register_b,
+            "the OTHER slot's prior must be freed before THIS slot's new value is registered \
+             (the swap-collision fix)"
+        );
+        assert!(unregister_a < register_d);
+        assert!(unregister_c < register_d);
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_a_swap_style_save_ends_with_both_new_values_live_sntl_pr274() {
+        // Dictation A -> B, Command B -> C: the new dictation value
+        // collides with the command slot's still-CURRENT value. Under the
+        // OLD (broken) ordering, registering dictation's new B before
+        // unregistering command's still-live B fails with "already
+        // registered". Unregistering both priors first is what makes this
+        // succeed cleanly.
+        let registry = SharedRegistry::new(&["A", "B"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "A",
+            "B",
+            true,
+            "B",
+            "C",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Ok(()),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(!registry.is_live("A"));
+        assert!(
+            registry.is_live("B"),
+            "B ends up live again, now under the dictation slot"
+        );
+        assert!(registry.is_live("C"));
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_dictation_register_failure_restores_both_priors_and_never_persists_sntl_pr274()
+     {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+        let mut persists = 0;
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                if h == "NewB" {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(persists, 0, "must never persist after a registration failure");
+        assert!(
+            dictation_registers.contains(&"PriorA".to_string()),
+            "dictation's own prior must be restored"
+        );
+        assert!(
+            command_registers.contains(&"PriorC".to_string()),
+            "command's prior must be restored too, even though its own new-value register was \
+             never attempted"
+        );
+        assert!(
+            !command_registers.contains(&"NewD".to_string()),
+            "command's new value must never be attempted once dictation's registration already \
+             failed"
+        );
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_command_register_failure_rolls_back_the_already_registered_dictation_value_sntl_pr274()
+     {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+        let mut persists = 0;
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                Ok(())
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                if h == "NewD" {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(persists, 0);
+        assert!(
+            unregisters.contains(&"NewB".to_string()),
+            "dictation's already-registered new value must be torn back out"
+        );
+        assert!(
+            dictation_registers
+                .iter()
+                .filter(|h| *h == "PriorA")
+                .count()
+                >= 1,
+            "dictation's prior must be re-registered"
+        );
+        assert!(
+            command_registers.contains(&"PriorC".to_string()),
+            "command's own prior must be restored (its internal rollback)"
+        );
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_persist_failure_after_both_registered_restores_both_priors_sntl_pr274()
+     {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                Ok(())
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                Ok(())
+            },
+            || Err("disk full".to_string()),
+        );
+
+        assert_eq!(result, Err("disk full".to_string()));
+        assert!(unregisters.contains(&"NewB".to_string()));
+        assert!(unregisters.contains(&"NewD".to_string()));
+        assert!(dictation_registers.contains(&"PriorA".to_string()));
+        assert!(command_registers.contains(&"PriorC".to_string()));
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_neither_changed_only_persists_once_sntl_pr274() {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+        let mut persists = 0;
+
+        let result = set_two_hotkeys_with_rollback(
+            false,
+            "A",
+            "A",
+            false,
+            "B",
+            "B",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                Ok(())
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(unregisters.is_empty());
+        assert!(dictation_registers.is_empty());
+        assert!(command_registers.is_empty());
+        assert_eq!(persists, 1);
+    }
 }
 
 /// Issue #198 tests for the AppState-free history-capture pure functions
@@ -1876,6 +2193,71 @@ mod command_dispatch_tests {
     }
 
     // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-2b757bf finding 🔴 2: a blank/
+    // whitespace-only model response must never be pasted as a silent
+    // success — that would replace the user's selection with nothing under
+    // `Ok`. `OllamaCommand::transform` (command.rs) can return
+    // `Ok(String::new())` for a degenerate model response; this guard must
+    // catch it symmetrically with the existing blank-INSTRUCTION guard
+    // above.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_a_blank_transform_result_sntl_pr274() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding("   \n  "); // whitespace-only response
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::EmptyResult));
+        assert_eq!(
+            paste.calls.get(),
+            0,
+            "a blank transform result must never reach the paste step"
+        );
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "original clipboard",
+            "the selection must be left untouched (clipboard restored), never replaced with \
+             nothing"
+        );
+    }
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_an_empty_string_transform_result_sntl_pr274() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding(""); // genuinely empty response
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::EmptyResult));
+        assert_eq!(paste.calls.get(), 0);
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+    }
+
+    // -------------------------------------------------------------
     // `captured_selection_is_usable`: the pure "was anything actually
     // selected" check `react_to_command_transition`'s `StartRecording` arm
     // runs before ever starting audio capture.
@@ -1891,6 +2273,47 @@ mod command_dispatch_tests {
         assert!(!captured_selection_is_usable(""));
         assert!(!captured_selection_is_usable("   "));
         assert!(!captured_selection_is_usable("\n\t "));
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-2b757bf finding 🔴 1: mutual
+    // exclusion over the single shared mic-capture resource
+    // (`buffer`/`diagnostics`/`capture`/`level_meter`) must be checked from
+    // BOTH hotkeys' `StartRecording` arms, not just command mode's — a
+    // dictation press while a command-mode capture is in flight must be
+    // guarded exactly like the reverse already is, or it clobbers
+    // `state.capture`/drains `state.buffer` out from under the live
+    // command-mode session. `mic_capture_is_busy` is the shared pure
+    // predicate both `react_to_transition` and `react_to_command_transition`
+    // call at the very top of their `StartRecording` arm — before any other
+    // state is touched — so it's testable without an `AppState` (#165).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn mic_capture_is_busy_when_a_capture_session_is_already_active_sntl_pr274() {
+        assert!(mic_capture_is_busy(true, false));
+    }
+
+    #[test]
+    fn mic_capture_is_busy_when_a_command_mode_selection_is_captured_but_capture_has_not_started_yet_sntl_pr274()
+     {
+        // The narrow window in `react_to_command_transition`'s
+        // `StartRecording` arm: `command_selection` is populated BEFORE
+        // `audio::CaptureSession::start` is even attempted, so `capture`
+        // can still be `None` while a command-mode press is already
+        // committed to running. The other hotkey must treat this as busy
+        // too, not just a live `capture`.
+        assert!(mic_capture_is_busy(false, true));
+    }
+
+    #[test]
+    fn mic_capture_is_busy_when_both_are_true_sntl_pr274() {
+        assert!(mic_capture_is_busy(true, true));
+    }
+
+    #[test]
+    fn mic_capture_is_free_when_neither_flag_is_set_sntl_pr274() {
+        assert!(!mic_capture_is_busy(false, false));
     }
 }
 
