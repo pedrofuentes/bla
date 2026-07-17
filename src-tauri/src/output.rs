@@ -65,6 +65,21 @@ use std::time::Duration;
 /// truncates the paste). Tuned further during the AC-7 human smoke test.
 pub const DEFAULT_RESTORE_DELAY: Duration = Duration::from_millis(200);
 
+/// Interval [`capture_selection`] waits between clipboard re-reads while
+/// polling for the synthesized copy keystroke's result to land (ac7-p0,
+/// #296/#278). The focused app services the copy asynchronously — especially
+/// on Windows — so the clipboard can still hold the stale pre-copy value for
+/// a short window after the keystroke. Paired with [`DEFAULT_CAPTURE_MAX_POLLS`].
+pub const DEFAULT_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Maximum number of clipboard re-reads [`capture_selection`] makes after the
+/// copy keystroke, spaced [`DEFAULT_CAPTURE_POLL_INTERVAL`] apart (~320 ms
+/// total), before giving up and returning the last read (ac7-p0, #296/#278).
+/// On exhaustion with the clipboard still unchanged from its pre-copy value,
+/// that last read is returned as-is so `captured_selection_is_usable` can
+/// surface the clear "no usable selection" error — no clobber, no spinning.
+pub const DEFAULT_CAPTURE_MAX_POLLS: u32 = 8;
+
 /// Thin OS-glue seam for reading/writing the real system clipboard
 /// (AGENTS.md OS-integration exemption). Implemented for real via `arboard`
 /// in [`SystemClipboard`]; tests inject a fake so
@@ -361,15 +376,32 @@ pub struct CapturedSelection {
 /// the clipboard; [`replace_selection`] is what eventually overwrites and
 /// then restores it.
 ///
-/// Reads the clipboard exactly twice (before and after the copy keystroke)
-/// and never writes to it — the OS, reacting to the synthesized keystroke
-/// while some other app holds focus and a selection, is what actually puts
-/// the selection on the clipboard, not this function.
+/// Reads the clipboard only (before and after the copy keystroke) and never
+/// writes to it — the OS, reacting to the synthesized keystroke while some
+/// other app holds focus and a selection, is what actually puts the
+/// selection on the clipboard, not this function.
+///
+/// The focused app services the synthesized copy asynchronously, so the
+/// clipboard can still hold the stale pre-copy value when we first re-read —
+/// a real timing race that surfaced on Windows as a spurious "no usable
+/// selection" (ac7-p0, #296/#278). So after the keystroke this polls: it
+/// re-reads up to `max_polls` times, sleeping `poll_interval` between reads
+/// (via the injected `sleep` seam), returning as soon as the read *differs*
+/// from the pre-copy value — the app has now written the selection. If the
+/// read never changes within the budget (e.g. the user had nothing selected,
+/// so the copy left the clipboard alone), the last read is returned as-is so
+/// `captured_selection_is_usable` can surface the clear error — no clobber.
+/// If the real selection happens to equal the prior clipboard, "unchanged"
+/// simply never trips and the (correct) value is returned after the polls
+/// exhaust; no sequence-number bookkeeping is needed for that case.
 ///
 /// `clipboard`/`copy` are the thin OS-glue seams (real impls:
-/// [`SystemClipboard`]/[`EnigoCopy`]) — this function's own logic is pure
-/// dispatch over them, fakeable in tests exactly like
-/// [`paste_via_clipboard_swap`] above.
+/// [`SystemClipboard`]/[`EnigoCopy`]); `sleep` is injected too (mirroring
+/// [`replace_selection`]'s `sleep`/`restore_delay` pair) so tests pass a
+/// no-op sleep + `poll_interval = Duration::ZERO` and a scripted fake
+/// clipboard to exercise the retry loop deterministically, never against a
+/// real clock. Real callers pass [`DEFAULT_CAPTURE_POLL_INTERVAL`] /
+/// [`DEFAULT_CAPTURE_MAX_POLLS`].
 ///
 /// Instruction/content channel separation: the returned selection is
 /// untrusted CONTENT-channel input for command mode's transform (a sibling
@@ -378,10 +410,21 @@ pub struct CapturedSelection {
 pub fn capture_selection(
     clipboard: &impl Clipboard,
     copy: &impl CopySynthesizer,
+    sleep: impl Fn(Duration),
+    poll_interval: Duration,
+    max_polls: u32,
 ) -> io::Result<CapturedSelection> {
     let pre_copy_clipboard = clipboard.get()?;
     copy.synthesize_copy()?;
-    let selection = clipboard.get()?;
+
+    let mut selection = clipboard.get()?;
+    let mut polls_remaining = max_polls;
+    while selection == pre_copy_clipboard && polls_remaining > 0 {
+        sleep(poll_interval);
+        selection = clipboard.get()?;
+        polls_remaining -= 1;
+    }
+
     Ok(CapturedSelection {
         selection: ClipboardPayload::new(selection),
         pre_copy_clipboard: ClipboardPayload::new(pre_copy_clipboard),
@@ -1422,14 +1465,8 @@ mod tests {
         let clipboard = ScriptedClipboard::new(&[""]);
         let copy = NoopCopy::new();
 
-        let captured = capture_selection(
-            &clipboard,
-            &copy,
-            |_interval| {},
-            Duration::ZERO,
-            3,
-        )
-        .unwrap();
+        let captured =
+            capture_selection(&clipboard, &copy, |_interval| {}, Duration::ZERO, 3).unwrap();
 
         assert_eq!(
             captured.selection.into_inner(),

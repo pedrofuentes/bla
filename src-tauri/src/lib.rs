@@ -3331,7 +3331,13 @@ fn react_to_command_transition(app: &tauri::AppHandle, transition: Option<hotkey
 
             state.dictation_generation.fetch_add(1, Ordering::SeqCst);
 
-            match output::capture_selection(&output::SystemClipboard, &output::EnigoCopy) {
+            match output::capture_selection(
+                &output::SystemClipboard,
+                &output::EnigoCopy,
+                std::thread::sleep,
+                output::DEFAULT_CAPTURE_POLL_INTERVAL,
+                output::DEFAULT_CAPTURE_MAX_POLLS,
+            ) {
                 Err(err) => {
                     eprintln!("bla: command-mode selection capture failed: {err}");
                     emit_pipeline_error(
