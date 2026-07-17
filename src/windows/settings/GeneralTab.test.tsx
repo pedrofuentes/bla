@@ -49,6 +49,9 @@ const BASE_SETTINGS: Settings = {
   file_base_dir: "",
   launch_at_login: false,
   sound_cues: true,
+  // Issue #259 default (src-tauri/src/settings.rs) — deliberately distinct
+  // from `hotkey` above.
+  command_hotkey: "Control+Shift+C",
 };
 
 const MODEL_REGISTRY: ModelRegistryEntry[] = [
@@ -1120,6 +1123,228 @@ describe("GeneralTab", () => {
     expect(mounted.container.querySelector('[data-testid="save-error"]')?.textContent).toMatch(
       /hotkey OS reject/i,
     );
+  });
+
+  // -------------------------------------------------------------------
+  // Issue #262 (AC-50): the command-mode hotkey field, next to the dictation
+  // one, reusing the same capture-then-Apply UI pattern (readonly input,
+  // focus enters capture, a completed chord shows PENDING until Apply,
+  // Escape/blur cancels). Persists under the `command_hotkey` wire key —
+  // verified directly against `src-tauri/src/settings.rs`'s
+  // `Settings::command_hotkey` field (no `#[serde(rename_all)]` on the
+  // struct, so the JSON key is the literal snake_case field name), the same
+  // kind of check that would have caught #237's camelCase/snake_case
+  // mismatch.
+  //
+  // Deliberately DOES NOT call `suspend_hotkey`/`resume_hotkey` while
+  // capturing: those commands target-unregister exactly the DICTATION
+  // `hotkey` (`commands::suspend_hotkey`'s doc comment), so routing the
+  // command-hotkey field's capture through them would suspend the wrong
+  // shortcut — interrupting dictation while the user types a command-hotkey
+  // chord, without protecting the command-mode hotkey itself. There is no
+  // backend suspend/resume for `command_hotkey` yet.
+  // -------------------------------------------------------------------
+
+  describe("command-mode hotkey (issue #262, AC-50)", () => {
+    it("loads settings on mount and pre-fills the command-hotkey field", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      );
+      expect(input?.value).toBe("Control+Shift+C");
+    });
+
+    it("shows a captured command-hotkey chord as PENDING and does NOT persist it", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+      focus(input);
+      invoke.mockClear();
+      keydown(input, "K", { ctrlKey: true, shiftKey: true });
+      await flush();
+
+      expect(input.value).toBe("Control+Shift+K");
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+      expect(
+        mounted.container.querySelector('[data-testid="command-hotkey-pending"]'),
+      ).not.toBeNull();
+    });
+
+    it("registers + persists the pending command-hotkey chord under the command_hotkey wire key only when Apply is clicked (AC-50)", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+      focus(input);
+      keydown(input, "K", { ctrlKey: true, shiftKey: true });
+      await flush();
+
+      invoke.mockClear();
+      const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+        '[data-testid="command-hotkey-apply-button"]',
+      )!;
+      click(applyButton);
+      await flush();
+
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: { ...BASE_SETTINGS, command_hotkey: "Control+Shift+K" },
+      });
+      expect(
+        mounted.container.querySelector('[data-testid="command-hotkey-pending"]'),
+      ).toBeNull();
+      expect(input.value).toBe("Control+Shift+K");
+    });
+
+    it("reflects a persisted command-hotkey change on reload, mirroring the dictation hotkey's own round-trip (AC-16/AC-50)", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+      mounted.unmount();
+
+      // A fresh mount (e.g. reopening the settings window) reloads from
+      // whatever's now persisted.
+      setupInvoke({
+        get_settings: () =>
+          Promise.resolve({ ...BASE_SETTINGS, command_hotkey: "Control+Shift+K" }),
+      });
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      );
+      expect(input?.value).toBe("Control+Shift+K");
+    });
+
+    it("disables Apply until a valid pending command-hotkey chord differs from the current one", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+        '[data-testid="command-hotkey-apply-button"]',
+      )!;
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+
+      expect(applyButton.disabled).toBe(true);
+
+      // Capturing the CURRENT chord leaves nothing to apply.
+      focus(input);
+      keydown(input, "C", { ctrlKey: true, shiftKey: true }); // == current
+      await flush();
+      expect(applyButton.disabled).toBe(true);
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+
+      // A different valid chord enables Apply.
+      focus(input);
+      keydown(input, "K", { ctrlKey: true, shiftKey: true });
+      await flush();
+      expect(applyButton.disabled).toBe(false);
+    });
+
+    it("shows an inline error and keeps Apply disabled for an invalid captured command-hotkey chord", async () => {
+      setupInvoke({
+        validate_hotkey: () => Promise.reject(new Error("bad accelerator")),
+      });
+
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+      focus(input);
+      invoke.mockClear();
+      keydown(input, "Z", { ctrlKey: true });
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="command-hotkey-error"]')?.textContent,
+      ).toMatch(/bad accelerator/i);
+      const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+        '[data-testid="command-hotkey-apply-button"]',
+      )!;
+      expect(applyButton.disabled).toBe(true);
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+    });
+
+    it("cancels command-hotkey capture on Escape without changing the field or calling set_settings", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+      focus(input);
+      keydown(input, "Escape");
+      await flush();
+
+      expect(input.value).toBe("Control+Shift+C");
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+    });
+
+    it("never suspends the dictation hotkey while capturing a command-hotkey chord (distinct from the dictation field's suspend/resume)", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+      invoke.mockClear();
+      focus(input);
+      keydown(input, "K", { ctrlKey: true, shiftKey: true });
+      await flush();
+
+      expect(invoke).not.toHaveBeenCalledWith("suspend_hotkey", expect.anything());
+      expect(invoke).not.toHaveBeenCalledWith("resume_hotkey", expect.anything());
+    });
+
+    it("does not clobber a concurrent dictation-hotkey Apply, and vice versa (independent pending state)", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const hotkeyInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="hotkey-input"]',
+      )!;
+      const commandInput = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+
+      focus(hotkeyInput);
+      keydown(hotkeyInput, "D", { ctrlKey: true, shiftKey: true });
+      await flush();
+
+      focus(commandInput);
+      keydown(commandInput, "K", { ctrlKey: true, shiftKey: true });
+      await flush();
+
+      expect(hotkeyInput.value).toBe("Control+Shift+D");
+      expect(commandInput.value).toBe("Control+Shift+K");
+
+      invoke.mockClear();
+      const commandApplyButton = mounted.container.querySelector<HTMLButtonElement>(
+        '[data-testid="command-hotkey-apply-button"]',
+      )!;
+      click(commandApplyButton);
+      await flush();
+
+      expect(invoke).toHaveBeenCalledWith("set_settings", {
+        settings: { ...BASE_SETTINGS, command_hotkey: "Control+Shift+K" },
+      });
+      // The still-pending dictation-hotkey chord survives the command-hotkey
+      // Apply untouched.
+      expect(hotkeyInput.value).toBe("Control+Shift+D");
+      expect(
+        mounted.container.querySelector('[data-testid="hotkey-pending"]'),
+      ).not.toBeNull();
+    });
   });
 
   // -------------------------------------------------------------------

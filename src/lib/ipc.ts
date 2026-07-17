@@ -56,6 +56,22 @@ export interface Settings {
    * fixtures) keep type-checking; treat a missing value as `0`.
    */
   retention_days?: number;
+  /**
+   * Issue #259 (M4 command-mode backbone): the command-mode global hotkey,
+   * persisted independently of `hotkey` — mirrors
+   * `settings::Settings::command_hotkey`. That Rust field carries no
+   * `#[serde(rename_all)]` (its struct-level attribute only governs missing-
+   * field defaulting, not casing), so its JSON key is the literal snake_case
+   * field name, `command_hotkey` — verified directly against
+   * `src-tauri/src/settings.rs` for issue #262, the same way #237's
+   * camelCase/snake_case wire mismatch should have been caught. Optional
+   * here for the same reason as `file_base_dir`/`retention_days` above: TS
+   * object literals built before this field existed keep type-checking;
+   * the settings window's command-hotkey field (#262) treats a missing
+   * value as an empty pending display, since the backend's own
+   * `#[serde(default)]` guarantees a real load always has one.
+   */
+  command_hotkey?: string;
 }
 
 /**
