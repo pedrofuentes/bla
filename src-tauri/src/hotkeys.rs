@@ -576,6 +576,77 @@ mod tests {
         assert!(distinct_hotkeys(&settings.hotkey, &settings.command_hotkey).is_ok());
     }
 
+    // -----------------------------------------------------------------
+    // Issue #281 (ac7-p0): the command-mode hotkey's TRIGGER key must be a
+    // function key (F1-F24) — see `validate_command_hotkey_keyset`'s doc
+    // comment for the full rationale (a leaked character-producing key
+    // clobbers the CONTENT selection; a function key produces no
+    // character, so it's harmless if the OS/plugin leaks it while held).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_command_hotkey_keyset_accepts_function_key_chords_issue_281() {
+        for good in [
+            "Control+Shift+F13",
+            "Alt+F1",
+            "Cmd+F24",
+            "Control+Alt+Shift+Super+F7",
+            "F12",
+        ] {
+            assert!(
+                validate_command_hotkey_keyset(good).is_ok(),
+                "expected {good:?} to be accepted as a command-mode hotkey"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_hotkey_keyset_rejects_character_producing_trigger_keys_issue_281() {
+        // A representative sample of the harm class this exists to prevent:
+        // letters, digits, punctuation, space, Enter, and Tab all produce a
+        // text character when leaked — exactly what clobbered the selection
+        // in #281's repro (`Ctrl+Shift+O` -> "oooo").
+        for bad in [
+            "Control+Shift+C",  // the #281 repro's letter key
+            "Control+Shift+O",  // the #281 repro's exact chord
+            "Control+Shift+1",  // digit
+            "Control+Comma",    // punctuation
+            "Control+Shift+Space",
+            "Control+Enter",
+            "Control+Tab",
+        ] {
+            let err = validate_command_hotkey_keyset(bad)
+                .expect_err(&format!("expected {bad:?} to be rejected"));
+            assert!(
+                err.to_lowercase().contains("function key"),
+                "expected a clear function-key explanation for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_hotkey_keyset_rejects_non_function_non_character_keys_issue_281() {
+        // Arrow/navigation keys don't produce a text character either, but
+        // the cofounder-decided allowlist is specifically function keys —
+        // not "any non-character key" — so these must still be rejected.
+        for bad in ["Control+ArrowUp", "Control+Home", "Control+Escape"] {
+            assert!(
+                validate_command_hotkey_keyset(bad).is_err(),
+                "expected {bad:?} to be rejected — only function keys are allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_hotkey_keyset_propagates_a_malformed_accelerators_parse_error_issue_281() {
+        for bad in ["", "NotARealKey", "Ctrl+", "Control+Shift"] {
+            assert!(
+                validate_command_hotkey_keyset(bad).is_err(),
+                "expected {bad:?} to be rejected as an unparseable accelerator"
+            );
+        }
+    }
+
     #[test]
     fn resolve_effective_hotkey_keeps_a_valid_persisted_binding() {
         let effective = resolve_effective_hotkey("Cmd+Shift+D", "Control+Option+Space");
