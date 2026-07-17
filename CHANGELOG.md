@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.2.0] — M2: UI shell (pending AC-7 cofounder smoke test)
+## [0.2.0] — 2026-07-17 (M1 + M2 shipped)
 
 ### Added
 
@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Launch-at-login + sound-cue preference (issue #126): a new "Launch bla at login" checkbox in the settings window's General tab enables/disables OS login autostart immediately on save (via `tauri-plugin-autostart`), and a new "Play sound cues" checkbox persists the preference cue playback will read starting in the next M2 increment.
 - Synthesized sound cues (issue #126): the recording pill now plays a short, purely synthesized tone (Web Audio `OscillatorNode`, no bundled audio files or recordings) on dictation start, on a successfully completed dictation, and on error — gated by the existing "Play sound cues" preference from the settings window's General tab, and silent for a cancelled dictation so cancelling never sounds like a failure.
 
-## [0.1.0] — M1: MVP dictation pipeline (pending AC-7 gate #27)
+## [0.1.0] — M1: MVP dictation pipeline
+
+> **Note:** M1 was released as part of v0.2.0 (2026-07-17); no separate v0.1.0 tag was cut. The M1 features below shipped together with M2 features under the v0.2.0 release.
 
 ### Added
 

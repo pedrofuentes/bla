@@ -4,7 +4,7 @@
 
 ## Current Phase
 
-Phase 0/1 — harness bootstrapped; discovery (PRD) and board seeding for M1 in progress.
+Phase 1 — M1 (MVP dictation pipeline) and M2 (UI shell) shipped as v0.2.0 (2026-07-17); M3 and M4 in development.
 
 ## Milestones
 
@@ -44,9 +44,9 @@ Phase 0/1 — harness bootstrapped; discovery (PRD) and board seeding for M1 in 
 
 | Milestone | Version | Status |
 |-----------|---------|--------|
-| M1 — MVP dictation pipeline | v0.1 | in-progress |
+| M1 — MVP dictation pipeline | v0.2.0 | done (shipped 2026-07-17) |
 | Windows runtime support | cross-cutting | in-progress (Increment A) |
-| M2 — UI shell | v0.2 | awaiting AC-7 |
+| M2 — UI shell | v0.2.0 | done (shipped 2026-07-17) |
 | M3 — Context features | v0.3 | pending |
 | M4 — Command mode & snippets | v0.4 | pending |
 | M5 — Polish & packaging | v1.0 | pending |
