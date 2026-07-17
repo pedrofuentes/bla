@@ -90,10 +90,24 @@ pub struct Settings {
     /// — thin OS glue in `lib.rs`/`commands::set_settings`; this field is
     /// only the durable preference.
     pub retention_days: u32,
-    // TODO(#259, TDD green step): `pub command_hotkey: String` field goes
-    // here — intentionally omitted in this red commit so `settings::tests`'
-    // new AC-49-adjacent tests (and their `non_default_settings()` fixture)
-    // below fail to compile.
+    /// The command-mode global hotkey (issue #259, part of #242, M4):
+    /// pressing/holding it drives its OWN `hotkeys::StateMachine` instance
+    /// (`lib.rs::AppState::command_hotkeys`), independent of the dictation
+    /// hotkey's — capture selection → transcribe the spoken instruction →
+    /// transform → replace selection, rather than a dictation. Persisted
+    /// separately from `hotkey` (never derived from it) so the two can be
+    /// rebound independently; [`hotkeys::distinct_hotkeys`](crate::hotkeys::distinct_hotkeys)
+    /// is the AC-49 guard `commands::set_settings` runs before persisting
+    /// either, rejecting a save that would leave both hotkeys bound to the
+    /// same accelerator (which would otherwise make one silently shadow the
+    /// other's OS registration). Defaults to `"Control+Shift+C"` —
+    /// deliberately distinct from `Settings::default().hotkey`
+    /// (`"Control+Shift+Space"`), using the same cross-platform-safe
+    /// modifier spelling (issue #110: no macOS-only `"Option"` alias).
+    /// There is no settings-window capture UI for this field yet (that's
+    /// issue #262) — a settings.json predating this field falls back to
+    /// this default via `#[serde(default)]`, same as every other field.
+    pub command_hotkey: String,
 }
 
 impl Default for Settings {
@@ -119,6 +133,10 @@ impl Default for Settings {
             launch_at_login: false,
             sound_cues: true,
             retention_days: 0,
+            // Issue #259: distinct from `hotkey` above by construction —
+            // `hotkeys_default_and_command_default_are_distinct_issue_259`
+            // pins this so the two can never silently drift back together.
+            command_hotkey: "Control+Shift+C".to_string(),
         }
     }
 }

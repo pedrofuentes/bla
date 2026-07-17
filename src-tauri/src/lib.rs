@@ -115,8 +115,28 @@ struct CachedStt {
 /// different threads.
 pub(crate) struct AppState {
     hotkeys: Mutex<hotkeys::StateMachine>,
-    // TODO(#259, TDD green step): `command_hotkeys`/`command_selection`
-    // fields go here — intentionally omitted in this red commit.
+    /// Issue #259 (M4 command-mode backbone, part of #242): the command-mode
+    /// hotkey's own hold/toggle `StateMachine` instance — a separate press/
+    /// release *session* from `hotkeys` above, so a command-mode chord can
+    /// never be misread as (or interfere with) a dictation chord's phase, or
+    /// vice versa. Both machines currently mirror the same persisted
+    /// `Settings::recording_mode` (Hold vs. Toggle) — see `apply_settings` —
+    /// there's no separate per-mode setting for command mode in this PR.
+    /// They still share the single physical mic-capture resource below
+    /// (`buffer`/`diagnostics`/`capture`/`level_meter`): only one of the two
+    /// chords can actually be recording at a time, guarded in
+    /// `react_to_command_transition`'s `StartRecording` arm.
+    command_hotkeys: Mutex<hotkeys::StateMachine>,
+    /// Issue #259: the selection captured (`output::capture_selection`) at
+    /// the command-mode hotkey's press, stashed here until the matching
+    /// release/second-press hands it to `run_command_in_background`. `None`
+    /// whenever no command-mode capture is in flight — including right
+    /// after a press whose capture failed, found nothing selected, or was
+    /// skipped because a dictation was already recording (see
+    /// `react_to_command_transition`'s `StartRecording` arm) — which its
+    /// `StopRecording` arm reads as "already surfaced a notice at press
+    /// time; quietly clean up, nothing to run."
+    command_selection: Mutex<Option<output::CapturedSelection>>,
     buffer: audio::SharedRingBuffer,
     diagnostics: Arc<audio::CaptureDiagnostics>,
     capture: Mutex<Option<audio::CaptureSession>>,
@@ -288,27 +308,35 @@ fn to_tray_output_mode(mode: settings::OutputModeSetting) -> tray::OutputMode {
 /// constructing an `AppState` (or any native-runtime-typed field) from test
 /// code.
 ///
-// TODO(#259, TDD green step): `apply_settings`/`apply_settings_to_state`
-// grow a second `command_hotkeys` machine + tuple return here —
-// intentionally left at their pre-#259 shape in this red commit, so
-// `apply_settings_tests`' new/updated tests below (which already call the
-// 4-arg/tuple-return shape) fail to compile.
+/// Returns the [`hotkeys::Transition`] each machine's mode flip produced —
+/// `(dictation, command)` — `Some(Cancelled)` in either slot when the flip
+/// interrupted an in-flight session — for the caller to hand to
+/// [`react_to_transition`]/[`react_to_command_transition`] respectively,
+/// which stop capture and discard the buffered audio.
+///
+/// Issue #259: `command_hotkeys` is flipped alongside `hotkeys` because both
+/// machines currently mirror the SAME persisted `recording_mode` (there is
+/// no separate per-mode setting for command mode in this PR) — without this,
+/// a saved Hold↔Toggle change would take effect on the live dictation
+/// machine immediately (the #126 fix this function already provides) but
+/// only reach the command-mode machine after a restart, reintroducing
+/// exactly the staleness #126 fixed, just for the newer hotkey.
 fn apply_settings(
     hotkeys: &Mutex<hotkeys::StateMachine>,
+    command_hotkeys: &Mutex<hotkeys::StateMachine>,
     output_switch: &Mutex<tray::OutputModeSwitch>,
     settings_slot: &Mutex<settings::Settings>,
     settings: settings::Settings,
-) -> Option<hotkeys::Transition> {
-    let transition = hotkeys
-        .lock()
-        .unwrap()
-        .set_mode(to_hotkey_mode(settings.recording_mode));
+) -> (Option<hotkeys::Transition>, Option<hotkeys::Transition>) {
+    let mode = to_hotkey_mode(settings.recording_mode);
+    let transition = hotkeys.lock().unwrap().set_mode(mode);
+    let command_transition = command_hotkeys.lock().unwrap().set_mode(mode);
     output_switch
         .lock()
         .unwrap()
         .set_mode(to_tray_output_mode(settings.output_mode));
     *settings_slot.lock().unwrap() = settings;
-    transition
+    (transition, command_transition)
 }
 
 /// `AppState`-shaped wrapper over [`apply_settings`] — the entry point
@@ -320,8 +348,14 @@ fn apply_settings(
 pub(crate) fn apply_settings_to_state(
     state: &AppState,
     settings: settings::Settings,
-) -> Option<hotkeys::Transition> {
-    apply_settings(&state.hotkeys, &state.output_switch, &state.settings, settings)
+) -> (Option<hotkeys::Transition>, Option<hotkeys::Transition>) {
+    apply_settings(
+        &state.hotkeys,
+        &state.command_hotkeys,
+        &state.output_switch,
+        &state.settings,
+        settings,
+    )
 }
 
 /// Translate the persisted [`settings::ModelPreset`] to the models
@@ -1892,16 +1926,32 @@ fn save_settings_to_store(
     store.save().map_err(|e| e.to_string())
 }
 
-// TODO(#259, TDD green step): `register_hotkey`/`unregister_hotkey` grow a
-// `prior`-targeted-unregister parameter, and a new sibling
-// `register_command_hotkey` appears here, in the green commit — left at
-// their pre-#259 shape/absence in this red commit.
+/// Registers `hotkey` (a string like `"Control+Option+Space"`) as the
+/// global shortcut driving the DICTATION hotkeys state machine.
+///
+/// **Issue #259 (M4 command-mode backbone):** `prior`, if given, is
+/// unregistered FIRST via a TARGETED [`unregister`](tauri_plugin_global_shortcut::GlobalShortcut::unregister)
+/// of that exact accelerator — never [`unregister_all`](tauri_plugin_global_shortcut::GlobalShortcut::unregister_all).
+/// Before the command-mode hotkey existed, this function *did* call
+/// `unregister_all()`, which was safe only because there was exactly one
+/// global shortcut ever registered; doing that now would silently drop the
+/// OTHER hotkey (dictation's or command mode's) out from under whichever
+/// one wasn't just changed. `prior` is `None` at startup (nothing registered
+/// yet) and `Some(previously-registered value)` on every re-registration
+/// (`commands::set_settings`'s register-before-persist path, and its
+/// rollback path, which passes the value that just got bound so it can be
+/// un-done). Unregistering `prior` is best-effort (`let _ =`): it may
+/// already be gone (nothing was ever registered, or the OS already dropped
+/// it), and that must never block registering `hotkey`.
 fn register_hotkey(
     app: &tauri::AppHandle,
+    prior: Option<&str>,
     hotkey: &str,
 ) -> Result<(), tauri_plugin_global_shortcut::Error> {
     let global_shortcut = app.global_shortcut();
-    let _ = global_shortcut.unregister_all();
+    if let Some(prior) = prior {
+        let _ = global_shortcut.unregister(prior);
+    }
     let handler_handle = app.clone();
     global_shortcut.on_shortcut(hotkey, move |_app, _shortcut, event| {
         let key_event = match event.state() {
@@ -1912,14 +1962,49 @@ fn register_hotkey(
     })
 }
 
+/// Registers `hotkey` as the global shortcut driving the COMMAND-MODE
+/// hotkeys state machine (issue #259) — mirrors [`register_hotkey`] exactly,
+/// one key over: same targeted-`unregister`-of-`prior` discipline (never
+/// `unregister_all()`, for the identical reason — it would drop the
+/// dictation hotkey too), dispatching to [`handle_command_key_event`]
+/// instead of [`handle_key_event`].
+fn register_command_hotkey(
+    app: &tauri::AppHandle,
+    prior: Option<&str>,
+    hotkey: &str,
+) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    let global_shortcut = app.global_shortcut();
+    if let Some(prior) = prior {
+        let _ = global_shortcut.unregister(prior);
+    }
+    let handler_handle = app.clone();
+    global_shortcut.on_shortcut(hotkey, move |_app, _shortcut, event| {
+        let key_event = match event.state() {
+            ShortcutState::Pressed => hotkeys::KeyEvent::KeyDown(0, monotonic_now()),
+            ShortcutState::Released => hotkeys::KeyEvent::KeyUp(0, monotonic_now()),
+        };
+        handle_command_key_event(&handler_handle, key_event);
+    })
+}
+
 /// Unregisters the global dictation hotkey without registering a new one
 /// (issue #181, `commands::suspend_hotkey`) — called while the settings
 /// window's hotkey-capture field is active so keypresses are captured for
 /// rebinding instead of also triggering a dictation via the still-live
 /// shortcut. [`register_hotkey`]/`commands::resume_hotkey` re-register when
 /// capture ends.
-fn unregister_hotkey(app: &tauri::AppHandle) -> Result<(), tauri_plugin_global_shortcut::Error> {
-    app.global_shortcut().unregister_all()
+///
+/// Issue #259: targets exactly `hotkey` (the caller passes the CURRENT
+/// dictation hotkey) via [`unregister`](tauri_plugin_global_shortcut::GlobalShortcut::unregister)
+/// — never `unregister_all()`, which would also drop the independently-
+/// registered command-mode hotkey (there is no settings-window capture UI
+/// for command mode yet — issue #262 — so only the dictation hotkey ever
+/// goes through suspend/resume in this PR).
+fn unregister_hotkey(
+    app: &tauri::AppHandle,
+    hotkey: &str,
+) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    app.global_shortcut().unregister(hotkey)
 }
 
 /// Whether a window `label` is allowed to suspend/resume the global
@@ -1995,7 +2080,11 @@ fn force_resume_hotkey(app: &tauri::AppHandle) {
     let hotkey = state.settings.lock().unwrap().hotkey.clone();
     let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
     if *gen_slot != 0 {
-        if let Err(err) = register_hotkey(app, &hotkey) {
+        // `None` prior: `suspend_hotkey` already target-unregistered this
+        // exact hotkey (issue #259 — see `unregister_hotkey`'s doc), so
+        // there's nothing left registered under this slot to unregister
+        // again here.
+        if let Err(err) = register_hotkey(app, None, &hotkey) {
             eprintln!("bla: failed to restore global hotkey on settings-window close: {err}");
         }
         *gen_slot = 0;
@@ -2129,6 +2218,194 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             stop_level_poller(&state);
             state.buffer.lock().unwrap().drain();
             state.diagnostics.clear_error();
+            set_pipeline_state(app, tray::PipelineState::Idle);
+        }
+        None => {}
+    }
+}
+
+/// Whether a captured selection (`output::capture_selection`'s `.selection`
+/// field, already unwrapped to plain text by the caller) is non-blank enough
+/// to run command mode's transform over (issue #259). A blank capture means
+/// the user pressed the command-mode hotkey with nothing actually selected
+/// (most apps leave the clipboard untouched by a copy keystroke with no
+/// selection) — command mode must degrade safely in that case (a kind-only
+/// notice, no transform attempted, no capture started) rather than sending
+/// an empty CONTENT-channel string through the LLM transform.
+fn captured_selection_is_usable(selection: &str) -> bool {
+    !selection.trim().is_empty()
+}
+
+/// OS glue: feed one key event into the shared COMMAND-MODE state machine
+/// and react to whatever [`hotkeys::Transition`] it produces (issue #259).
+/// Mirrors [`handle_key_event`] exactly, one machine over.
+fn handle_command_key_event(app: &tauri::AppHandle, event: hotkeys::KeyEvent) {
+    let state = app.state::<AppState>();
+    let transition = state.command_hotkeys.lock().unwrap().handle(event);
+    react_to_command_transition(app, transition);
+}
+
+/// Issue #259 (mirrors issue #44's `reconcile_hotkeys_on_focus_loss`): called
+/// on window focus-loss to reconcile a possibly-dropped `KeyUp` on the
+/// COMMAND-MODE machine, so it can never wedge in `Holding` either.
+fn reconcile_command_hotkeys_on_focus_loss(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let transition = state.command_hotkeys.lock().unwrap().reset();
+    react_to_command_transition(app, transition);
+}
+
+/// React to a COMMAND-MODE `hotkeys::Transition` (issue #259, part of #242):
+/// on `StartRecording`, capture the active selection (#257) and — only if
+/// something was actually selected, and no dictation is already using the
+/// single shared mic-capture resource — start recording the spoken
+/// instruction; on `StopRecording`, hand the captured selection + recorded
+/// audio to [`run_command_in_background`]; on `Cancelled` (debounce/reset),
+/// discard the recording and restore the clipboard if a selection was
+/// already captured. Reuses the exact same `AppState::dictation_generation`/
+/// pill/tray machinery `react_to_transition` does (see that field's doc
+/// comment for why they're shared) — no new tray/pill state, no forked
+/// generation counter.
+fn react_to_command_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Transition>) {
+    use output::Clipboard as _;
+
+    let state = app.state::<AppState>();
+    match transition {
+        Some(hotkeys::Transition::StartRecording) => {
+            // Physical mic capture is a single shared resource
+            // (`buffer`/`diagnostics`/`capture`/`level_meter`) — if a
+            // dictation (or another command-mode press, though the state
+            // machine itself already prevents that) already owns it, degrade
+            // safely: no capture, no clipboard touched, a kind-only notice.
+            if state.capture.lock().unwrap().is_some() {
+                emit_pipeline_error(
+                    app,
+                    &errors::ErrorKind::Other {
+                        message: "Command mode is unavailable while a dictation is recording."
+                            .to_string(),
+                    },
+                );
+                return;
+            }
+
+            state.dictation_generation.fetch_add(1, Ordering::SeqCst);
+
+            match output::capture_selection(&output::SystemClipboard, &output::EnigoCopy) {
+                Err(err) => {
+                    eprintln!("bla: command-mode selection capture failed: {err}");
+                    emit_pipeline_error(
+                        app,
+                        &errors::ErrorKind::Other {
+                            message: "Couldn't read the current selection.".to_string(),
+                        },
+                    );
+                    // capture_selection never writes to the clipboard on its
+                    // own failure paths (it only reads, plus the OS's own
+                    // copy-keystroke side effect) — nothing to restore.
+                }
+                Ok(captured) => {
+                    let content = captured.selection.into_inner();
+                    if !captured_selection_is_usable(&content) {
+                        emit_pipeline_error(
+                            app,
+                            &errors::ErrorKind::Other {
+                                message: "Nothing was selected.".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                    *state.command_selection.lock().unwrap() = Some(output::CapturedSelection {
+                        selection: output::ClipboardPayload::new(content),
+                        pre_copy_clipboard: captured.pre_copy_clipboard,
+                    });
+
+                    state.buffer.lock().unwrap().drain();
+                    state.diagnostics.clear_error();
+                    match audio::CaptureSession::start(
+                        state.buffer.clone(),
+                        state.diagnostics.clone(),
+                        state.level_meter.clone(),
+                    ) {
+                        Ok(session) => {
+                            *state.capture.lock().unwrap() = Some(session);
+                            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                            *state.level_poll_stop.lock().unwrap() = Some(stop_tx);
+                            spawn_level_poller(app.clone(), state.level_meter.clone(), stop_rx);
+                            set_pipeline_state(app, tray::PipelineState::Recording);
+                        }
+                        Err(err) => {
+                            eprintln!("bla: failed to start command-mode audio capture: {err}");
+                            emit_pipeline_error(app, &errors::error_kind_for_capture_error(&err));
+                            set_pipeline_state(app, tray::PipelineState::Error);
+                            // `command_selection` is deliberately left
+                            // populated: no clipboard restore happens here.
+                            // `capture` never got set, so when the eventual
+                            // `StopRecording` (chord release) arrives below,
+                            // it reads an empty drained buffer and hands
+                            // `run_command_in_background` zero samples —
+                            // `run_command_transform`'s `samples.is_empty()`
+                            // guard is what actually restores the clipboard
+                            // at that point. Restoring it here too would
+                            // just race whatever the user's clipboard holds
+                            // by the time that second restore ran.
+                        }
+                    }
+                }
+            }
+        }
+        Some(hotkeys::Transition::StopRecording) => {
+            let session = state.capture.lock().unwrap().take();
+            if let Some(session) = session {
+                session.stop();
+            }
+            stop_level_poller(&state);
+
+            let captured = state.command_selection.lock().unwrap().take();
+            let Some(captured) = captured else {
+                // StartRecording never got as far as capturing a usable
+                // selection (guarded start, capture failure, or nothing
+                // selected) — a notice was already surfaced there; quietly
+                // clean up.
+                state.diagnostics.clear_error();
+                state.buffer.lock().unwrap().drain();
+                set_pipeline_state(app, tray::PipelineState::Idle);
+                return;
+            };
+
+            if let Some(err) = state.diagnostics.last_error() {
+                eprintln!("bla: command-mode audio capture was degraded, discarding: {err}");
+                state.diagnostics.clear_error();
+                state.buffer.lock().unwrap().drain();
+                let _ = output::SystemClipboard.set(&captured.pre_copy_clipboard.into_inner());
+                emit_pipeline_error(
+                    app,
+                    &errors::ErrorKind::Other {
+                        message: "Couldn't record the spoken instruction.".to_string(),
+                    },
+                );
+                set_pipeline_state(app, tray::PipelineState::Error);
+                return;
+            }
+
+            let samples = state.buffer.lock().unwrap().drain();
+            let generation = state.dictation_generation.load(Ordering::SeqCst);
+            set_pipeline_state(app, tray::PipelineState::Transcribing);
+            run_command_in_background(app.clone(), samples, captured, generation);
+        }
+        Some(hotkeys::Transition::Cancelled) => {
+            let session = state.capture.lock().unwrap().take();
+            if let Some(session) = session {
+                session.stop();
+            }
+            stop_level_poller(&state);
+            state.buffer.lock().unwrap().drain();
+            state.diagnostics.clear_error();
+            if let Some(captured) = state.command_selection.lock().unwrap().take() {
+                // A selection was already captured before this press was
+                // cancelled (debounce, or a focus-loss reconcile) — restore
+                // the user's original clipboard rather than leaving the
+                // captured selection sitting on it.
+                let _ = output::SystemClipboard.set(&captured.pre_copy_clipboard.into_inner());
+            }
             set_pipeline_state(app, tray::PipelineState::Idle);
         }
         None => {}
@@ -2948,9 +3225,217 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
     });
 }
 
-// TODO(#259, TDD green step): `CommandRunError`, `run_command_transform`,
-// and `run_command_in_background` go here — intentionally omitted in this
-// red commit so `command_dispatch_tests` below fails to compile.
+/// What went wrong in [`run_command_transform`] (issue #259, part of #242).
+/// Every variant is reached only AFTER that function has already restored
+/// the clipboard (or, for [`CommandRunError::Paste`], after
+/// `output::replace_selection` restored it internally on a paste-synthesis
+/// failure) — see that function's doc comment for the invariant this
+/// guarantees. `run_command_in_background` maps each variant to a
+/// kind-only, static notice string (never the wrapped error's own text —
+/// same HARD RULE `errors.rs` enforces for the dictation path).
+#[derive(Debug, PartialEq, Eq)]
+enum CommandRunError {
+    /// No audio was captured, or the transcribed instruction was blank —
+    /// there was nothing to run the transform with.
+    NoInstruction,
+    /// `Stt::transcribe` failed.
+    Transcription(stt::SttError),
+    /// `CommandTransform::transform` failed (AC-47: never a deterministic
+    /// fallback for command mode, unlike dictation's `RegexCleanup`).
+    Transform(command::CommandError),
+    /// `output::replace_selection` failed to synthesize the paste keystroke
+    /// or observe the post-paste clipboard; it already restored the
+    /// original clipboard internally before returning `Err` (see its own
+    /// doc comment), so this variant carries no further cleanup obligation.
+    Paste,
+}
+
+/// Command mode's core orchestration (issue #259, AC-23): transcribe the
+/// recorded spoken instruction, transform `content` (the selection captured
+/// by `output::capture_selection`, untrusted CONTENT-channel input) through
+/// it via #256's separated-channel `CommandTransform`, and paste the result
+/// back over the selection via #257's `output::replace_selection` —
+/// restoring `pre_copy_clipboard` (the user's original clipboard, saved by
+/// `output::capture_selection` before command mode ever touched it) in
+/// EVERY failure branch, so a failure never leaves the clipboard holding the
+/// mid-flow captured-selection value instead of what the user actually had.
+///
+/// Generic over `stt::Stt`/`command::CommandTransform`/`output::Clipboard`/
+/// `output::PasteSynthesizer` exactly like `pipeline::Pipeline`'s own
+/// generic shape, so — despite its production caller
+/// (`run_command_in_background`) being OS glue — this function itself is
+/// unit-testable with fakes/stubs, no `AppState`/`tauri::Wry` involved
+/// (issue #165's Windows-CI hard rule). This is where AC-23's "asserted in
+/// `cargo test` with a stubbed selection and fixture instruction audio,
+/// asserting output text and post-paste clipboard state" actually lives —
+/// see `command_dispatch_tests` below.
+///
+/// **Instruction/content channel separation (this PR's file-scope
+/// constraint):** `content` and the transcribed `instruction` are threaded
+/// through as two distinct arguments all the way to `transform.transform(&content, &instruction)`
+/// — never concatenated anywhere in this function.
+#[allow(clippy::too_many_arguments)] // mirrors output::route's identical justification: pure
+                                     // dispatch logic over several independently-injected seams
+fn run_command_transform(
+    stt: &impl stt::Stt,
+    transform: &impl command::CommandTransform,
+    clipboard: &impl output::Clipboard,
+    paste: &impl output::PasteSynthesizer,
+    sleep: impl FnOnce(std::time::Duration),
+    samples: &[f32],
+    content: String,
+    pre_copy_clipboard: String,
+) -> Result<String, CommandRunError> {
+    if samples.is_empty() {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::NoInstruction);
+    }
+
+    let instruction = match stt.transcribe(samples, &stt::TranscribeOpts::default()) {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = clipboard.set(&pre_copy_clipboard);
+            return Err(CommandRunError::Transcription(err));
+        }
+    };
+
+    if instruction.trim().is_empty() {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::NoInstruction);
+    }
+
+    let transformed = match transform.transform(&content, &instruction) {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = clipboard.set(&pre_copy_clipboard);
+            return Err(CommandRunError::Transform(err));
+        }
+    };
+
+    match output::replace_selection(
+        clipboard,
+        paste,
+        sleep,
+        output::ClipboardPayload::new(pre_copy_clipboard),
+        output::ClipboardPayload::new(transformed.clone()),
+        output::DEFAULT_RESTORE_DELAY,
+    ) {
+        Ok(()) => Ok(transformed),
+        Err(_) => Err(CommandRunError::Paste),
+    }
+}
+
+/// Runs command mode's background flow (issue #259, part of #242) over a
+/// recorded instruction + a selection already captured by
+/// `react_to_command_transition`'s `StartRecording` arm, in a background
+/// thread so the shortcut-handler callback that triggered `StopRecording`
+/// never blocks on transcription. Thin OS glue over [`run_command_transform`]
+/// (the actual, unit-tested orchestration): builds the real `Stt`/
+/// `CommandTransform`/`Clipboard`/`PasteSynthesizer` and gates every
+/// UI-visible effect (notice emit, pipeline state write, pill settle) behind
+/// [`generation_is_live`] — mirroring `run_pipeline_in_background`'s own
+/// "the real effect is unconditional, only the UI feedback is gated"
+/// pattern: `run_command_transform` has ALREADY restored the clipboard by
+/// the time this function checks liveness, so a stale generation still
+/// leaves the user's clipboard correct, it just skips telling them why.
+fn run_command_in_background(
+    app: tauri::AppHandle,
+    samples: Vec<f32>,
+    captured: output::CapturedSelection,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let content = captured.selection.into_inner();
+        let pre_copy_clipboard = captured.pre_copy_clipboard.into_inner();
+
+        let settings = { app.state::<AppState>().settings.lock().unwrap().clone() };
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("bla"));
+
+        #[cfg(feature = "whisper")]
+        let stt_result = {
+            let state = app.state::<AppState>();
+            build_stt(&settings, &app_data_dir, &state.stt_cache)
+        };
+        #[cfg(not(feature = "whisper"))]
+        let stt_result = build_stt(&settings, &app_data_dir);
+
+        let stt_engine = match stt_result {
+            Ok(engine) => engine,
+            Err(msg) => {
+                eprintln!("bla: {msg}");
+                use output::Clipboard as _;
+                let _ = output::SystemClipboard.set(&pre_copy_clipboard);
+                if generation_is_live(&app, generation) {
+                    emit_pipeline_error(&app, &errors::error_kind_for_build_stt_failure(&msg));
+                    set_pipeline_state(&app, tray::PipelineState::Error);
+                }
+                return;
+            }
+        };
+
+        let command_transform = command::OllamaCommand::with_default_base_url(
+            "llama3",
+            cleanup::UreqTransport::default(),
+        );
+
+        let result = run_command_transform(
+            &stt_engine,
+            &command_transform,
+            &output::SystemClipboard,
+            &output::EnigoPaste,
+            std::thread::sleep,
+            &samples,
+            content,
+            pre_copy_clipboard,
+        );
+
+        match result {
+            Ok(_transformed) => {
+                if !generation_is_live(&app, generation) {
+                    return;
+                }
+                // Issue #259: no history-row persistence for command-mode
+                // text (explicitly out of scope for this PR, per #242's
+                // AC-29 not requesting it) — otherwise mirrors dictation's
+                // completed-run settle for the same "done" pill confirmation
+                // (issue #151).
+                let previous = app
+                    .state::<AppState>()
+                    .pipeline_display
+                    .lock()
+                    .unwrap()
+                    .state;
+                settle_idle_keeping_pill_for_done(&app, previous, generation);
+            }
+            Err(err) => {
+                if !generation_is_live(&app, generation) {
+                    return;
+                }
+                let message = match &err {
+                    CommandRunError::NoInstruction => "No instruction was heard.",
+                    CommandRunError::Transcription(_) => {
+                        "Couldn't transcribe the spoken instruction."
+                    }
+                    CommandRunError::Transform(_) => {
+                        "Local AI is unreachable; command mode couldn't run."
+                    }
+                    CommandRunError::Paste => "Couldn't paste the transformed text.",
+                };
+                eprintln!("bla: command mode failed: {err:?}");
+                emit_pipeline_error(
+                    &app,
+                    &errors::ErrorKind::Other {
+                        message: message.to_string(),
+                    },
+                );
+                set_pipeline_state(&app, tray::PipelineState::Error);
+            }
+        }
+    });
+}
 
 /// Wall-clock `output::Clock` for file-mode path/timestamp templating —
 /// the one place this crate's OS-glue reads the real system clock (`output`
@@ -3153,15 +3638,22 @@ pub fn run() {
                 eprintln!("bla: failed to prune history on startup: {err}");
             }
 
-            // TODO(#259, TDD green step): AppState grows `command_hotkeys`/
-            // `command_selection` fields here — intentionally omitted in
-            // this red commit.
             let state = AppState {
                 hotkeys: Mutex::new(hotkeys::StateMachine::new(
                     to_hotkey_mode(settings.recording_mode),
                     [0u32],
                     hotkeys::DEFAULT_DEBOUNCE,
                 )),
+                // Issue #259: mirrors `hotkeys` above (same recording_mode —
+                // see `apply_settings`'s doc comment on why the two share
+                // it), driving the command-mode hotkey's own independent
+                // press/release session.
+                command_hotkeys: Mutex::new(hotkeys::StateMachine::new(
+                    to_hotkey_mode(settings.recording_mode),
+                    [0u32],
+                    hotkeys::DEFAULT_DEBOUNCE,
+                )),
+                command_selection: Mutex::new(None),
                 buffer: Arc::new(Mutex::new(audio::RingBuffer::new(
                     audio::TARGET_SAMPLE_RATE as usize * MAX_CAPTURE_SECONDS,
                 ))),
@@ -3200,15 +3692,34 @@ pub fn run() {
             let default_hotkey = settings::Settings::default().hotkey;
             let effective_hotkey =
                 hotkeys::resolve_effective_hotkey(&settings.hotkey, &default_hotkey).to_string();
-            if let Err(err) = register_hotkey(&handle, &effective_hotkey) {
+            if let Err(err) = register_hotkey(&handle, None, &effective_hotkey) {
                 eprintln!(
                     "bla: failed to register global hotkey {effective_hotkey:?} at startup; \
                      the app will launch without a bound dictation hotkey: {err}"
                 );
             }
 
-            // TODO(#259, TDD green step): a second, command-mode hotkey
-            // registration (via `register_command_hotkey`) goes here.
+            // Issue #259: same non-fatal, resolve-to-default-on-corruption
+            // startup discipline as the dictation hotkey just above, for the
+            // command-mode hotkey. `None` prior — this call always runs
+            // AFTER the dictation hotkey's own `register_hotkey` above, and
+            // (issue #259's `register_hotkey`/`register_command_hotkey` doc
+            // comments) neither one calls `unregister_all()`, so this
+            // registration can never clobber the dictation hotkey that was
+            // just bound.
+            let default_command_hotkey = settings::Settings::default().command_hotkey;
+            let effective_command_hotkey = hotkeys::resolve_effective_hotkey(
+                &settings.command_hotkey,
+                &default_command_hotkey,
+            )
+            .to_string();
+            if let Err(err) = register_command_hotkey(&handle, None, &effective_command_hotkey) {
+                eprintln!(
+                    "bla: failed to register global command-mode hotkey \
+                     {effective_command_hotkey:?} at startup; the app will launch without a \
+                     bound command-mode hotkey: {err}"
+                );
+            }
 
             // Issue #44: reconcile a possibly-dropped KeyUp on window
             // focus-loss so the machine can never wedge in Holding. Issue
@@ -3216,12 +3727,16 @@ pub fn run() {
             // instead of quitting the whole app — this is a tray-resident
             // utility now, so "close" and "quit" are deliberately different
             // actions; the tray menu's Quit item is the only way to exit.
+            // Issue #259: the command-mode machine gets the identical
+            // focus-loss reconcile as the dictation machine, so it can never
+            // wedge in Holding either.
             if let Some(window) = app.get_webview_window("main") {
                 let focus_handle = handle.clone();
                 let close_handle = handle.clone();
                 window.on_window_event(move |event| match event {
                     tauri::WindowEvent::Focused(false) => {
                         reconcile_hotkeys_on_focus_loss(&focus_handle);
+                        reconcile_command_hotkeys_on_focus_loss(&focus_handle);
                     }
                     tauri::WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();

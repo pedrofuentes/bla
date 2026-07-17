@@ -58,10 +58,21 @@ pub fn validate_hotkey(hotkey: &str) -> Result<(), String> {
 /// is reported via that same parse error, so this function doesn't need a
 /// separate "which one is malformed" case: [`validate_hotkey`] already runs
 /// first at each call site.
-// TODO(#259, TDD green step): `pub fn distinct_hotkeys` implementation goes
-// here — intentionally omitted in this red commit so `hotkeys::tests`' new
-// AC-49 tests below fail to compile (undefined function), per this PR's
-// test(red) -> feat(green) discipline.
+pub fn distinct_hotkeys(dictation: &str, command: &str) -> Result<(), String> {
+    use std::str::FromStr;
+    let dictation_parsed =
+        tauri_plugin_global_shortcut::Shortcut::from_str(dictation).map_err(|e| e.to_string())?;
+    let command_parsed =
+        tauri_plugin_global_shortcut::Shortcut::from_str(command).map_err(|e| e.to_string())?;
+    if dictation_parsed == command_parsed {
+        Err(format!(
+            "the command-mode hotkey must differ from the dictation hotkey (both resolve to \
+             {command:?})"
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Startup fallback (issue #91 Sentinel 🔴): returns `persisted` if it is a
 /// valid hotkey per [`validate_hotkey`], otherwise `default`. Callers pass
