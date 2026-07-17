@@ -1055,17 +1055,35 @@ mod mapping_tests {
     /// it only passes under the fixed (unregister-both-first) ordering.
     struct SharedRegistry {
         live: std::cell::RefCell<std::collections::HashSet<String>>,
+        /// Accelerators that always fail to register, regardless of `live`
+        /// — simulates an external failure reason unrelated to this app's
+        /// own tracked collisions (another application's exclusive claim,
+        /// an OS-reserved combo). Used by the command-register-failure
+        /// residual test (SNTL-20260716-bla-PR274-0900818) to force
+        /// `register_command`'s new value to fail for a reason that has
+        /// nothing to do with the swap collision itself.
+        blocked: std::collections::HashSet<String>,
     }
     impl SharedRegistry {
         fn new(initial: &[&str]) -> Self {
             Self {
                 live: std::cell::RefCell::new(initial.iter().map(|s| s.to_string()).collect()),
+                blocked: std::collections::HashSet::new(),
+            }
+        }
+        fn with_blocked(initial: &[&str], blocked: &[&str]) -> Self {
+            Self {
+                live: std::cell::RefCell::new(initial.iter().map(|s| s.to_string()).collect()),
+                blocked: blocked.iter().map(|s| s.to_string()).collect(),
             }
         }
         fn unregister(&self, h: &str) {
             self.live.borrow_mut().remove(h);
         }
         fn register(&self, h: &str) -> Result<(), String> {
+            if self.blocked.contains(h) {
+                return Err(format!("{h} is claimed by another application"));
+            }
             if self.live.borrow().contains(h) {
                 return Err(format!("{h} already registered"));
             }
@@ -1169,6 +1187,72 @@ mod mapping_tests {
             "B ends up live again, now under the dictation slot"
         );
         assert!(registry.is_live("C"));
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-0900818 residual on 🔴 3: the
+    // command-register-failure rollback branch restored command's PRIOR
+    // value BEFORE freeing dictation's colliding NEW binding. Repro:
+    // dictation A→B (succeeds, B now live), command B→C, but
+    // `register_command("C")` fails for an unrelated external reason. The
+    // buggy ordering then attempted `register_command("B")` — which
+    // collides with dictation's now-live "B" — the collision error was
+    // swallowed (`let _ =`), so command's prior was never actually
+    // restored; then dictation's OWN rollback unregistered "B" anyway,
+    // leaving "B" live NOWHERE. Net effect: the command hotkey ends up
+    // dead until restart, with settings.json (which never got persisted,
+    // so still reads the OLD command="B") disagreeing with the OS (which
+    // has neither B nor C registered under the command slot).
+    //
+    // This test is deliberately built so it FAILS under the pre-fix
+    // ordering (asserted here: `is_live("B")` would be `false` on the
+    // buggy code — verified by temporarily reverting the reorder fix
+    // locally, confirming a red run, then restoring it) and PASSES once
+    // `new_hotkey` is freed before `register_command(prior_command_hotkey)`
+    // is attempted.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_command_register_failure_after_a_colliding_dictation_swap_restores_both_sntl_pr274_0900818(
+    ) {
+        // "C" is blocked (an external app/OS-reserved combo), independent
+        // of this app's own tracked collisions — so `register_command("C")`
+        // fails for a reason that has NOTHING to do with the dictation/
+        // command swap itself.
+        let registry = SharedRegistry::with_blocked(&["A", "B"], &["C"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "A",
+            "B",
+            true,
+            "B",
+            "C",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Ok(()),
+        );
+
+        assert!(result.is_err(), "C is blocked, so the save must fail");
+        assert!(
+            registry.is_live("B"),
+            "command's prior binding \"B\" must end up live again — it must NEVER be left \
+             registered nowhere just because it happened to collide with dictation's newly \
+             (and by now rolled back) applied value"
+        );
+        assert!(
+            !registry.is_live("C"),
+            "the blocked value must never end up live"
+        );
+        // Dictation's own rollback must also have taken effect: its new
+        // value isn't left live either (only ever ONE hotkey should be
+        // bound to "B" at a time, and it must be the command slot's,
+        // matching the ROLLED-BACK state — dictation itself is back to "A").
+        assert!(
+            registry.is_live("A"),
+            "dictation must be rolled back to its own prior binding \"A\""
+        );
     }
 
     #[test]
