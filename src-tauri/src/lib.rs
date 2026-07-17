@@ -2623,6 +2623,10 @@ pub fn run() {
             commands::list_tone_rules,
             commands::upsert_tone_rule,
             commands::delete_tone_rule,
+            commands::list_snippets,
+            commands::add_snippet,
+            commands::update_snippet,
+            commands::remove_snippet,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
