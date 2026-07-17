@@ -117,6 +117,7 @@ fn ac1_headless_pipeline_removes_fillers_and_applies_self_correction() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -188,6 +189,7 @@ fn ac2_latency_budget_regex_path_under_2s_for_15s_fixture() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let start = std::time::Instant::now();
@@ -237,6 +239,7 @@ fn ac4_ollama_unreachable_falls_back_to_regex_cleanup_with_no_error() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -302,6 +305,7 @@ fn ac5_full_pipeline_run_makes_no_network_io_outside_allowlist() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -359,6 +363,7 @@ fn pipeline_error_kind_mapping_never_leaks_transcript_text() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let err = pipeline
@@ -408,6 +413,7 @@ fn ac4b_ollama_unreachable_still_pastes_and_is_informational_not_blocking() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
