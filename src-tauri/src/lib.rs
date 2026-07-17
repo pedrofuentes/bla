@@ -1397,6 +1397,106 @@ mod mapping_tests {
         assert!(command_registers.contains(&"PriorC".to_string()));
     }
 
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-867577d residual: the ABOVE persist-
+    // failure test uses non-colliding fixtures (PriorA/NewB/PriorC/NewD) —
+    // exactly the coverage gap that let this branch's own mirror-edge ship
+    // undetected. This is the genuinely discriminating version: dictation
+    // prior="X", new="Y"; command prior="Z", new="X" (command's NEW value
+    // equals dictation's PRIOR — the collision precondition). Both
+    // registrations succeed, then persist() fails.
+    //
+    // Repro against the PRE-fix ordering (processing dictation's whole
+    // unregister-then-register block fully before command's even starts):
+    // unregister("Y") frees Y; register_dictation("X") COLLIDES with
+    // command's still-live "X" (command's own rollback block hasn't run
+    // yet) and fails silently (`let _ =`) — dictation's prior is never
+    // actually restored; THEN command's block unregisters "X" (freeing it
+    // to register "Z") and registers "Z". Net: "X" ends up live NOWHERE —
+    // the dictation hotkey is dead, and settings.json (never persisted,
+    // still reads the OLD "X") disagrees with the OS. Confirmed red
+    // against the pre-fix code before the unregister-both-then-register-
+    // both reorder landed.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_persist_failure_after_a_colliding_swap_restores_both_sntl_pr274_867577d()
+     {
+        let registry = SharedRegistry::new(&["X", "Z"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "X",
+            "Y",
+            true,
+            "Z",
+            "X",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Err("disk full".to_string()),
+        );
+
+        assert_eq!(result, Err("disk full".to_string()));
+        assert!(
+            registry.is_live("X"),
+            "dictation's prior \"X\" must end up live again — it must NEVER be left registered \
+             nowhere just because it happened to collide with command's newly (and by now \
+             rolled back) applied value"
+        );
+        assert!(
+            registry.is_live("Z"),
+            "command's prior must also be restored"
+        );
+        assert!(!registry.is_live("Y"), "dictation's new value must be freed");
+    }
+
+    // -------------------------------------------------------------
+    // Completeness coverage for the THIRD rollback point (dictation-
+    // register-failure) under the same swap-adjacent-collision shape, per
+    // the SNTL-20260716-bla-PR274-867577d audit request. Unlike the two
+    // tests above, this branch never actually had a reordering bug: when
+    // `register_dictation(new_hotkey)` itself fails, NEITHER new value is
+    // ever live (dictation's own attempt just failed — nothing bound;
+    // command's new value hasn't even been attempted yet, since that block
+    // runs strictly after this one returns) — so restoring both priors
+    // here can never collide with a still-live new value, regardless of
+    // ordering. This test passes both BEFORE and AFTER the
+    // rollback_both_hotkeys unification below; it exists to lock the
+    // invariant in as regression coverage for the refactor, not because a
+    // distinct bug was found here (see the audit note in this PR's
+    // changelog/commit message).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_dictation_register_failure_with_a_swap_adjacent_collision_is_still_safe_sntl_pr274_867577d()
+     {
+        let registry = SharedRegistry::with_blocked(&["X", "Z"], &["Y"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "X",
+            "Y",
+            true,
+            "Z",
+            "W",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Ok(()),
+        );
+
+        assert!(result.is_err(), "Y is blocked, so the save must fail");
+        assert!(registry.is_live("X"), "dictation's prior must be restored");
+        assert!(registry.is_live("Z"), "command's prior must be restored");
+        assert!(!registry.is_live("Y"));
+        assert!(
+            !registry.is_live("W"),
+            "command's new value must never even be attempted once dictation's registration \
+             already failed"
+        );
+    }
+
     #[test]
     fn set_two_hotkeys_with_rollback_neither_changed_only_persists_once_sntl_pr274() {
         let mut dictation_registers: Vec<String> = vec![];
