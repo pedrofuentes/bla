@@ -16,6 +16,7 @@ import { chordFromKeyboardEvent, validateCommandHotkeyKeyset } from "../../lib/h
 import { applySettingsPatch, revertPatchedFields } from "../../lib/settingsPatch";
 import { validatePathTemplate } from "../../lib/pathTemplate";
 import { validateBaseDir, type RuntimePlatform } from "../../lib/baseDir";
+import { COMMAND_MODE_ENABLED } from "../../lib/features";
 
 const MODEL_PRESETS: readonly ModelPreset[] = ["LargeV3Turbo", "Small"];
 
@@ -895,47 +896,52 @@ export function GeneralTab() {
         )}
       </div>
 
-      <div className="flex flex-col gap-1">
-        <label htmlFor="command-hotkey-input" className="text-sm font-medium">
-          Command-mode hotkey
-        </label>
-        <div className="flex items-center gap-2">
-          <input
-            id="command-hotkey-input"
-            data-testid="command-hotkey-input"
-            ref={commandHotkeyInputRef}
-            type="text"
-            readOnly
-            value={commandHotkeyFieldValue}
-            onFocus={beginCaptureCommand}
-            onBlur={handleCommandHotkeyBlur}
-            onKeyDown={handleCommandHotkeyKeyDown}
-            className="flex-1 rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
-          />
-          <button
-            type="button"
-            data-testid="command-hotkey-apply-button"
-            onClick={handleApplyCommandHotkey}
-            disabled={!canApplyCommandHotkey}
-            className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 hover:bg-blue-500"
-          >
-            Apply
-          </button>
+      {COMMAND_MODE_ENABLED && (
+        <div className="flex flex-col gap-1">
+          <label htmlFor="command-hotkey-input" className="text-sm font-medium">
+            Command-mode hotkey
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              id="command-hotkey-input"
+              data-testid="command-hotkey-input"
+              ref={commandHotkeyInputRef}
+              type="text"
+              readOnly
+              value={commandHotkeyFieldValue}
+              onFocus={beginCaptureCommand}
+              onBlur={handleCommandHotkeyBlur}
+              onKeyDown={handleCommandHotkeyKeyDown}
+              className="flex-1 rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
+            />
+            <button
+              type="button"
+              data-testid="command-hotkey-apply-button"
+              onClick={handleApplyCommandHotkey}
+              disabled={!canApplyCommandHotkey}
+              className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 hover:bg-blue-500"
+            >
+              Apply
+            </button>
+          </div>
+          {commandHotkeyPending && (
+            <p
+              data-testid="command-hotkey-pending"
+              className="text-xs text-amber-600 dark:text-amber-400"
+            >
+              Pending change — click Apply to save, or Esc/refocus to discard.
+            </p>
+          )}
+          {commandHotkeyError && (
+            <p
+              data-testid="command-hotkey-error"
+              className="text-xs text-red-600 dark:text-red-400"
+            >
+              {commandHotkeyError}
+            </p>
+          )}
         </div>
-        {commandHotkeyPending && (
-          <p
-            data-testid="command-hotkey-pending"
-            className="text-xs text-amber-600 dark:text-amber-400"
-          >
-            Pending change — click Apply to save, or Esc/refocus to discard.
-          </p>
-        )}
-        {commandHotkeyError && (
-          <p data-testid="command-hotkey-error" className="text-xs text-red-600 dark:text-red-400">
-            {commandHotkeyError}
-          </p>
-        )}
-      </div>
+      )}
 
       <fieldset className="flex flex-col gap-2">
         <legend className="text-sm font-medium">Recording mode</legend>

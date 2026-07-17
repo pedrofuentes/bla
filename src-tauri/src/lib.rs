@@ -56,6 +56,11 @@ const PILL_WINDOW_LABEL: &str = "pill";
 /// The tray's "Settings…" item looks it up by this label to show + focus it.
 const SETTINGS_WINDOW_LABEL: &str = "settings";
 
+/// Release gate for command mode. Keep this mirrored with
+/// `src/lib/features.ts::COMMAND_MODE_ENABLED`; each language reads only its
+/// own constant so there are no scattered runtime booleans.
+const COMMAND_MODE_ENABLED: bool = false;
+
 pub mod audio;
 // `pub` (rather than private like their stub siblings): as of the pipeline
 // increment (issue #25), `cleanup`/`output`/`pipeline` are real, tested,
@@ -2790,6 +2795,16 @@ fn register_command_hotkey(
     })
 }
 
+/// Runs the startup command-hotkey registration only while command mode is
+/// shipped. The injected closure keeps this compile-time gate unit-testable
+/// without constructing `AppState`/`tauri::Wry` (issue #165).
+fn register_command_hotkey_at_startup(register: impl FnOnce()) {
+    if !COMMAND_MODE_ENABLED {
+        return;
+    }
+    register();
+}
+
 /// Unregisters the global dictation hotkey without registering a new one
 /// (issue #181, `commands::suspend_hotkey`) — called while the settings
 /// window's hotkey-capture field is active so keypresses are captured for
@@ -3297,7 +3312,15 @@ fn captured_selection_is_usable(selection: &str) -> bool {
 /// OS glue: feed one key event into the shared COMMAND-MODE state machine
 /// and react to whatever [`hotkeys::Transition`] it produces (issue #259).
 /// Mirrors [`handle_key_event`] exactly, one machine over.
+fn should_handle_command_key_event() -> bool {
+    COMMAND_MODE_ENABLED
+}
+
 fn handle_command_key_event(app: &tauri::AppHandle, event: hotkeys::KeyEvent) {
+    if !should_handle_command_key_event() {
+        return;
+    }
+
     let state = app.state::<AppState>();
     let transition = state.command_hotkeys.lock().unwrap().handle(event);
     react_to_command_transition(app, transition);
@@ -4859,8 +4882,9 @@ pub fn run() {
 
             // Issue #259: same non-fatal, resolve-to-default-on-corruption
             // startup discipline as the dictation hotkey just above, for the
-            // command-mode hotkey. `None` prior — this call always runs
-            // AFTER the dictation hotkey's own `register_hotkey` above, and
+            // command-mode hotkey. `None` prior — when command mode is
+            // enabled, this call runs AFTER the dictation hotkey's own
+            // `register_hotkey` above, and
             // (issue #259's `register_hotkey`/`register_command_hotkey` doc
             // comments) neither one calls `unregister_all()`, so this
             // registration can never clobber the dictation hotkey that was
@@ -4871,13 +4895,16 @@ pub fn run() {
                 &default_command_hotkey,
             )
             .to_string();
-            if let Err(err) = register_command_hotkey(&handle, None, &effective_command_hotkey) {
-                eprintln!(
-                    "bla: failed to register global command-mode hotkey \
-                     {effective_command_hotkey:?} at startup; the app will launch without a \
-                     bound command-mode hotkey: {err}"
-                );
-            }
+            register_command_hotkey_at_startup(|| {
+                if let Err(err) = register_command_hotkey(&handle, None, &effective_command_hotkey)
+                {
+                    eprintln!(
+                        "bla: failed to register global command-mode hotkey \
+                         {effective_command_hotkey:?} at startup; the app will launch without a \
+                         bound command-mode hotkey: {err}"
+                    );
+                }
+            });
 
             // Issue #44: reconcile a possibly-dropped KeyUp on window
             // focus-loss so the machine can never wedge in Holding. Issue
