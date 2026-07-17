@@ -136,6 +136,33 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
  * the real command is a local, infallible compile-time check) falls back
  * to `"unix"`, matching this app's primary target (MISSION §2: macOS
  * daily driver, Windows a supported secondary target).
+ *
+ * Issue #262 (AC-50): a second hotkey field, "Command-mode hotkey", sits
+ * right below the dictation one and reuses the SAME capture-then-Apply UI
+ * pattern one field over — its own pending/error/capturing state
+ * (`pendingCommandHotkey`/`commandHotkeyError`/`capturingCommand`), its own
+ * `validate_hotkey` probe on a completed chord, and its own Apply button
+ * that enqueues onto the SAME serial `applyQueueRef` via
+ * `applySettingsChange({ command_hotkey: chord })` — `runApply` already
+ * merges/persists/reverts generically over whatever key the patch touches,
+ * so only the hotkey-specific pending-state bookkeeping needed a second,
+ * parallel branch (see `runApply`'s `patch.command_hotkey !== undefined`
+ * checks and `reconcileFromBackend`'s two independent capture-seq
+ * parameters). Deliberately does NOT call `suspend_hotkey`/`resume_hotkey`
+ * while capturing: those commands target-unregister exactly the DICTATION
+ * `hotkey` (`commands::suspend_hotkey`'s doc comment — issue #259 made this
+ * a target-unregister specifically so it wouldn't also drop the
+ * independently-registered command-mode hotkey), so routing the
+ * command-hotkey field's capture through them would suspend the wrong OS
+ * shortcut. There is no backend suspend/resume for `command_hotkey` yet, so
+ * the field's capture is a pure client-side keystroke grab with no
+ * accompanying OS-level suppression — the same shape the dictation field
+ * had before issue #181 added that safety net for it specifically. Persists
+ * under the `command_hotkey` wire key, confirmed directly against
+ * `src-tauri/src/settings.rs::Settings::command_hotkey` (no struct-level
+ * `#[serde(rename_all)]`, so the JSON key is the literal snake_case field
+ * name) — the same kind of check that would have caught #237's
+ * camelCase/snake_case mismatch.
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -144,6 +171,13 @@ export function GeneralTab() {
   const [pendingHotkey, setPendingHotkey] = useState<string | null>(null);
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
+  // Issue #262: the command-mode hotkey field's own pending/error/capturing
+  // state, parallel to the dictation field's above — see the class doc's
+  // "Issue #262" section for why this is a second, independent trio rather
+  // than a shared one.
+  const [pendingCommandHotkey, setPendingCommandHotkey] = useState<string | null>(null);
+  const [commandHotkeyError, setCommandHotkeyError] = useState<string | null>(null);
+  const [capturingCommand, setCapturingCommand] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("checking");
   const [downloadPercent, setDownloadPercent] = useState<number | undefined>(undefined);
   const [modelRegistry, setModelRegistry] = useState<ModelRegistryEntry[]>([]);
@@ -195,6 +229,12 @@ export function GeneralTab() {
   // drop focus after a chord so re-focusing re-enters capture.
   const capturingRef = useRef(false);
   const hotkeyInputRef = useRef<HTMLInputElement>(null);
+  // Issue #262: the command-hotkey field's own capture-sequence counter and
+  // sync capturing-mirror/field-ref, parallel to the dictation field's above
+  // (no suspend/resume generation tracking here — see the class doc).
+  const captureCommandSeqRef = useRef(0);
+  const capturingCommandRef = useRef(false);
+  const commandHotkeyInputRef = useRef<HTMLInputElement>(null);
   // Set on unmount so late async continuations no-op instead of touching
   // state on an unmounted tree.
   const cancelledRef = useRef(false);
@@ -377,8 +417,13 @@ export function GeneralTab() {
   // diverge from what actually persisted. Routed through the serial queue with
   // a supersession guard so it never overwrites a newer apply's result, and it
   // only clears the pending chord if no newer capture happened (`captureSeq`).
+  //
+  // Issue #262: takes the DICTATION and COMMAND-hotkey capture-seqs as two
+  // independent, individually-nullable parameters — a caller passes `null`
+  // for whichever field its patch didn't touch, so a late reconcile of one
+  // field's timed-out Apply never touches the other's pending state.
   const reconcileFromBackend = useCallback(
-    (captureSeq: number) => {
+    (hotkeySeq: number | null, commandHotkeySeq: number | null) => {
       void enqueue(async () => {
         const epoch = applyEpochRef.current;
         let loaded: Settings;
@@ -393,9 +438,13 @@ export function GeneralTab() {
         if (applyEpochRef.current !== epoch) return;
         settingsRef.current = loaded;
         setSettings(loaded);
-        if (captureSeqRef.current === captureSeq) {
+        if (hotkeySeq !== null && captureSeqRef.current === hotkeySeq) {
           setPendingHotkey(null);
           setHotkeyError(null);
+        }
+        if (commandHotkeySeq !== null && captureCommandSeqRef.current === commandHotkeySeq) {
+          setPendingCommandHotkey(null);
+          setCommandHotkeyError(null);
         }
       });
     },
@@ -412,6 +461,9 @@ export function GeneralTab() {
       // The capture id this apply was scheduled against — used so a stale
       // async success can't clear a chord captured AFTER this apply (🟡).
       const hotkeyCaptureSeq = captureSeqRef.current;
+      // Issue #262: the same guard, one field over, for the command-hotkey
+      // field's independent pending state.
+      const commandHotkeyCaptureSeq = captureCommandSeqRef.current;
       const base = settingsRef.current;
       if (!base) return;
       const next = applySettingsPatch(base, patch);
@@ -420,6 +472,7 @@ export function GeneralTab() {
       setSaveStatus("saving");
       setSaveError(null);
       if (patch.hotkey !== undefined) setHotkeyError(null);
+      if (patch.command_hotkey !== undefined) setCommandHotkeyError(null);
 
       const setPromise = invoke("set_settings", { settings: next });
       try {
@@ -432,6 +485,14 @@ export function GeneralTab() {
         if (patch.hotkey !== undefined && captureSeqRef.current === hotkeyCaptureSeq) {
           setPendingHotkey(null);
           setHotkeyError(null);
+        }
+        // Issue #262: the same success-clear, one field over.
+        if (
+          patch.command_hotkey !== undefined &&
+          captureCommandSeqRef.current === commandHotkeyCaptureSeq
+        ) {
+          setPendingCommandHotkey(null);
+          setCommandHotkeyError(null);
         }
         // Issue #91/#110 pattern reuse: after a preset change, re-check the
         // newly-selected preset's on-disk status.
@@ -467,12 +528,25 @@ export function GeneralTab() {
           setPendingHotkey(null);
           setHotkeyError(message);
         }
+        // Issue #262: the same revert-and-show-error, one field over.
+        if (
+          patch.command_hotkey !== undefined &&
+          captureCommandSeqRef.current === commandHotkeyCaptureSeq
+        ) {
+          setPendingCommandHotkey(null);
+          setCommandHotkeyError(message);
+        }
         // 🟡 late-reconcile: a TIMED-OUT set_settings that later SUCCEEDS means
         // the backend persisted `next` while we reverted — resync from truth.
         if (err instanceof Error && err.message === SET_SETTINGS_TIMEOUT_MESSAGE) {
           setPromise.then(
             () => {
-              if (!cancelledRef.current) reconcileFromBackend(hotkeyCaptureSeq);
+              if (!cancelledRef.current) {
+                reconcileFromBackend(
+                  patch.hotkey !== undefined ? hotkeyCaptureSeq : null,
+                  patch.command_hotkey !== undefined ? commandHotkeyCaptureSeq : null,
+                );
+              }
             },
             () => {
               /* a genuine failure: the revert already reflects it */
@@ -580,6 +654,103 @@ export function GeneralTab() {
     void applySettingsChange({ hotkey: chord });
   }, [pendingHotkey, hotkeyError, applySettingsChange]);
 
+  // ---- Issue #262: command-hotkey capture (keystroke grabbing only — never
+  // persists). Mirrors the dictation field's capture handlers above, minus
+  // the suspend/resume calls — see the class doc's "Issue #262" section for
+  // why: `suspend_hotkey`/`resume_hotkey` target-unregister exactly the
+  // DICTATION hotkey, not `command_hotkey`. ----
+
+  const beginCaptureCommand = useCallback(() => {
+    if (capturingCommandRef.current) return; // already capturing (e.g. ref.focus re-entry)
+    capturingCommandRef.current = true;
+    captureCommandSeqRef.current += 1; // a new capture supersedes any in-flight clear
+    setCapturingCommand(true);
+    setPendingCommandHotkey(null);
+    setCommandHotkeyError(null);
+  }, []);
+
+  // Ends capture WITHOUT keeping a pending chord (Escape / blur mid-capture).
+  const cancelCaptureCommand = useCallback(() => {
+    capturingCommandRef.current = false;
+    setCapturingCommand(false);
+    setPendingCommandHotkey(null);
+    setCommandHotkeyError(null);
+  }, []);
+
+  const handleCommandHotkeyBlur = useCallback(() => {
+    // A blur while actively capturing (no chord yet) cancels; a blur AFTER a
+    // chord was captured — including the programmatic blur below — keeps the
+    // pending value (capturingCommandRef is already false by then).
+    if (capturingCommandRef.current) cancelCaptureCommand();
+  }, [cancelCaptureCommand]);
+
+  const handleCommandHotkeyKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (!capturingCommandRef.current) return;
+      // Swallow the keydown's default only while actively capturing.
+      e.preventDefault();
+
+      if (e.key === "Escape") {
+        cancelCaptureCommand();
+        return;
+      }
+
+      const chord = chordFromKeyboardEvent(e.nativeEvent);
+      if (chord === null) {
+        // Bare modifier / no modifier yet — keep listening.
+        return;
+      }
+
+      // Chord captured → END capture and show the chord as pending. Drop
+      // focus so re-focusing the field re-enters capture. A parse probe
+      // drives the inline error + Apply-button enablement; the authoritative
+      // validate happens on Apply's set_settings.
+      capturingCommandRef.current = false;
+      captureCommandSeqRef.current += 1; // a distinct captured chord supersedes prior probes/clears
+      const seq = captureCommandSeqRef.current;
+      setCapturingCommand(false);
+      setPendingCommandHotkey(chord);
+      commandHotkeyInputRef.current?.blur();
+      withTimeout(
+        invoke("validate_hotkey", { accelerator: chord }),
+        VALIDATE_TIMEOUT_MS,
+        VALIDATE_TIMEOUT_MESSAGE,
+      )
+        .then(() => {
+          // Only for THIS captured chord — a newer capture owns the error now.
+          if (!cancelledRef.current && captureCommandSeqRef.current === seq) {
+            setCommandHotkeyError(null);
+          }
+        })
+        .catch((err) => {
+          if (!cancelledRef.current && captureCommandSeqRef.current === seq) {
+            setCommandHotkeyError(String(err));
+          }
+        });
+    },
+    [cancelCaptureCommand],
+  );
+
+  const canApplyCommandHotkey =
+    !capturingCommand &&
+    pendingCommandHotkey !== null &&
+    pendingCommandHotkey !== settings?.command_hotkey &&
+    commandHotkeyError === null;
+
+  const handleApplyCommandHotkey = useCallback(() => {
+    const chord = pendingCommandHotkey;
+    const current = settingsRef.current;
+    if (
+      chord === null ||
+      current === null ||
+      chord === current.command_hotkey ||
+      commandHotkeyError !== null
+    ) {
+      return;
+    }
+    void applySettingsChange({ command_hotkey: chord });
+  }, [pendingCommandHotkey, commandHotkeyError, applySettingsChange]);
+
   // ---- Issue #180: file-mode output picker (base folder + path template) ----
 
   const handleBaseDirChange = useCallback(
@@ -637,6 +808,19 @@ export function GeneralTab() {
     : (pendingHotkey ?? settings.hotkey);
   const hotkeyPending = !capturing && pendingHotkey !== null && pendingHotkey !== settings.hotkey;
 
+  // Issue #262: same derivation, one field over. `settings.command_hotkey`
+  // is optional in the TS type only for pre-#262 object-literal back-compat
+  // (see its ipc.ts doc) — a real backend load always sends it (its Rust
+  // field carries `#[serde(default)]`), so `?? ""` is just a display-only
+  // guard for a test/harness fixture that omits it.
+  const commandHotkeyFieldValue = capturingCommand
+    ? "Press a key combination… (Esc to cancel)"
+    : (pendingCommandHotkey ?? settings.command_hotkey ?? "");
+  const commandHotkeyPending =
+    !capturingCommand &&
+    pendingCommandHotkey !== null &&
+    pendingCommandHotkey !== settings.command_hotkey;
+
   return (
     <div className="flex max-w-md flex-col gap-6" data-testid="general-panel">
       <div className="flex flex-col gap-1">
@@ -674,6 +858,48 @@ export function GeneralTab() {
         {hotkeyError && (
           <p data-testid="hotkey-error" className="text-xs text-red-600 dark:text-red-400">
             {hotkeyError}
+          </p>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <label htmlFor="command-hotkey-input" className="text-sm font-medium">
+          Command-mode hotkey
+        </label>
+        <div className="flex items-center gap-2">
+          <input
+            id="command-hotkey-input"
+            data-testid="command-hotkey-input"
+            ref={commandHotkeyInputRef}
+            type="text"
+            readOnly
+            value={commandHotkeyFieldValue}
+            onFocus={beginCaptureCommand}
+            onBlur={handleCommandHotkeyBlur}
+            onKeyDown={handleCommandHotkeyKeyDown}
+            className="flex-1 rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-950"
+          />
+          <button
+            type="button"
+            data-testid="command-hotkey-apply-button"
+            onClick={handleApplyCommandHotkey}
+            disabled={!canApplyCommandHotkey}
+            className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 hover:bg-blue-500"
+          >
+            Apply
+          </button>
+        </div>
+        {commandHotkeyPending && (
+          <p
+            data-testid="command-hotkey-pending"
+            className="text-xs text-amber-600 dark:text-amber-400"
+          >
+            Pending change — click Apply to save, or Esc/refocus to discard.
+          </p>
+        )}
+        {commandHotkeyError && (
+          <p data-testid="command-hotkey-error" className="text-xs text-red-600 dark:text-red-400">
+            {commandHotkeyError}
           </p>
         )}
       </div>
