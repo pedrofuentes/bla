@@ -2666,16 +2666,24 @@ pub(crate) fn set_two_hotkeys_with_rollback(
 
     if command_hotkey_changed {
         if let Err(err) = register_command(new_command_hotkey) {
-            // Command's own prior is restored here; dictation's new value
-            // (if changed) already succeeded above and is now live — tear
-            // it back out and restore ITS prior too, so a command-hotkey
-            // failure can't leave the OS bound to a dictation hotkey that
-            // never ends up persisted below.
-            let _ = register_command(prior_command_hotkey);
+            // Issue #259 Sentinel 🔴-3 residual (SNTL-20260716-bla-PR274-0900818):
+            // free dictation's new value FIRST, before attempting to
+            // restore command's prior — a swap-style save can have
+            // `prior_command_hotkey == new_hotkey` (dictation A→B, command
+            // B→C), and dictation's new value is already live at this
+            // point (its own registration succeeded above). Restoring
+            // command's prior before freeing that collision would fail
+            // (silently, via the `let _ =` below) on the OS's single
+            // shared accelerator registry, leaving command's prior live
+            // NOWHERE once dictation's rollback then unregisters it too —
+            // exactly the dead-hotkey/settings.json-disagreement outcome
+            // this whole function exists to prevent. Mirrors the ordering
+            // the persist-failure branch below already gets right.
             if hotkey_changed {
                 unregister(new_hotkey);
                 let _ = register_dictation(prior_hotkey);
             }
+            let _ = register_command(prior_command_hotkey);
             return Err(err);
         }
     }
