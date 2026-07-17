@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chordFromKeyboardEvent } from "./hotkeyChord";
+import { chordFromKeyboardEvent, validateCommandHotkeyKeyset } from "./hotkeyChord";
 
 /** Minimal `KeyboardEvent` builder — jsdom's constructor supports these fields directly. */
 function keyEvent(key: string, mods: Partial<KeyboardEventInit> = {}): KeyboardEvent {
@@ -73,5 +73,51 @@ describe("chordFromKeyboardEvent", () => {
     // A bare letter with zero modifiers isn't captured as a chord — avoids
     // accidentally binding a hotkey to an unmodified printable key.
     expect(chordFromKeyboardEvent(keyEvent("D"))).toBeNull();
+  });
+});
+
+// -----------------------------------------------------------------
+// Issue #281 (ac7-p0): the command-mode hotkey's trigger key must be a
+// function key (F1-F24) — a leaked keydown (the OS/plugin can't suppress
+// one on either macOS or Windows, see hotkeys.rs's validate_command_hotkey_keyset
+// doc comment for the full diagnosis) produces no text character for a
+// function key, so it can't clobber a selection the way a leaked letter
+// key did in #281's Ctrl+Shift+O -> "oooo" repro. This is the CLIENT-SIDE
+// half of the fix's defense in depth — an immediate, synchronous check the
+// picker runs on a just-captured chord, before ever calling the backend
+// `validate_command_hotkey` probe.
+// -----------------------------------------------------------------
+describe("validateCommandHotkeyKeyset", () => {
+  it("accepts function-key chords (F1-F24)", () => {
+    for (const chord of [
+      "Control+Shift+F13",
+      "Alt+F1",
+      "Super+F24",
+      "Control+Alt+Shift+Super+F7",
+    ]) {
+      expect(validateCommandHotkeyKeyset(chord)).toEqual({ valid: true });
+    }
+  });
+
+  it("rejects a character-producing trigger key with a clear function-key explanation", () => {
+    for (const chord of [
+      "Control+Shift+C", // the pre-#281 shipped default
+      "Control+Shift+O", // the #281 repro's exact chord
+      "Control+Shift+1",
+      "Control+Shift+Space",
+      "Control+Enter",
+      "Control+Tab",
+    ]) {
+      const result = validateCommandHotkeyKeyset(chord);
+      expect(result.valid).toBe(false);
+      if (!result.valid) {
+        expect(result.reason.toLowerCase()).toContain("function key");
+      }
+    }
+  });
+
+  it("rejects a non-function-key non-character trigger too — the allowlist is function keys specifically", () => {
+    const result = validateCommandHotkeyKeyset("Control+ArrowUp");
+    expect(result.valid).toBe(false);
   });
 });

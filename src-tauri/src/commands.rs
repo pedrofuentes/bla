@@ -136,17 +136,12 @@ pub fn set_settings(
     } else {
         String::new()
     };
-    if hotkey_changed {
-        crate::hotkeys::validate_hotkey(&settings.hotkey)?;
-    }
-    if command_hotkey_changed {
-        crate::hotkeys::validate_hotkey(&settings.command_hotkey)?;
-    }
-    // AC-49: reject a save that would leave both hotkeys bound to the same
-    // accelerator, BEFORE either is (re)registered or anything is
-    // persisted — a malformed individual hotkey is already caught by the
-    // two `validate_hotkey` calls just above, so by this point both parse.
-    crate::hotkeys::distinct_hotkeys(&settings.hotkey, &settings.command_hotkey)?;
+    validate_settings_hotkeys(
+        hotkey_changed,
+        &settings.hotkey,
+        command_hotkey_changed,
+        &settings.command_hotkey,
+    )?;
 
     set_two_hotkeys_with_rollback(
         hotkey_changed,
@@ -225,6 +220,50 @@ pub fn set_settings(
     Ok(())
 }
 
+/// The exact validate-before-persist gating [`set_settings`] runs for the
+/// two hotkey fields, extracted into a pure function so it's unit-testable
+/// without an `AppHandle`/`State<AppState>` (#165's Windows-CI rule —
+/// `set_settings` itself can't be constructed in a `#[cfg(test)]` without a
+/// `tauri::Wry` runtime). `set_settings` calls this directly (see its body)
+/// rather than reimplementing the same checks inline — there is exactly one
+/// copy of this gating, so a test against this function IS a test of what
+/// `set_settings` actually runs, not a parallel reimplementation that could
+/// silently drift from it.
+///
+/// Order matters and is preserved exactly as `set_settings` had it inline
+/// before this extraction (Sentinel review on PR #293, closing a coverage
+/// gap: commit 9ac99d1 wired `hotkeys::validate_command_hotkey_keyset` into
+/// `set_settings` with no Rust test exercising the integration — only a
+/// frontend test mocking `invoke`):
+/// 1. `hotkey_changed` -> `validate_hotkey(hotkey)` (issue #91).
+/// 2. `command_hotkey_changed` -> `validate_hotkey(command_hotkey)` THEN
+///    `validate_command_hotkey_keyset(command_hotkey)` (issue #281,
+///    ac7-p0) — gated on `command_hotkey_changed` specifically so an
+///    unrelated settings save (e.g. toggling sound cues) never re-rejects
+///    an already-persisted legacy value, such as the pre-#281 shipped
+///    default `"Control+Shift+C"`, that a user never touched. This fix
+///    prevents a NEW bad value from being saved; it doesn't retroactively
+///    invalidate an old one already in `settings.json` (see the #292
+///    follow-up for that gap).
+/// 3. `distinct_hotkeys(hotkey, command_hotkey)` unconditionally (AC-49) —
+///    by this point both hotkeys that changed have already parsed, so this
+///    only ever rejects a same-accelerator collision.
+fn validate_settings_hotkeys(
+    hotkey_changed: bool,
+    hotkey: &str,
+    command_hotkey_changed: bool,
+    command_hotkey: &str,
+) -> Result<(), String> {
+    if hotkey_changed {
+        crate::hotkeys::validate_hotkey(hotkey)?;
+    }
+    if command_hotkey_changed {
+        crate::hotkeys::validate_hotkey(command_hotkey)?;
+        crate::hotkeys::validate_command_hotkey_keyset(command_hotkey)?;
+    }
+    crate::hotkeys::distinct_hotkeys(hotkey, command_hotkey)
+}
+
 /// Switch the live output-mode target (AC-14) without otherwise touching
 /// settings. `set_settings` also updates this as part of a full settings
 /// save; this is the lightweight path both the status window's toggle
@@ -278,6 +317,23 @@ pub fn set_output_mode(
 #[tauri::command]
 pub fn validate_hotkey(accelerator: String) -> Result<(), String> {
     crate::hotkeys::validate_hotkey(&accelerator)
+}
+
+/// Validates a candidate COMMAND-MODE hotkey accelerator (issue #281,
+/// ac7-p0): the same general-grammar probe as [`validate_hotkey`], PLUS the
+/// function-key-trigger keyset constraint (`hotkeys::validate_command_hotkey_keyset`)
+/// that's specific to the command-mode slot — see that function's doc for
+/// why. Deliberately a SEPARATE command from `validate_hotkey` rather than a
+/// shared one with a mode flag: the dictation hotkey field must keep using
+/// the unconstrained probe (this PR intentionally does not change dictation-
+/// hotkey validation — see the #281 follow-up issue for that discussion),
+/// so the two fields' live picker-time checks stay wired to genuinely
+/// different validators, matching `set_settings`'s own asymmetric handling
+/// of the two slots one field over.
+#[tauri::command]
+pub fn validate_command_hotkey(accelerator: String) -> Result<(), String> {
+    crate::hotkeys::validate_hotkey(&accelerator)?;
+    crate::hotkeys::validate_command_hotkey_keyset(&accelerator)
 }
 
 /// Kicks the first-run Whisper model downloader for the currently selected
@@ -648,6 +704,83 @@ pub fn resume_hotkey(
         *gen_slot = 0;
     }
     Ok(())
+}
+
+// -------------------------------------------------------------------------
+// Issue #281 (ac7-p0), Sentinel review on PR #293: closes a coverage gap —
+// commit 9ac99d1 wired `hotkeys::validate_command_hotkey_keyset` into
+// `set_settings` (via `validate_settings_hotkeys` above) and added the new
+// `validate_command_hotkey` command, but neither had a Rust test exercising
+// the actual backend integration; the only coverage was a frontend test
+// mocking `invoke`, which proves nothing about the real Rust wiring — a
+// future refactor of the `command_hotkey_changed` gating could silently
+// break enforcement with nothing here to catch it.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod validate_settings_hotkeys_tests {
+    use super::validate_settings_hotkeys;
+
+    #[test]
+    fn rejects_a_changed_command_hotkey_with_a_non_function_key_trigger_issue_281() {
+        let err = validate_settings_hotkeys(
+            false,
+            "Control+Shift+Space",
+            true,
+            "Control+Shift+C", // letter trigger — the #281 harm class
+        )
+        .expect_err("a letter-key command_hotkey must be rejected when changed");
+        assert!(
+            err.to_lowercase().contains("function key"),
+            "expected a clear function-key explanation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_changed_command_hotkey_with_a_function_key_trigger_issue_281() {
+        assert!(
+            validate_settings_hotkeys(false, "Control+Shift+Space", true, "Control+Shift+F13",)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn does_not_reject_an_unchanged_non_function_key_command_hotkey_issue_281() {
+        // Gating check: `command_hotkey_changed = false` must skip the
+        // keyset enforcement entirely, so an unrelated settings save never
+        // re-rejects an already-persisted legacy value (e.g. the pre-#281
+        // shipped default `"Control+Shift+C"`) that a user never touched —
+        // this fix prevents a NEW bad value from being saved, it doesn't
+        // retroactively invalidate an old one already in settings.json.
+        assert!(
+            validate_settings_hotkeys(false, "Control+Shift+Space", false, "Control+Shift+C",)
+                .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod validate_command_hotkey_command_tests {
+    use super::validate_command_hotkey;
+
+    #[test]
+    fn accepts_a_function_key_chord_issue_281() {
+        assert!(validate_command_hotkey("Control+Shift+F13".to_string()).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_character_key_chord_issue_281() {
+        let err = validate_command_hotkey("Control+Shift+C".to_string())
+            .expect_err("a letter-key chord must be rejected");
+        assert!(
+            err.to_lowercase().contains("function key"),
+            "expected a clear function-key explanation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn propagates_a_malformed_accelerators_parse_error() {
+        assert!(validate_command_hotkey("NotARealKey".to_string()).is_err());
+    }
 }
 
 // -------------------------------------------------------------------------

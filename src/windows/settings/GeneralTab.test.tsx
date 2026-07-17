@@ -69,6 +69,8 @@ function setupInvoke(overrides: Partial<Record<string, (...args: unknown[]) => u
         return Promise.resolve("already-present");
       case "validate_hotkey":
         return Promise.resolve(undefined);
+      case "validate_command_hotkey":
+        return Promise.resolve(undefined);
       case "set_settings":
         return Promise.resolve(undefined);
       case "model_registry":
@@ -1183,7 +1185,9 @@ describe("GeneralTab", () => {
         '[data-testid="command-hotkey-input"]',
       )!;
       focus(input);
-      keydown(input, "K", { ctrlKey: true, shiftKey: true });
+      // Issue #281: must be a function key — a letter key would now be
+      // rejected by the client-side keyset check before ever reaching Apply.
+      keydown(input, "F13", { ctrlKey: true, shiftKey: true });
       await flush();
 
       invoke.mockClear();
@@ -1194,12 +1198,10 @@ describe("GeneralTab", () => {
       await flush();
 
       expect(invoke).toHaveBeenCalledWith("set_settings", {
-        settings: { ...BASE_SETTINGS, command_hotkey: "Control+Shift+K" },
+        settings: { ...BASE_SETTINGS, command_hotkey: "Control+Shift+F13" },
       });
-      expect(
-        mounted.container.querySelector('[data-testid="command-hotkey-pending"]'),
-      ).toBeNull();
-      expect(input.value).toBe("Control+Shift+K");
+      expect(mounted.container.querySelector('[data-testid="command-hotkey-pending"]')).toBeNull();
+      expect(input.value).toBe("Control+Shift+F13");
     });
 
     it("reflects a persisted command-hotkey change on reload, mirroring the dictation hotkey's own round-trip (AC-16/AC-50)", async () => {
@@ -1208,7 +1210,10 @@ describe("GeneralTab", () => {
       mounted.unmount();
 
       // A fresh mount (e.g. reopening the settings window) reloads from
-      // whatever's now persisted.
+      // whatever's now persisted. Reload is a pure display path (no capture,
+      // no validation), so this doesn't need a function-key value to prove
+      // anything about #281 — kept as a distinct-from-default letter chord
+      // to also cover a legacy-shaped persisted value still round-tripping.
       setupInvoke({
         get_settings: () =>
           Promise.resolve({ ...BASE_SETTINGS, command_hotkey: "Control+Shift+K" }),
@@ -1235,23 +1240,57 @@ describe("GeneralTab", () => {
 
       expect(applyButton.disabled).toBe(true);
 
-      // Capturing the CURRENT chord leaves nothing to apply.
+      // Capturing the CURRENT chord leaves nothing to apply — doubly so
+      // here since BASE_SETTINGS' command_hotkey ("Control+Shift+C") is
+      // also a letter key the #281 keyset check now rejects, but Apply
+      // would stay disabled purely from "equals current" regardless.
       focus(input);
       keydown(input, "C", { ctrlKey: true, shiftKey: true }); // == current
       await flush();
       expect(applyButton.disabled).toBe(true);
       expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
 
-      // A different valid chord enables Apply.
+      // A different, function-key-valid chord enables Apply.
       focus(input);
-      keydown(input, "K", { ctrlKey: true, shiftKey: true });
+      keydown(input, "F13", { ctrlKey: true, shiftKey: true });
       await flush();
       expect(applyButton.disabled).toBe(false);
     });
 
-    it("shows an inline error and keeps Apply disabled for an invalid captured command-hotkey chord", async () => {
+    // -----------------------------------------------------------------
+    // Issue #281 (ac7-p0): the function-key keyset constraint, checked at
+    // TWO points — client-side (synchronous, no IPC) and the backend
+    // `validate_command_hotkey` probe (defense in depth) — see the class
+    // doc's "Issue #281" section.
+    // -----------------------------------------------------------------
+
+    it("rejects a character-producing captured chord CLIENT-SIDE, with no backend round-trip, showing the function-key explanation (issue #281)", async () => {
+      mounted = mount(<GeneralTab />);
+      await flush();
+
+      const input = mounted.container.querySelector<HTMLInputElement>(
+        '[data-testid="command-hotkey-input"]',
+      )!;
+      focus(input);
+      invoke.mockClear();
+      keydown(input, "Z", { ctrlKey: true, shiftKey: true });
+      await flush();
+
+      expect(
+        mounted.container.querySelector('[data-testid="command-hotkey-error"]')?.textContent,
+      ).toMatch(/function key/i);
+      const applyButton = mounted.container.querySelector<HTMLButtonElement>(
+        '[data-testid="command-hotkey-apply-button"]',
+      )!;
+      expect(applyButton.disabled).toBe(true);
+      // The client-side check alone caught this — no backend probe needed.
+      expect(invoke).not.toHaveBeenCalledWith("validate_command_hotkey", expect.anything());
+      expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything());
+    });
+
+    it("shows an inline error and keeps Apply disabled when the BACKEND validate_command_hotkey probe rejects a (client-side-valid) captured chord", async () => {
       setupInvoke({
-        validate_hotkey: () => Promise.reject(new Error("bad accelerator")),
+        validate_command_hotkey: () => Promise.reject(new Error("bad accelerator")),
       });
 
       mounted = mount(<GeneralTab />);
@@ -1262,9 +1301,14 @@ describe("GeneralTab", () => {
       )!;
       focus(input);
       invoke.mockClear();
-      keydown(input, "Z", { ctrlKey: true });
+      // A function key passes the client-side check, so this reaches the
+      // (here, rejecting) backend probe.
+      keydown(input, "F14", { ctrlKey: true });
       await flush();
 
+      expect(invoke).toHaveBeenCalledWith("validate_command_hotkey", {
+        accelerator: "Control+F14",
+      });
       expect(
         mounted.container.querySelector('[data-testid="command-hotkey-error"]')?.textContent,
       ).toMatch(/bad accelerator/i);
@@ -1322,11 +1366,14 @@ describe("GeneralTab", () => {
       await flush();
 
       focus(commandInput);
-      keydown(commandInput, "K", { ctrlKey: true, shiftKey: true });
+      // Issue #281: the command-hotkey field specifically requires a
+      // function-key trigger — the dictation field above is deliberately
+      // untouched by this fix and keeps capturing letter keys.
+      keydown(commandInput, "F13", { ctrlKey: true, shiftKey: true });
       await flush();
 
       expect(hotkeyInput.value).toBe("Control+Shift+D");
-      expect(commandInput.value).toBe("Control+Shift+K");
+      expect(commandInput.value).toBe("Control+Shift+F13");
 
       invoke.mockClear();
       const commandApplyButton = mounted.container.querySelector<HTMLButtonElement>(
@@ -1336,14 +1383,12 @@ describe("GeneralTab", () => {
       await flush();
 
       expect(invoke).toHaveBeenCalledWith("set_settings", {
-        settings: { ...BASE_SETTINGS, command_hotkey: "Control+Shift+K" },
+        settings: { ...BASE_SETTINGS, command_hotkey: "Control+Shift+F13" },
       });
       // The still-pending dictation-hotkey chord survives the command-hotkey
       // Apply untouched.
       expect(hotkeyInput.value).toBe("Control+Shift+D");
-      expect(
-        mounted.container.querySelector('[data-testid="hotkey-pending"]'),
-      ).not.toBeNull();
+      expect(mounted.container.querySelector('[data-testid="hotkey-pending"]')).not.toBeNull();
     });
   });
 

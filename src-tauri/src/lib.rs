@@ -4646,6 +4646,7 @@ pub fn run() {
             commands::set_settings,
             commands::set_output_mode,
             commands::validate_hotkey,
+            commands::validate_command_hotkey,
             commands::download_selected_model,
             commands::model_registry,
             commands::suspend_hotkey,

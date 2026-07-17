@@ -100,13 +100,29 @@ pub struct Settings {
     /// is the AC-49 guard `commands::set_settings` runs before persisting
     /// either, rejecting a save that would leave both hotkeys bound to the
     /// same accelerator (which would otherwise make one silently shadow the
-    /// other's OS registration). Defaults to `"Control+Shift+C"` —
+    /// other's OS registration). Defaults to `"Control+Shift+F12"` —
     /// deliberately distinct from `Settings::default().hotkey`
     /// (`"Control+Shift+Space"`), using the same cross-platform-safe
-    /// modifier spelling (issue #110: no macOS-only `"Option"` alias).
-    /// There is no settings-window capture UI for this field yet (that's
-    /// issue #262) — a settings.json predating this field falls back to
-    /// this default via `#[serde(default)]`, same as every other field.
+    /// modifier spelling (issue #110: no macOS-only `"Option"` alias). There
+    /// is no settings-window capture UI for this field yet (that's issue
+    /// #262) — a settings.json predating this field falls back to this
+    /// default via `#[serde(default)]`, same as every other field.
+    ///
+    /// Issue #292 (follow-up from #281, ac7-p0): was originally
+    /// `"Control+Shift+C"` — a letter key, exactly the character-producing-
+    /// trigger class issue #281 constrains the command-mode hotkey field
+    /// against (`hotkeys::validate_command_hotkey_keyset` requires a
+    /// function-key trigger, F1-F24, because a leaked keydown while the
+    /// chord is held can otherwise clobber a text selection). #281's
+    /// validation is change-gated and forward-only, so it never touched
+    /// this shipped default — every fresh install, and every user who never
+    /// customized this field, stayed exposed to the exact harm #281 fixes
+    /// against until this default changed. `F12` (not the "preferred"
+    /// F13-F24 safe range) because it's on every physical keyboard,
+    /// including laptops with no F13+ key, and `Control+Shift+F12`
+    /// specifically is a low-collision chord (unlike bare `F12`, which
+    /// several apps/OS shells bind to something). Still fully
+    /// user-rebindable via the settings window.
     pub command_hotkey: String,
 }
 
@@ -134,9 +150,15 @@ impl Default for Settings {
             sound_cues: true,
             retention_days: 0,
             // Issue #259: distinct from `hotkey` above by construction —
-            // `hotkeys_default_and_command_default_are_distinct_issue_259`
+            // `command_hotkey_defaults_to_a_value_distinct_from_the_dictation_hotkey_default_issue_259`
             // pins this so the two can never silently drift back together.
-            command_hotkey: "Control+Shift+C".to_string(),
+            // Issue #292: `F12`, not the pre-#281 letter key `"C"` — see the
+            // field's doc comment above for the full rationale. Pinned as a
+            // valid function-key chord by
+            // `default_command_hotkey_passes_the_281_function_key_keyset_issue_292`
+            // below, so a future default change can't silently reintroduce
+            // a character-key default.
+            command_hotkey: "Control+Shift+F12".to_string(),
         }
     }
 }
@@ -511,7 +533,36 @@ mod tests {
     fn command_hotkey_defaults_to_a_value_distinct_from_the_dictation_hotkey_default_issue_259() {
         let default = Settings::default();
         assert_ne!(default.command_hotkey, default.hotkey);
-        assert_eq!(default.command_hotkey, "Control+Shift+C");
+        // Issue #292: F12, not the pre-#281 letter key "C" — see
+        // default_command_hotkey_passes_the_281_function_key_keyset_issue_292
+        // below for the test that locks in WHY (a valid function-key chord).
+        assert_eq!(default.command_hotkey, "Control+Shift+F12");
+    }
+
+    // -------------------------------------------------------------
+    // Issue #292 (follow-up from #281, ac7-p0): the shipped default
+    // `command_hotkey` used to be `"Control+Shift+C"` — a letter key,
+    // exactly the character-producing-trigger class #281 constrains the
+    // command-mode hotkey field against. #281's `set_settings` validation
+    // is change-gated and forward-only (it never touches an
+    // already-persisted value), so it never touched this default — every
+    // fresh install stayed exposed to #281's exact harm until the default
+    // itself changed. This test locks in the actual point of #292: the
+    // shipped default must itself be a valid function-key chord, so a
+    // future default change can't silently reintroduce a character-key
+    // default with nothing to catch it.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn default_command_hotkey_passes_the_281_function_key_keyset_issue_292() {
+        let default = Settings::default();
+        assert!(
+            crate::hotkeys::validate_command_hotkey_keyset(&default.command_hotkey).is_ok(),
+            "the shipped default command_hotkey {:?} must itself be a valid function-key \
+             chord (issue #281's keyset), or every fresh install ships exposed to #281's \
+             harm out of the box",
+            default.command_hotkey
+        );
     }
 
     #[test]

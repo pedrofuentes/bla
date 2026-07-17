@@ -12,7 +12,7 @@ import {
   modelStatusLabel,
   type ModelStatus,
 } from "../../lib/status";
-import { chordFromKeyboardEvent } from "../../lib/hotkeyChord";
+import { chordFromKeyboardEvent, validateCommandHotkeyKeyset } from "../../lib/hotkeyChord";
 import { applySettingsPatch, revertPatchedFields } from "../../lib/settingsPatch";
 import { validatePathTemplate } from "../../lib/pathTemplate";
 import { validateBaseDir, type RuntimePlatform } from "../../lib/baseDir";
@@ -163,6 +163,27 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
  * `#[serde(rename_all)]`, so the JSON key is the literal snake_case field
  * name) — the same kind of check that would have caught #237's
  * camelCase/snake_case mismatch.
+ *
+ * Issue #281 (ac7-p0): the command-hotkey field's capture handler additionally
+ * requires the captured chord's trigger key to be a function key (F1-F24) —
+ * neither macOS's Carbon hotkey registration nor Windows' `RegisterHotKey`
+ * can suppress a keydown while the chord is held, so a character-producing
+ * trigger key (a letter, digit, punctuation, Space, Enter, Tab, …) that
+ * leaks to the focused app TYPES into it, replacing a selection before the
+ * command transform ever runs (the bug: `Ctrl+Shift+O` held -> `"oooo"`
+ * clobbered the selection). A function key produces no character, so a
+ * leaked one is harmless. This is checked in TWO places, per the same
+ * defense-in-depth shape as the rest of this field's validation:
+ * `validateCommandHotkeyKeyset` (`src/lib/hotkeyChord.ts`) runs
+ * synchronously, client-side, on the just-captured chord — no IPC
+ * round-trip — and, only once that passes, the capture-time probe calls
+ * `validate_command_hotkey` (not the plain `validate_hotkey` the dictation
+ * field still uses) so the backend's `hotkeys::validate_command_hotkey_keyset`
+ * re-checks it too. `set_settings` enforces the same keyset constraint a
+ * third time at the actual persistence boundary — a bad value can never be
+ * saved even if a caller bypassed this picker's checks entirely. Deliberately
+ * does NOT touch the dictation-hotkey field's validation (see the #281
+ * follow-up issue filed for that discussion).
  */
 export function GeneralTab() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -711,8 +732,20 @@ export function GeneralTab() {
       setCapturingCommand(false);
       setPendingCommandHotkey(chord);
       commandHotkeyInputRef.current?.blur();
+
+      // Issue #281: the client-side, synchronous half of the function-key
+      // keyset check — no IPC round-trip needed for the common case of a
+      // character-producing trigger key (see the class doc's "Issue #281"
+      // section). Only a chord that PASSES this goes on to the backend
+      // probe below, which re-checks the same constraint server-side.
+      const keysetCheck = validateCommandHotkeyKeyset(chord);
+      if (!keysetCheck.valid) {
+        setCommandHotkeyError(keysetCheck.reason);
+        return;
+      }
+
       withTimeout(
-        invoke("validate_hotkey", { accelerator: chord }),
+        invoke("validate_command_hotkey", { accelerator: chord }),
         VALIDATE_TIMEOUT_MS,
         VALIDATE_TIMEOUT_MESSAGE,
       )
