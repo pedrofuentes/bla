@@ -141,6 +141,16 @@ pub fn set_settings(
     }
     if command_hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.command_hotkey)?;
+        // Issue #281 (ac7-p0): reject a NEW command-mode hotkey whose
+        // trigger key isn't a function key, BEFORE it's registered or
+        // persisted — see `hotkeys::validate_command_hotkey_keyset`'s doc
+        // for the full rationale. Gated on `command_hotkey_changed` (not
+        // run unconditionally) so an unrelated settings save never re-rejects
+        // an already-persisted legacy value (e.g. the pre-#281 shipped
+        // default, `"Control+Shift+C"`) that a user never touched — this
+        // fix prevents a NEW bad value from being saved, it doesn't
+        // retroactively invalidate an old one already in settings.json.
+        crate::hotkeys::validate_command_hotkey_keyset(&settings.command_hotkey)?;
     }
     // AC-49: reject a save that would leave both hotkeys bound to the same
     // accelerator, BEFORE either is (re)registered or anything is
@@ -278,6 +288,23 @@ pub fn set_output_mode(
 #[tauri::command]
 pub fn validate_hotkey(accelerator: String) -> Result<(), String> {
     crate::hotkeys::validate_hotkey(&accelerator)
+}
+
+/// Validates a candidate COMMAND-MODE hotkey accelerator (issue #281,
+/// ac7-p0): the same general-grammar probe as [`validate_hotkey`], PLUS the
+/// function-key-trigger keyset constraint (`hotkeys::validate_command_hotkey_keyset`)
+/// that's specific to the command-mode slot — see that function's doc for
+/// why. Deliberately a SEPARATE command from `validate_hotkey` rather than a
+/// shared one with a mode flag: the dictation hotkey field must keep using
+/// the unconstrained probe (this PR intentionally does not change dictation-
+/// hotkey validation — see the #281 follow-up issue for that discussion),
+/// so the two fields' live picker-time checks stay wired to genuinely
+/// different validators, matching `set_settings`'s own asymmetric handling
+/// of the two slots one field over.
+#[tauri::command]
+pub fn validate_command_hotkey(accelerator: String) -> Result<(), String> {
+    crate::hotkeys::validate_hotkey(&accelerator)?;
+    crate::hotkeys::validate_command_hotkey_keyset(&accelerator)
 }
 
 /// Kicks the first-run Whisper model downloader for the currently selected
