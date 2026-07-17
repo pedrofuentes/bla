@@ -705,10 +705,10 @@ mod tests {
         // text character when leaked — exactly what clobbered the selection
         // in #281's repro (`Ctrl+Shift+O` -> "oooo").
         for bad in [
-            "Control+Shift+C",  // the #281 repro's letter key
-            "Control+Shift+O",  // the #281 repro's exact chord
-            "Control+Shift+1",  // digit
-            "Control+Comma",    // punctuation
+            "Control+Shift+C", // the #281 repro's letter key
+            "Control+Shift+O", // the #281 repro's exact chord
+            "Control+Shift+1", // digit
+            "Control+Comma",   // punctuation
             "Control+Shift+Space",
             "Control+Enter",
             "Control+Tab",
