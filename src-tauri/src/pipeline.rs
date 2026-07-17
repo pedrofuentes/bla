@@ -65,10 +65,13 @@ pub struct Outcome {
     pub raw_transcript: String,
     /// The transcript after `Cleanup` (or the AC-4 `RegexCleanup` fallback).
     pub cleaned_transcript: String,
-    /// True when the configured `Cleanup` returned
-    /// `CleanupError::Unreachable` and `Pipeline` fell back to
-    /// `RegexCleanup` (AC-4) — never surfaced as an error, but exposed here
-    /// for callers/tests that want to observe the fallback happened.
+    /// True when `Pipeline` fell back to `RegexCleanup` instead of using the
+    /// configured `Cleanup`'s output — either because it returned
+    /// `CleanupError::Unreachable` (AC-4) OR because its `Ok` output looked
+    /// like a conversational preamble / prompt echo rather than a rewrite
+    /// (issue #283; see [`Pipeline::clean_with_fallback`]). Never surfaced as
+    /// an error, but exposed here for callers/tests that want to observe the
+    /// fallback happened (e.g. the `should_settle_with_notice` tray notice).
     pub cleanup_fell_back: bool,
     /// Issue #263 (AC-53): true when a configured snippet's trigger
     /// matched the raw transcript and `cleaned_transcript` is therefore
@@ -205,12 +208,31 @@ where
         })
     }
 
-    /// AC-4 / ADR-0005: try the configured `Cleanup`; on
-    /// `CleanupError::Unreachable`, fall back to `RegexCleanup` (always
-    /// infallible), so no cleanup error ever reaches the output path.
+    /// AC-4 / ADR-0005 (+ issue #283): try the configured `Cleanup`; fall
+    /// back to `RegexCleanup` (always infallible) — and record that it fell
+    /// back — in either of two cases, so no cleanup error and no polluted
+    /// model output ever reaches the output path:
+    ///
+    /// 1. `CleanupError::Unreachable` (AC-4): the LLM backend was
+    ///    unreachable/timed out.
+    /// 2. The LLM returned `Ok`, but the text looks like a conversational
+    ///    preamble / prompt echo rather than the rewritten transcript (issue
+    ///    #283, ac7-p0: e.g. "This is a formal rewrite of your original
+    ///    transcript: …"). Emitting that as the "cleaned" dictation is worse
+    ///    than the deterministic regex baseline, so degrade to the baseline —
+    ///    the same safe-degradation contract as the unreachable path. The
+    ///    detector (`preamble::looks_like_preamble`) is conservative: a
+    ///    legitimate rewrite that merely starts with "This" is not caught.
+    ///
     /// Returns the cleaned text plus whether the fallback fired.
     fn clean_with_fallback(&self, raw: &str, tone: Tone) -> (String, bool) {
         match self.cleanup.clean(raw, tone) {
+            Ok(text) if crate::preamble::looks_like_preamble(&text) => {
+                let baseline = RegexCleanup
+                    .clean(raw, tone)
+                    .expect("RegexCleanup is infallible");
+                (baseline, true)
+            }
             Ok(text) => (text, false),
             Err(CleanupError::Unreachable) => {
                 let text = RegexCleanup

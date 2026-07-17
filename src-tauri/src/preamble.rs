@@ -19,6 +19,100 @@
 //! only its leading shape and a couple of the prompt's own distinctive
 //! uppercase labels (MISSION §5: this module logs nothing).
 
+/// The command prompt's own distinctive UPPERCASE channel labels. If either
+/// appears anywhere in model *output*, the model is echoing/narrating its
+/// system prompt rather than returning a rewrite (the #282 shape) — a
+/// faithful rewrite of ordinary selected text does not reproduce these exact
+/// uppercase phrases. Matched case-sensitively to stay conservative (a
+/// lowercase "content channel" could appear in genuine prose).
+const PROMPT_ECHO_MARKERS: &[&str] = &["CONTENT CHANNEL", "INSTRUCTION CHANNEL"];
+
+/// Leading phrases (lowercased) that mark the output as a conversational
+/// preamble, a task-narration, a role label, or a "here is the rewrite:"
+/// header rather than the rewritten text itself. Matched via `starts_with`
+/// on the leading-punctuation-stripped, lowercased output — deliberately
+/// specific ("this is a formal rewrite", not bare "this is") so a legitimate
+/// rewrite that merely begins with "This"/"Here"/"The" is never flagged
+/// (issues #282, #283).
+const PREAMBLE_PREFIXES: &[&str] = &[
+    // "Sure, here …" / "Of course, here …" / "Certainly, here …"
+    "sure, here",
+    "sure! here",
+    "sure thing",
+    "sure, i",
+    "of course, here",
+    "of course! here",
+    "certainly, here",
+    "certainly! here",
+    // "Here is the rewritten …" style headers (scoped to rewrite/output
+    // wording so "Here is where we disagree." is not caught).
+    "here is the rewritten",
+    "here's the rewritten",
+    "here is the rewrite",
+    "here's the rewrite",
+    "here is a rewritten",
+    "here's a rewritten",
+    "here is the corrected",
+    "here's the corrected",
+    "here is your rewritten",
+    "here is the formal version",
+    "here is the casual version",
+    "here is the cleaned",
+    // Task-narration (the #282 shape).
+    "my task is",
+    "your task is",
+    "the task is to",
+    "the user has selected",
+    "the user selected",
+    "the user's selected",
+    // "This is a … rewrite/version …" labels (the #283 shape) — scoped so
+    // "This is a formal document…" / "This is normal." are NOT caught.
+    "this is a formal rewrite",
+    "this is a casual rewrite",
+    "this is a neutral rewrite",
+    "this is a formal version",
+    "this is a casual version",
+    "this is a rewrite of",
+    "this is the rewrite of",
+    "this is the rewritten",
+    "this is a rewritten",
+    "this is your rewritten",
+    // Refusals / meta.
+    "as an ai",
+    "i'm just an ai",
+    // The model's own turn label.
+    "assistant:",
+];
+
+/// Whether `output` looks like an LLM preamble / prompt echo rather than the
+/// bare rewritten text (issues #282, #283). Conservative by construction —
+/// see the module and constant docs for the false-positive discipline.
+///
+/// Two independent signals:
+/// 1. The prompt's own uppercase channel labels appearing anywhere in the
+///    output ([`PROMPT_ECHO_MARKERS`]).
+/// 2. A [`PREAMBLE_PREFIXES`] phrase at the very start of the output, after
+///    stripping leading whitespace and common quote/markdown-emphasis
+///    characters a model might wrap a preamble in.
+pub fn looks_like_preamble(output: &str) -> bool {
+    if PROMPT_ECHO_MARKERS
+        .iter()
+        .any(|marker| output.contains(marker))
+    {
+        return true;
+    }
+
+    let normalized: String = output
+        .trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '*' | '#' | '“' | '‘')
+        })
+        .to_lowercase();
+
+    PREAMBLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,9 +176,7 @@ mod tests {
     #[test]
     fn tolerates_leading_whitespace_quotes_and_markdown_emphasis() {
         assert!(looks_like_preamble("   My task is to rewrite this."));
-        assert!(looks_like_preamble(
-            "\"Sure, here is the rewritten text.\""
-        ));
+        assert!(looks_like_preamble("\"Sure, here is the rewritten text.\""));
         assert!(looks_like_preamble("**Here is the rewritten text:** Done."));
     }
 

@@ -4315,6 +4315,15 @@ enum CommandRunError {
     /// selection). Treated exactly like [`CommandRunError::NoInstruction`]:
     /// the clipboard is restored, the paste keystroke is never synthesized.
     EmptyResult,
+    /// `CommandTransform::transform` returned `Ok`, but the text looks like a
+    /// conversational preamble / prompt echo rather than the rewritten
+    /// selection — the model (hardcoded llama3, 8B) narrated its own system
+    /// prompt or prepended a label instead of rewriting (issue #282, ac7-p0;
+    /// detected by [`preamble::looks_like_preamble`]). Treated exactly like
+    /// [`CommandRunError::EmptyResult`]: the clipboard is restored and the
+    /// paste keystroke is never synthesized, so a narrated prompt is never
+    /// pasted over the user's selection.
+    Preamble,
     /// `output::replace_selection` failed to synthesize the paste keystroke
     /// or observe the post-paste clipboard; it already restored the
     /// original clipboard internally before returning `Err` (see its own
@@ -4346,6 +4355,16 @@ enum CommandRunError {
 /// constraint):** `content` and the transcribed `instruction` are threaded
 /// through as two distinct arguments all the way to `transform.transform(&content, &instruction)`
 /// — never concatenated anywhere in this function.
+/// Minimum number of (trimmed) characters a transcribed instruction must
+/// have before command mode will call the model (issue #282). Deliberately
+/// tiny — the point is only to reject a blank or single-stray-character
+/// transcription (which cannot be a meaningful directive and, sent to an 8B
+/// model with a real selection, tends to elicit prompt-narration), NOT to
+/// second-guess genuine short instructions like "fix" (3 chars). The
+/// output-side [`preamble::looks_like_preamble`] guard covers the harder case
+/// of a non-degenerate-but-bad instruction.
+const MIN_INSTRUCTION_CHARS: usize = 2;
+
 #[allow(clippy::too_many_arguments)] // mirrors output::route's identical justification: pure
                                      // dispatch logic over several independently-injected seams
 fn run_command_transform(
@@ -4371,7 +4390,14 @@ fn run_command_transform(
         }
     };
 
-    if instruction.trim().is_empty() {
+    // Issue #282 (ac7-p0): a blank OR sub-minimal-length transcribed
+    // instruction is degenerate (e.g. a single stray character downstream of
+    // the hotkey-leak #281) — short-circuit BEFORE calling the model, so a
+    // garbage instruction can never elicit a narrated-prompt response the
+    // user then sees. Kept conservative (a genuine short instruction like
+    // "fix" is 3 chars and passes) — the output-side preamble guard below is
+    // the second line of defense for a non-degenerate-but-bad instruction.
+    if instruction.trim().chars().count() < MIN_INSTRUCTION_CHARS {
         let _ = clipboard.set(&pre_copy_clipboard);
         return Err(CommandRunError::NoInstruction);
     }
@@ -4391,6 +4417,17 @@ fn run_command_transform(
     if transformed.trim().is_empty() {
         let _ = clipboard.set(&pre_copy_clipboard);
         return Err(CommandRunError::EmptyResult);
+    }
+
+    // Issue #282 (ac7-p0): the model sometimes returns a conversational
+    // preamble / a narration of its own system prompt instead of the
+    // rewritten selection. Treat that like a failed transform — restore the
+    // clipboard, never paste — so a narrated prompt is never pasted over the
+    // user's selection. Conservative detector (see `preamble` module): a
+    // legitimate rewrite that merely starts with "This" is not caught.
+    if preamble::looks_like_preamble(&transformed) {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::Preamble);
     }
 
     match output::replace_selection(
@@ -4505,6 +4542,9 @@ fn run_command_in_background(
                     }
                     CommandRunError::EmptyResult => {
                         "Local AI returned an empty result; the selection was left unchanged."
+                    }
+                    CommandRunError::Preamble => {
+                        "Local AI didn't return a usable rewrite; the selection was left unchanged."
                     }
                     CommandRunError::Paste => "Couldn't paste the transformed text.",
                 };
