@@ -74,6 +74,104 @@ pub fn distinct_hotkeys(dictation: &str, command: &str) -> Result<(), String> {
     }
 }
 
+/// Issue #281 (ac7-p0): the trigger (non-modifier) key allowed for the
+/// **command-mode** hotkey specifically — restricted to a function key
+/// (F1-F24). See [`validate_command_hotkey_keyset`]'s doc for the full
+/// rationale; this is just the allowlist itself, factored out so the
+/// doc comment above can explain the "why F1-F24, not just F13-F24" choice
+/// once, next to the check that enforces it.
+fn is_function_key(key: tauri_plugin_global_shortcut::Code) -> bool {
+    use tauri_plugin_global_shortcut::Code::*;
+    matches!(
+        key,
+        F1 | F2
+            | F3
+            | F4
+            | F5
+            | F6
+            | F7
+            | F8
+            | F9
+            | F10
+            | F11
+            | F12
+            | F13
+            | F14
+            | F15
+            | F16
+            | F17
+            | F18
+            | F19
+            | F20
+            | F21
+            | F22
+            | F23
+            | F24
+    )
+}
+
+/// Issue #281 (ac7-p0): reject a command-mode hotkey whose TRIGGER key would
+/// produce a text character if it leaked to the focused application.
+///
+/// **Background (see the #281 diagnosis comment for the full investigation):**
+/// `tauri-plugin-global-shortcut`/`global-hotkey` expose no suppress/consume
+/// option for a registered accelerator. On macOS, a non-media-key chord
+/// registers via Carbon `RegisterEventHotKey`, which is purely
+/// *observational* — the keystroke always reaches the focused app. On
+/// Windows, `RegisterHotKey`'s `MOD_NOREPEAT` only suppresses the FIRST
+/// keydown; OS auto-repeat keydowns generated while the chord is held still
+/// pass through. Neither is an app-code bug — there is no plugin-level fix.
+/// The observed harm (#281's repro): holding `Ctrl+Shift+O` in hold-to-record
+/// mode leaked repeated `O` keydowns into the focused app, typing `"oooo"`
+/// over the user's selection *before* the transform ever ran — the CONTENT
+/// channel the transform received was the leaked text, not the real
+/// selection.
+///
+/// **The fix (cofounder decision on #281):** since the leaked keydown can't
+/// be suppressed, prevent the harm instead — a function key produces no text
+/// character, so a leaked function-key keydown is inert as far as the
+/// focused app's text content goes. This parses `hotkey` with the exact same
+/// parser [`validate_hotkey`] uses (`Shortcut::from_str` — no divergent
+/// grammar between the two checks) and then requires the parsed trigger
+/// [`Code`](tauri_plugin_global_shortcut::Code) to be one of F1-F24.
+///
+/// **Why F1-F24, not just the "preferred" F13-F24 safe range:** F13-F24 are
+/// exactly as safe from the character-leak perspective as F1-F12 — a
+/// function key never produces a character regardless of which half of the
+/// range it's in — so there's no *character-safety* reason to exclude
+/// F1-F12. There IS a practical reason to *include* them: F13-F24 requires
+/// an extended/desktop keyboard (or remapping software) that most laptop
+/// keyboards — this app's primary target, MISSION §2 — simply have no
+/// physical key for. Restricting the allowlist to only F13-F24 would make
+/// the command-mode hotkey field impossible for most users to ever capture a
+/// value into (the settings-window picker can only capture a keydown the
+/// user's actual keyboard can produce). The only downside of allowing
+/// F1-F12 is a higher chance of colliding with an OS-reserved function key
+/// (brightness/volume/Mission Control/etc.) — a pre-existing, separate risk
+/// every hotkey field already carries for any key choice, and not the harm
+/// this fix is scoped to prevent.
+///
+/// Called from both sides of the same defense-in-depth boundary this
+/// module's other validators use: `commands::validate_command_hotkey` (a
+/// live picker-time probe, mirroring `commands::validate_hotkey`'s existing
+/// role for the general grammar check) and `commands::set_settings` (so a
+/// character-key command hotkey can never persist, even if a caller bypassed
+/// the picker's probe entirely).
+pub fn validate_command_hotkey_keyset(hotkey: &str) -> Result<(), String> {
+    use std::str::FromStr;
+    let parsed =
+        tauri_plugin_global_shortcut::Shortcut::from_str(hotkey).map_err(|e| e.to_string())?;
+    if is_function_key(parsed.key) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Command mode needs a function key (like F13) so the key press won't type into \
+             your document if it leaks to the focused app while the chord is held — \
+             {hotkey:?}'s trigger key isn't a function key (F1-F24)."
+        ))
+    }
+}
+
 /// Startup fallback (issue #91 Sentinel 🔴): returns `persisted` if it is a
 /// valid hotkey per [`validate_hotkey`], otherwise `default`. Callers pass
 /// `settings::Settings::default().hotkey` (always a valid accelerator) as
