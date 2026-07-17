@@ -77,9 +77,7 @@ export function chordFromKeyboardEvent(e: KeyboardEvent): string | null {
  * physical F13+ key, and F1-F12 are equally safe from the character-leak
  * perspective).
  */
-const FUNCTION_KEY_TOKENS = new Set(
-  Array.from({ length: 24 }, (_, i) => `F${i + 1}`),
-);
+const FUNCTION_KEY_TOKENS = new Set(Array.from({ length: 24 }, (_, i) => `F${i + 1}`));
 
 export type CommandHotkeyKeysetValidation = { valid: true } | { valid: false; reason: string };
 

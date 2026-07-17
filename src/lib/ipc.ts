@@ -204,6 +204,20 @@ export interface Commands {
   set_output_mode: { args: { mode: OutputModeSetting }; result: void };
   /** Mirrors `commands::validate_hotkey` — thin wrapper over `hotkeys::validate_hotkey`. */
   validate_hotkey: { args: { accelerator: string }; result: void };
+  /**
+   * Mirrors `commands::validate_command_hotkey` (issue #281, ac7-p0):
+   * `validate_hotkey`'s general grammar check PLUS the command-mode-specific
+   * function-key-trigger keyset constraint
+   * (`hotkeys::validate_command_hotkey_keyset`) — a leaked keydown can't be
+   * suppressed on either OS, so the command-mode hotkey's trigger key must
+   * be a function key (F1-F24), which produces no text character if it
+   * leaks to the focused app while the chord is held. `GeneralTab.tsx`'s
+   * command-hotkey field calls this instead of `validate_hotkey` for its
+   * capture-time probe — the dictation-hotkey field keeps using the plain
+   * `validate_hotkey` (this fix deliberately does not touch dictation-hotkey
+   * validation).
+   */
+  validate_command_hotkey: { args: { accelerator: string }; result: void };
   download_selected_model: { result: DownloadStartResult };
   /** Mirrors `commands::model_registry` (issue #184). */
   model_registry: { result: ModelRegistryEntry[] };
