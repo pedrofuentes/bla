@@ -1632,4 +1632,99 @@ mod ollama_tests {
             assert!(system.to_lowercase().contains(must_contain));
         }
     }
+
+    // -------------------------------------------------------------
+    // Issue #283 (ac7-p0): CLEANUP_PROMPT_V4 — a new, versioned cleanup/tone
+    // prompt hardened against conversational preambles / labels (e.g. "This
+    // is a formal rewrite of your original transcript: …"), with a few-shot
+    // demonstration that the output is ONLY the rewritten transcript.
+    // Supersedes CLEANUP_PROMPT_V3 as `OllamaCleanup`'s live system prompt,
+    // per the "add a new file, never edit the old one in place" convention;
+    // v3 (and v1/v2) stay on disk untouched, still protected by their own
+    // regression tests above.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cleanup_prompt_v4_is_a_distinct_file_from_v3() {
+        assert_ne!(
+            CLEANUP_PROMPT_V4, CLEANUP_PROMPT_V3,
+            "cleanup_v4.txt must be its own file, not a copy of cleanup_v3.txt"
+        );
+    }
+
+    #[test]
+    fn ac_v4_prompt_file_contains_the_rewrite_only_constraints() {
+        let prompt = CLEANUP_PROMPT_V4.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "filler",
+            "self-correction",
+            "punctuation",
+            "bullet",
+            "tone",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "cleanup_v4 prompt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_prompt_v4_contains_the_dictionary_and_tone_placeholders() {
+        assert!(CLEANUP_PROMPT_V4.contains("{{DICTIONARY}}"));
+        assert!(CLEANUP_PROMPT_V4.contains("{{TONE}}"));
+    }
+
+    #[test]
+    fn cleanup_prompt_v4_rule_7_forbids_inserting_unspoken_dictionary_terms_issue_229() {
+        let normalized = CLEANUP_PROMPT_V4
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains(RULE_7_ANTI_HALLUCINATION_CLAUSE),
+            "cleanup_v4 rule 7 must forbid inserting a dictionary term the speaker never said \
+             (anti-hallucination guard) — normalized prompt was: {normalized:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_prompt_v4_hardens_against_preambles_issue_283() {
+        let prompt = CLEANUP_PROMPT_V4.to_lowercase();
+        assert!(prompt.contains("preamble"));
+        // A worked few-shot demonstration (transcript -> output-is-only-the-
+        // rewritten-text), contrasting a correct rewrite with a labeled one.
+        assert!(
+            CLEANUP_PROMPT_V4.contains("CORRECT OUTPUT") && CLEANUP_PROMPT_V4.contains("WRONG OUTPUT"),
+            "cleanup_v4.txt must carry a few-shot example contrasting correct vs. preamble output"
+        );
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v4_substitutes_the_dictionary_and_tone_placeholders() {
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let rendered = render_cleanup_prompt_v4(&dictionary, Tone::Formal);
+        assert!(!rendered.contains("{{DICTIONARY}}"));
+        assert!(!rendered.contains("{{TONE}}"));
+        assert!(!rendered.contains("{{"));
+        assert!(!rendered.contains("}}"));
+        assert!(rendered.contains(&crate::stt::build_initial_prompt(&dictionary)));
+        assert!(rendered.to_lowercase().contains("formal"));
+    }
+
+    #[test]
+    fn ollama_cleanup_sends_the_v4_prompt_live_issue_283() {
+        // The production `OllamaCleanup::clean` path must now send v4 (the
+        // hardened prompt), not v3.
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub);
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+        assert_eq!(parsed["system"], render_cleanup_prompt_v4(&[], Tone::Neutral));
+    }
 }

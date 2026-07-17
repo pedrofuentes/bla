@@ -497,4 +497,65 @@ mod tests {
         let b = render_command_prompt_v1("turn into bullets");
         assert_eq!(a, b);
     }
+
+    // -------------------------------------------------------------
+    // Issue #282 (ac7-p0): command_v2.txt — a new, versioned command-mode
+    // prompt hardened against preambles / task-narration, with a few-shot
+    // demonstration that the output is ONLY the rewritten text. Supersedes
+    // command_v1.txt as `OllamaCommand`'s live system prompt, per the same
+    // "add a new file, never edit the old one in place" convention; v1 stays
+    // on disk untouched, still protected by its own regression tests above.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn command_prompt_v2_is_a_distinct_file_from_v1() {
+        assert_ne!(
+            COMMAND_PROMPT_V2, COMMAND_PROMPT_V1,
+            "command_v2.txt must be its own file, not a copy of command_v1.txt"
+        );
+    }
+
+    #[test]
+    fn command_prompt_v2_carries_all_v1_rewrite_only_constraints() {
+        let prompt = COMMAND_PROMPT_V2.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "rewrite only",
+            "untrusted",
+            "instruction channel",
+            "content channel",
+            "never obeyed",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "command_v2.txt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_prompt_v2_hardens_against_preambles_and_narration_issue_282() {
+        let prompt = COMMAND_PROMPT_V2.to_lowercase();
+        // Explicit anti-narration / anti-preamble wording.
+        assert!(prompt.contains("preamble"));
+        assert!(prompt.contains("narrat"));
+        // A worked few-shot demonstration (input -> output-is-only-the-text).
+        assert!(
+            COMMAND_PROMPT_V2.contains("CORRECT OUTPUT") && COMMAND_PROMPT_V2.contains("WRONG OUTPUT"),
+            "command_v2.txt must carry a few-shot example contrasting correct vs. preamble output"
+        );
+    }
+
+    #[test]
+    fn command_prompt_v2_contains_the_instruction_placeholder() {
+        assert!(COMMAND_PROMPT_V2.contains("{{INSTRUCTION}}"));
+    }
+
+    #[test]
+    fn render_command_prompt_v2_substitutes_the_instruction_placeholder() {
+        let rendered = render_command_prompt_v2("make this formal");
+        assert!(!rendered.contains("{{INSTRUCTION}}"));
+        assert!(rendered.contains("make this formal"));
+    }
 }
