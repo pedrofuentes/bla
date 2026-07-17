@@ -7,6 +7,273 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-17 (M3: context features)
+
+### Added
+
+- Headless SQLite `Store` foundation for dictation history (kickoff #160): a
+  numbered, idempotent `PRAGMA user_version` migration runner creates the
+  `history` table (raw + cleaned text, timestamp, source app), with
+  insert/search/delete/clear operations and a pure `retention_cutoff_ms`
+  helper for future auto-pruning.
+- History capture backend (M3 PR 3.2, issue #198): every completed dictation
+  now persists a history row (raw + cleaned transcript) to the local SQLite
+  store, including a dictation whose generation went stale for UI purposes —
+  the text was already pasted, so it's never dropped from history. New IPC
+  commands `search_history`, `copy_history_entry` (routed through the
+  existing clipboard seam, never a bare loggable `String`), `delete_history_entry`,
+  and `clear_history` back the History tab. A new `Settings.retention_days`
+  (`0` = keep forever) prunes history on startup and after every settings save
+  once set above zero.
+- History settings tab (M3 PR 3.3, issue #199): the settings window's
+  History tab now shows your dictation history — a substring search box,
+  a result list (timestamp, source app when known, cleaned-text preview)
+  with per-entry Copy/Delete, a "Clear all" gated behind an inline confirm
+  (never a native dialog), and a "Keep history for" control bound to the
+  retention-days setting (0 = keep forever) that persists immediately.
+- Personal dictionary backend (M3 PR 3.4, issue #200): a new `dictionary`
+  table (migration 2 on the `Store` foundation from #160/#198) with
+  case-insensitive term uniqueness (`UNIQUE COLLATE NOCASE` — adding
+  "Kubernetes" then "kubectl" keeps two rows, but "kubernetes" a second time
+  is a no-op) and CRUD (`Store::add_term`/`list_terms`/`remove_term`, plus
+  the `list_dictionary_terms`/`add_dictionary_term`/`remove_dictionary_term`
+  IPC commands). Dictionary terms now actually flow into both sides of the
+  pipeline: Whisper's `initial_prompt` (`TranscribeOpts.dictionary`) and a
+  new versioned, rewrite-only `cleanup_v2` prompt (`prompts/cleanup_v2.txt`,
+  superseding `cleanup_v1.txt` as `OllamaCleanup`'s live system prompt)
+  carrying a `{{DICTIONARY}}` placeholder substituted with the current terms
+  at call time.
+- Dictionary settings tab (M3 PR 3.5, issue #201): the settings window's
+  Dictionary tab now lists your personal-dictionary terms
+  (`list_dictionary_terms`), an add-term input calling `add_dictionary_term`
+  with immediate list update, and per-term Remove calling
+  `remove_dictionary_term`. Because the backend's case-insensitive
+  uniqueness constraint (`dictionary(term UNIQUE COLLATE NOCASE)`, #200)
+  makes a duplicate add a silent no-op rather than a rejected call, the
+  tab validates client-side — blank/whitespace-only input and a
+  case-insensitive duplicate of an existing term both surface inline
+  feedback and never reach the backend.
+- Per-app tone backend (M3 PR 3.6, issue #202): `context.rs` now detects the
+  focused application at hotkey-press time (`active-win-pos-rs`, app NAME
+  only — never a window title, to avoid triggering the macOS Screen
+  Recording permission prompt) and resolves it against a new `tone_rules`
+  table (migration 3 on the `Store` foundation: `app_pattern` →
+  `casual`/`formal`/`verbatim`, `UNIQUE COLLATE NOCASE` + a `CHECK`
+  constraint, upsert/list/delete CRUD) via a pure, glob/case-insensitive
+  pattern matcher. `Tone` gains `Casual`/`Formal` variants alongside the
+  existing `Neutral`/`Verbatim`; `OllamaCleanup` now renders a new
+  `cleanup_v3` prompt (superseding `cleanup_v2`, which stays untouched) with
+  a `{{TONE}}` placeholder carrying a tone-specific writing-style
+  instruction. `run_pipeline_in_background` now resolves and dispatches the
+  matching tone on every dictation instead of a hardcoded `Tone::Neutral`,
+  with detection failure degrading silently to `Neutral` (never surfaced to
+  the paste path) — and the detected app name now also reaches
+  `history.app_name`, previously always `None`. New
+  `list_tone_rules`/`upsert_tone_rule`/`delete_tone_rule` IPC commands.
+- Tone settings tab (M3 PR 3.7, issue #203): the settings window's Tone tab
+  replaces the "coming soon" placeholder with a real UI for the per-app
+  tone rules `list_tone_rules`/`upsert_tone_rule`/`delete_tone_rule` (#202)
+  already persist. Rules render as a numbered list in the exact order
+  `context::resolve_tone_for_app` walks (insertion order, `id` ASC) with a
+  "checked top to bottom — the first matching pattern wins" note, so the
+  list visually communicates match priority; there's no reorder command on
+  the backend, so none is offered. An add-rule form (app pattern +
+  casual/formal/verbatim picker) calls `upsert_tone_rule`, appending the new
+  rule at the end of the list to match its real insertion-order position;
+  each row's tone picker also calls `upsert_tone_rule` (keyed on that row's
+  own pattern) to edit a rule's tone in place, and a per-row Remove calls
+  `delete_tone_rule`. Because the backend's upsert-by-pattern is a silent
+  update rather than a rejected call on a duplicate, blank/whitespace-only
+  and case-insensitive-duplicate patterns are rejected client-side before
+  the add call is ever placed, mirroring the Dictionary tab's validation
+  pattern.
+- File-mode output-path/template picker (issue #180, AC-7 #173 p0): the
+  settings window's General tab now has an Output section — a
+  Paste-at-cursor/Append-to-a-file mode switch, plus, when File mode is
+  selected, a "Base folder (vault)" field and a `{{date:YYYY-MM-DD}}`-templated
+  path field (e.g. `daily/{{date:YYYY-MM-DD}}.md` for an Obsidian daily
+  note). Switching to File mode now actually writes into the folder you
+  choose instead of a fixed, unchangeable default location; an invalid path
+  template (absolute, or one that escapes the base folder) shows an inline
+  error and is never saved.
+- Model download sizes in the settings picker (issue #184): the General
+  tab's model `<select>` now shows each Whisper preset's download size
+  (e.g. "Small — 488 MB"), sourced from a new `model_registry` command.
+
+### Changed
+
+- Settings window auto-apply (issue #183, AC-7 smoke test): removed the
+  General tab's Save button — the recording mode, model preset,
+  launch-at-login and sound-cues controls now apply immediately on change,
+  with a brief "Saved" confirmation or an inline error, instead of
+  requiring a separate Save click that caused false-alarm bug reports in
+  the AC-7 smoke test.
+- Hotkey rebinding uses an explicit Apply button (issue #187, cofounder
+  decision): in the settings General tab, changing the dictation hotkey now
+  captures the new chord as a pending value and only registers + saves it
+  when you click Apply (the other settings still apply instantly).
+  Capturing still suspends the live global shortcut so keystrokes are
+  grabbed for rebinding, and fully restores the current hotkey if you
+  cancel — and an unbindable chord (already claimed by another app) is
+  reported inline and never persisted, so it can't leave dictation without
+  a working hotkey.
+- Chore/docs/test batch closing three Sentinel follow-ups (issues #197,
+  #211, #213): declared an explicit `"engines": { "node": ">=20.19" }`
+  floor in `package.json` (plus a matching `.nvmrc`), consistent with
+  `@vitejs/plugin-react` 5.x's own Node requirement; updated the README's
+  file-output section to document the Settings → Output "Base folder
+  (vault)" and path-template fields (the Obsidian daily-note flow) instead
+  of the old fixed app-data-location description; and made the pill
+  listener test's `console.error` spy restore reliably by setting
+  `restoreMocks: true` in `vitest.config.ts`.
+- Test hygiene (issue #205): vitest now excludes `.worktrees/**` and
+  `.claude/worktrees/**` from test discovery to prevent false test counts
+  and spurious failures when worktrees are present locally.
+- Test batch closing seven Sentinel test-quality follow-ups plus a
+  format-drift fix (issues #209, #224, #225, #226, #234, #238, #240, part
+  of #217): added negative "not committed before blur" assertions to
+  GeneralTab's file-mode fields and HistoryTab's retention control; added a
+  HistoryTab test exercising the `searchSeqRef` out-of-order-search guard
+  and a `commitRetention` rejection/revert-path test; added DictionaryTab
+  controlled-promise tests for the add/remove in-flight button states;
+  added a ToneTab test exercising the per-row `editGenRef` guard against a
+  stale REJECT clobbering a newer, already-applied edit; replaced the
+  `tests/visual/settings-harness.tsx` Tone-tab fixture's non-synthetic
+  `*Terminal` app pattern with a synthetic `*SynthTerm` and recaptured the
+  affected `docs/design/screenshots/settings-tone-*.png` screenshots; and
+  ran Prettier on `src/lib/pathTemplate.ts` to fix format drift. No
+  production behavior changed.
+- Test batch closing three Sentinel test-quality follow-ups (issues #221,
+  #229, #239): the busy_timeout regression test (#162/#221) is honestly
+  non-discriminating on its own — rusqlite 0.40.1's internal default
+  happens to also produce a 5000ms `PRAGMA busy_timeout`, so removing
+  `from_connection`'s explicit `conn.busy_timeout(...)` call still leaves
+  that assertion green — so a second, source-level test now parses
+  `from_connection`'s own body out of `store.rs` and asserts the explicit
+  call is textually present, pinning the reviewable contract; added
+  fixture regression tests pinning `cleanup_v2`/`cleanup_v3`'s rule 7
+  anti-hallucination clause ("never insert a dictionary term the speaker
+  did not actually say"); and added a class-level wire-key contract guard
+  — a `commands.rs` test that parses every `#[tauri::command]` fn out of
+  its own source and asserts any multi-word snake_case argument carries
+  `rename_all = "snake_case"`. No production behavior changed.
+
+### Fixed
+
+- Fixed the recording pill/tray icon being able to get stuck out of sync
+  with the actual pipeline state (issue #128, escalated by Sentinel on PR
+  #127): `AppState` now holds pipeline state and pill visibility together
+  as one `tray::PipelineDisplay` behind a single mutex, and the
+  main-thread closure re-derives what to show (`tray::resolve_display`)
+  from whatever `AppState` currently holds at the moment it actually runs,
+  closing an ordering race between overlapping same-generation state
+  transitions instead of papering over the common case.
+- Fixed overlapping dictations clobbering each other's pipeline state
+  (issues #176, #175, #174): a per-dictation generation id (minted at
+  `StartRecording`, mirroring the existing pill-visibility-epoch pattern)
+  is now threaded through the background transcription thread and every
+  settle it can spawn; a completion whose generation no longer matches the
+  live dictation now no-ops entirely instead of clobbering the newer
+  dictation. The settle thread's delayed pill-hide also now locks
+  `pipeline_state` before reading the epoch/generation atomics, closing a
+  narrow TOCTOU window.
+- Fixed the recording pill's waveform appearing flat/dead during dictation
+  (issue #179, AC-7 #173): a new pure `scaleLevelForDisplay`
+  (`src/lib/waveform.ts`) applies a perceptual `sqrt(rms) * 2.5` gain so
+  speech-level RMS now visibly fills most of the bar while silence stays
+  at the floor.
+- Suppressed the global dictation hotkey during capture (issue #181, AC-7
+  smoke test): the settings window's hotkey-capture field now temporarily
+  unregisters the live global shortcut (`suspend_hotkey`) while active, so
+  keypresses are captured for rebinding instead of also starting a
+  dictation, restoring it (`resume_hotkey`) on cancel/blur/invalid capture.
+- Fixed the recording pill blanking to "Status unavailable" on a single
+  failed event subscription (issue #182): a rejected
+  `audio-level`/`pipeline-state-changed`/`pipeline-error` subscription now
+  degrades only the feature it feeds (e.g. the live waveform falls back to
+  the state dot) instead of masking the whole pill; the fallback is
+  reserved for every subscription failing, and a listener's later
+  successful (re)subscription always clears its own prior failure.
+- Fix (#162): `Store::from_connection` now explicitly sets a 5s
+  `busy_timeout` before running migrations, so a transient lock on the
+  on-disk history DB (a second app instance, a crash-relaunch race, an OS
+  indexer/backup read lock) blocks and retries instead of failing the
+  write immediately with `SQLITE_BUSY` and dropping a history row.
+- Fix (#69): a dictionary term containing a NUL byte no longer panics
+  whisper-rs's `set_initial_prompt` — `build_initial_prompt` strips NUL
+  bytes before any other processing.
+- Fix (#70): once one dictionary term overflowed `initial_prompt`'s length
+  cap, every *subsequent* term used to be silently dropped along with it;
+  `build_initial_prompt` now skips only the oversized term and keeps
+  packing whatever else fits. `Store::list_terms` also orders
+  most-recently-added first, so a dictionary too large for the cap loses
+  its oldest terms first, not an arbitrary subset.
+- Fix (#163): a `schema_migrations` ledger now backs the migration
+  runner's version guard with a real discriminating test — a
+  silently-broken guard now fails loudly (a ledger PRIMARY KEY violation)
+  on the very next reopen instead of passing every existing test.
+- Fix (#219): the retention prune's cutoff now guards against a
+  clock-skewed `now` — pruning is skipped entirely if `now` reads before
+  the newest recorded history row (proof of a backward clock jump), and
+  the cutoff is otherwise clamped so it can never exceed the newest row's
+  own timestamp. A backwards clock jump can no longer mass-delete history
+  once retention is user-configurable (#199).
+- Hardened the file-output write path against a symlink/TOCTOU gap (issue
+  #208, flagged by Sentinel on PR #204). Confining a dictation's templated
+  path to the configured base folder was purely lexical — it rejected
+  absolute paths and `..` traversal but never touched the filesystem — so
+  a symlink pre-planted inside the base folder (or swapped in between the
+  confine step and the write) could redirect the append outside the
+  confined tree. The write now canonicalizes the resolved parent directory
+  (after creating it) and refuses the write unless it still resolves under
+  the canonicalized base, refuses a pre-existing symlink at the final path
+  component, and on macOS/Linux opens the target with `O_NOFOLLOW` so a
+  symlinked final component makes the open fail atomically rather than
+  being followed. A refused write surfaces through the existing kind-only
+  error path (no file path or dictation text is ever logged or sent to the
+  UI). This is same-user-bounded defense-in-depth, not a privilege
+  boundary.
+- Two Sentinel follow-ups fixed together (issues #210, #220): the Settings
+  → Output "Base folder (vault)" field now validates absoluteness
+  client-side (`src/lib/baseDir.ts`'s `validateBaseDir`) — since
+  `output::resolve_base_dir` uses the configured string verbatim (never
+  expanding `~`, never resolving a relative path against anything but the
+  process's CWD at write time), a relative value previously wrote into an
+  unexpected, launch-inconsistent location with no warning. Separately,
+  `Store::insert_history` failures at the `run_pipeline_in_background` call
+  site — previously `eprintln!`-only, invisible in a packaged GUI and a
+  silent history-row loss — now also emit a new, informational
+  `errors::ErrorKind::HistoryPersistFailed` through the existing typed
+  `pipeline-error` event surface (kind-only, no data from the underlying
+  `rusqlite::Error`), which the pill renders as a non-blocking "Couldn't
+  save this dictation to history." toast; the row insert itself stays
+  unconditional but the toast is gated behind `generation_is_live` like
+  every other UI-visible effect in that function.
+- Fixed a Sentinel finding on PR #245's cross-platform base-folder fix
+  (issue #246): `validateBaseDir` previously accepted either platform's
+  absolute syntax regardless of the runtime OS — a synced `settings.json`
+  carrying a Windows `C:\...` form onto macOS (or a bare POSIX `/foo` onto
+  Windows) passed client-side validation even though
+  `output::resolve_base_dir` runs Rust-side against THIS machine,
+  reproducing #210's CWD-relative-write failure mode. `validateBaseDir`
+  now takes the runtime platform as an explicit parameter and accepts only
+  that platform's absolute form, rejecting a foreign-platform form with a
+  distinct "Not an absolute path on this system…" inline error. The
+  settings window fetches the runtime platform once on mount via a new,
+  trivial, zero-argument `get_platform` command and passes it to the
+  validator on every base-folder change/blur.
+- Rust core-logic hardening batch closing three triaged findings (issues
+  #61, #71, #74): `write_wav_16k_mono` now writes to a sibling temp file
+  and only renames it onto the destination once the WAV is fully written
+  and finalized, so a mid-write error can no longer leave a
+  truncated/corrupt WAV file behind; `WhisperStt::transcribe` now decodes a
+  whisper.cpp segment's text lossily instead of silently dropping it when
+  it isn't valid UTF-8, and emits a stderr warning (a count only, never
+  the decoded text) when that happens; and `classify_ureq_error`'s timeout
+  classification now checks the typed `io::ErrorKind::TimedOut` on the
+  transport error's wrapped source instead of substring-matching its
+  rendered message.
+
 ## [0.2.0] — M2: UI shell (pending AC-7 cofounder smoke test)
 
 ### Added

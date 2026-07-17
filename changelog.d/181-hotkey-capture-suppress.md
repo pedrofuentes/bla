@@ -1,1 +1,0 @@
-- Suppressed the global dictation hotkey during capture (issue #181, AC-7 smoke test): the settings window's hotkey-capture field now temporarily unregisters the live global shortcut (`suspend_hotkey`) while active, so keypresses are captured for rebinding instead of also starting a dictation, restoring it (`resume_hotkey`) on cancel/blur/invalid capture.
