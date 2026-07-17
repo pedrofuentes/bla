@@ -1420,8 +1420,8 @@ mod mapping_tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn set_two_hotkeys_with_rollback_persist_failure_after_a_colliding_swap_restores_both_sntl_pr274_867577d()
-     {
+    fn set_two_hotkeys_with_rollback_persist_failure_after_a_colliding_swap_restores_both_sntl_pr274_867577d(
+    ) {
         let registry = SharedRegistry::new(&["X", "Z"]);
 
         let result = set_two_hotkeys_with_rollback(
@@ -1448,7 +1448,10 @@ mod mapping_tests {
             registry.is_live("Z"),
             "command's prior must also be restored"
         );
-        assert!(!registry.is_live("Y"), "dictation's new value must be freed");
+        assert!(
+            !registry.is_live("Y"),
+            "dictation's new value must be freed"
+        );
     }
 
     // -------------------------------------------------------------
@@ -1469,8 +1472,8 @@ mod mapping_tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn set_two_hotkeys_with_rollback_dictation_register_failure_with_a_swap_adjacent_collision_is_still_safe_sntl_pr274_867577d()
-     {
+    fn set_two_hotkeys_with_rollback_dictation_register_failure_with_a_swap_adjacent_collision_is_still_safe_sntl_pr274_867577d(
+    ) {
         let registry = SharedRegistry::with_blocked(&["X", "Z"], &["Y"]);
 
         let result = set_two_hotkeys_with_rollback(
@@ -2709,14 +2712,35 @@ pub(crate) fn set_settings_with_rollback(
 /// unregistered with no matching rollback, dead until restart, while
 /// settings.json still claims it's bound.
 ///
-/// **The fix:** unregister BOTH changed priors before registering EITHER
-/// new value, so by the time either registration is attempted, the whole
-/// registry is already free of both old bindings — a genuine swap (or any
-/// other combination) can only fail for a reason unrelated to this
-/// transient ordering (e.g. the OS itself rejecting an accelerator another
-/// application owns), and every failure path restores BOTH slots to their
-/// prior bindings before returning `Err`, so a failed save never leaves
-/// exactly one slot dead.
+/// **The fix, and why it's now ONE shared helper instead of three
+/// hand-rolled branches (SNTL-20260716-bla-PR274-{2b757bf,0900818,867577d}
+/// — three separate delta re-reviews, each catching a DIFFERENT
+/// mirror-edge of the identical mistake in a different branch):** every
+/// rollback in this function — whichever of the three failure points
+/// (dictation-register / command-register / persist) triggers it — must
+/// free every new binding that's ACTUALLY LIVE right now before
+/// re-registering any prior, never the reverse. Get that ordering
+/// backwards in even one branch and a prior can attempt to bind while a
+/// still-live new value (possibly belonging to the OTHER slot, in a
+/// swap-style save) is squatting on the same accelerator; the OS rejects
+/// it, the failure is necessarily best-effort/swallowed (there's no
+/// further fallback to run), and that prior ends up live NOWHERE —
+/// exactly the dead-hotkey/settings.json-disagreement outcome this whole
+/// function exists to prevent. [`rollback_both_hotkeys`] is the single
+/// place this ordering now lives, parameterized by which new bindings are
+/// actually live at the point of failure (computed from what actually
+/// happened, never assumed):
+/// - dictation-register-failure: neither new value is ever live (this
+///   slot's own attempt just failed with nothing bound; the command slot's
+///   register hasn't even been attempted yet) — restoring both priors here
+///   can't collide regardless of ordering, but it still goes through the
+///   shared helper for the guarantee to live in one place, not three.
+/// - command-register-failure: dictation's new value is live IF
+///   `hotkey_changed` (its own registration already succeeded above);
+///   command's own new value never became live (this is the failure
+///   itself).
+/// - persist-failure: BOTH new values are live (both registrations already
+///   succeeded, or this failure point would never be reached).
 ///
 /// Mirrors [`set_settings_with_rollback`]'s register-then-persist-then-
 /// rollback-on-failure shape for each individual slot (not literally
@@ -2750,59 +2774,113 @@ pub(crate) fn set_two_hotkeys_with_rollback(
         unregister(prior_command_hotkey);
     }
 
+    let mut dictation_new_is_live = false;
+    let mut command_new_is_live = false;
+
     if hotkey_changed {
         if let Err(err) = register_dictation(new_hotkey) {
-            // The new chord won't bind — restore dictation's own prior
-            // (mirrors `set_settings_with_rollback`'s single-slot rollback)
-            // AND the command slot's prior, unregistered up front even
-            // though its own register was never even attempted.
-            let _ = register_dictation(prior_hotkey);
-            if command_hotkey_changed {
-                let _ = register_command(prior_command_hotkey);
-            }
+            rollback_both_hotkeys(
+                hotkey_changed,
+                prior_hotkey,
+                dictation_new_is_live,
+                new_hotkey,
+                command_hotkey_changed,
+                prior_command_hotkey,
+                command_new_is_live,
+                new_command_hotkey,
+                &mut unregister,
+                &mut register_dictation,
+                &mut register_command,
+            );
             return Err(err);
         }
+        dictation_new_is_live = true;
     }
 
     if command_hotkey_changed {
         if let Err(err) = register_command(new_command_hotkey) {
-            // Issue #259 Sentinel 🔴-3 residual (SNTL-20260716-bla-PR274-0900818):
-            // free dictation's new value FIRST, before attempting to
-            // restore command's prior — a swap-style save can have
-            // `prior_command_hotkey == new_hotkey` (dictation A→B, command
-            // B→C), and dictation's new value is already live at this
-            // point (its own registration succeeded above). Restoring
-            // command's prior before freeing that collision would fail
-            // (silently, via the `let _ =` below) on the OS's single
-            // shared accelerator registry, leaving command's prior live
-            // NOWHERE once dictation's rollback then unregisters it too —
-            // exactly the dead-hotkey/settings.json-disagreement outcome
-            // this whole function exists to prevent. Mirrors the ordering
-            // the persist-failure branch below already gets right.
-            if hotkey_changed {
-                unregister(new_hotkey);
-                let _ = register_dictation(prior_hotkey);
-            }
-            let _ = register_command(prior_command_hotkey);
+            rollback_both_hotkeys(
+                hotkey_changed,
+                prior_hotkey,
+                dictation_new_is_live,
+                new_hotkey,
+                command_hotkey_changed,
+                prior_command_hotkey,
+                command_new_is_live,
+                new_command_hotkey,
+                &mut unregister,
+                &mut register_dictation,
+                &mut register_command,
+            );
             return Err(err);
         }
+        command_new_is_live = true;
     }
 
     if let Err(err) = persist() {
-        // Both registrations succeeded — restore both to their prior
-        // bindings so the OS and the (unchanged) settings.json agree again.
-        if hotkey_changed {
-            unregister(new_hotkey);
-            let _ = register_dictation(prior_hotkey);
-        }
-        if command_hotkey_changed {
-            unregister(new_command_hotkey);
-            let _ = register_command(prior_command_hotkey);
-        }
+        rollback_both_hotkeys(
+            hotkey_changed,
+            prior_hotkey,
+            dictation_new_is_live,
+            new_hotkey,
+            command_hotkey_changed,
+            prior_command_hotkey,
+            command_new_is_live,
+            new_command_hotkey,
+            &mut unregister,
+            &mut register_dictation,
+            &mut register_command,
+        );
         return Err(err);
     }
 
     Ok(())
+}
+
+/// The single shared rollback discipline for every failure point in
+/// [`set_two_hotkeys_with_rollback`] (issue #259 Sentinel 🔴-3 and its two
+/// mirror edges — SNTL-20260716-bla-PR274-{2b757bf,0900818,867577d} —
+/// three hand-rolled per-branch rollbacks each independently got this
+/// ordering wrong in a different branch; this is now the one place it
+/// lives). See that function's doc comment for the full rationale and the
+/// three call sites' `*_new_is_live` values.
+///
+/// Frees every new binding that's ACTUALLY live right now (`unregister` is
+/// a no-op for one that isn't — but which is which is computed by the
+/// caller from what actually happened, never assumed), THEN registers
+/// whichever slot(s) changed back to its prior value. This ordering — free
+/// every live new binding before registering ANY prior — is what
+/// guarantees a prior can never collide with a still-live new value on the
+/// OS's single shared accelerator registry, no matter which of the three
+/// failure points called it or which combination of `*_new_is_live` that
+/// point observed.
+#[allow(clippy::too_many_arguments)] // mirrors set_two_hotkeys_with_rollback's own justification —
+                                     // this is that function's one extracted rollback step
+fn rollback_both_hotkeys(
+    hotkey_changed: bool,
+    prior_hotkey: &str,
+    dictation_new_is_live: bool,
+    new_hotkey: &str,
+    command_hotkey_changed: bool,
+    prior_command_hotkey: &str,
+    command_new_is_live: bool,
+    new_command_hotkey: &str,
+    unregister: &mut impl FnMut(&str),
+    register_dictation: &mut impl FnMut(&str) -> Result<(), String>,
+    register_command: &mut impl FnMut(&str) -> Result<(), String>,
+) {
+    if dictation_new_is_live {
+        unregister(new_hotkey);
+    }
+    if command_new_is_live {
+        unregister(new_command_hotkey);
+    }
+    if hotkey_changed {
+        let _ = register_dictation(prior_hotkey);
+    }
+    if command_hotkey_changed {
+        let _ = register_command(prior_command_hotkey);
+    }
 }
 
 /// Backend safety net (PR #185 Sentinel 🔴-1(b)): force-restore the global
