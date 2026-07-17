@@ -14,7 +14,7 @@ use crate::{
     apply_settings_to_state, copy_history_entry_text, is_settings_window, model_registry_entries,
     now_ms, output_mode_toggle_label, prune_history_for_retention, react_to_command_transition,
     react_to_transition, register_command_hotkey, register_hotkey, save_settings_to_store,
-    set_settings_with_rollback, should_resume_hotkey, spec_for_preset, to_models_preset,
+    set_two_hotkeys_with_rollback, should_resume_hotkey, spec_for_preset, to_models_preset,
     to_tray_output_mode, unregister_hotkey, AppState, ModelRegistryEntry,
 };
 
@@ -109,22 +109,23 @@ pub fn set_settings(
     // therefore does NOT touch the generation at all — dissolving the
     // two-writer TOCTOU that earlier cycles fought.
     //
-    // Rollback keeps the OS binding and settings.json in agreement on failure.
-    // The control flow (register-before-persist; roll the OS back to the prior
-    // hotkey if EITHER the register or the persist fails) is the pure,
-    // unit-tested `set_settings_with_rollback` seam (PR #185 cycle-6 🟡); this
-    // command only injects the three OS effects. #91: validate BEFORE binding
-    // so a malformed chord is rejected without touching the OS.
-    //
     // Issue #259 (AC-49): extended to a SECOND independent hotkey slot
-    // (command mode). Both hotkeys live in the one `Settings` blob
-    // persisted by a single `save_settings_to_store` call, so the two
-    // `set_settings_with_rollback` calls below each use a no-op `persist`
-    // closure (they only carry the register-then-rollback-on-failure
-    // logic) — the REAL persist happens exactly once, after BOTH OS
-    // bindings (whichever changed) are confirmed live, so a settings.json
-    // write can never race ahead of one hotkey's still-unconfirmed OS
-    // registration.
+    // (command mode), sharing one persisted `Settings` blob AND one OS
+    // accelerator registry with the dictation slot.
+    //
+    // Issue #259 Sentinel 🔴-3 (SNTL-20260716-bla-PR274-2b757bf): the two
+    // slots are registered via `set_two_hotkeys_with_rollback`, NOT two
+    // independent per-slot register-then-persist calls — the OS's global
+    // shortcut registry keys purely by accelerator, so handling the slots
+    // fully independently breaks for a swap-style save (new-dictation ==
+    // current-command's still-live value, or vice versa): registering the
+    // first slot's new value can hit "already registered" because the
+    // other slot's still-current binding hasn't been freed yet, and a
+    // naive per-slot rollback has no reason to touch that other slot,
+    // leaving it dead until restart with settings.json disagreeing with
+    // the OS. `set_two_hotkeys_with_rollback` unregisters BOTH changed
+    // priors before registering EITHER new value, so this can't happen —
+    // see its doc comment for the full rationale.
     let prior_hotkey = if hotkey_changed {
         state.settings.lock().unwrap().hotkey.clone()
     } else {
@@ -147,82 +148,24 @@ pub fn set_settings(
     // two `validate_hotkey` calls just above, so by this point both parse.
     crate::hotkeys::distinct_hotkeys(&settings.hotkey, &settings.command_hotkey)?;
 
-    set_settings_with_rollback(
+    set_two_hotkeys_with_rollback(
         hotkey_changed,
         &prior_hotkey,
         &settings.hotkey,
-        |h| register_hotkey(&app, Some(&prior_hotkey), h).map_err(|e| e.to_string()),
-        || Ok(()),
-        |prior| {
-            // PR #185 cycle-6 🟢: a failed RESTORE must not be invisible — the
-            // OS could be left unbound. Surface it (per this file's eprintln
-            // convention) instead of silently swallowing it.
-            if let Err(err) = register_hotkey(&app, Some(&settings.hotkey), prior) {
-                eprintln!(
-                    "bla: failed to restore prior hotkey {prior:?} after a set_settings rollback; \
-                     the global dictation shortcut may be unbound until restart: {err}"
-                );
-            }
-        },
-    )?;
-
-    if let Err(err) = set_settings_with_rollback(
         command_hotkey_changed,
         &prior_command_hotkey,
         &settings.command_hotkey,
         |h| {
-            register_command_hotkey(&app, Some(&prior_command_hotkey), h).map_err(|e| e.to_string())
+            // Best-effort, same convention as `register_hotkey`'s own
+            // internal targeted-unregister-of-prior: `h` may already be
+            // unregistered (e.g. nothing was ever bound to it), and that
+            // must never block registering the OTHER slot's new value.
+            let _ = unregister_hotkey(&app, h);
         },
-        || Ok(()),
-        |prior| {
-            if let Err(err) = register_command_hotkey(&app, Some(&settings.command_hotkey), prior) {
-                eprintln!(
-                    "bla: failed to restore prior command-mode hotkey {prior:?} after a \
-                     set_settings rollback; the global command-mode shortcut may be unbound \
-                     until restart: {err}"
-                );
-            }
-        },
-    ) {
-        // The dictation hotkey (if changed) already registered successfully
-        // above — roll it back too, so a command-hotkey registration
-        // failure can never leave the OS bound to a dictation hotkey that
-        // never actually gets persisted below.
-        if hotkey_changed {
-            if let Err(rollback_err) = register_hotkey(&app, Some(&settings.hotkey), &prior_hotkey)
-            {
-                eprintln!(
-                    "bla: failed to restore prior dictation hotkey while rolling back a \
-                     command-hotkey registration failure: {rollback_err}"
-                );
-            }
-        }
-        return Err(err);
-    }
-
-    // Both hotkeys' OS bindings (whichever changed) are now live — persist
-    // the whole settings blob exactly once. A failure here rolls BOTH back
-    // to their prior values so the OS and the (unchanged) settings.json
-    // never end up disagreeing.
-    if let Err(err) = save_settings_to_store(&app, &settings) {
-        if hotkey_changed {
-            if let Err(rb) = register_hotkey(&app, Some(&settings.hotkey), &prior_hotkey) {
-                eprintln!(
-                    "bla: failed to restore prior dictation hotkey after a persist failure: {rb}"
-                );
-            }
-        }
-        if command_hotkey_changed {
-            if let Err(rb) =
-                register_command_hotkey(&app, Some(&settings.command_hotkey), &prior_command_hotkey)
-            {
-                eprintln!(
-                    "bla: failed to restore prior command-mode hotkey after a persist failure: {rb}"
-                );
-            }
-        }
-        return Err(err);
-    }
+        |h| register_hotkey(&app, None, h).map_err(|e| e.to_string()),
+        |h| register_command_hotkey(&app, None, h).map_err(|e| e.to_string()),
+        || save_settings_to_store(&app, &settings),
+    )?;
 
     // Issue #126: thin OS glue over `tauri-plugin-autostart`'s
     // `AutoLaunchManager` — the decision of WHETHER to call this already
