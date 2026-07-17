@@ -3318,18 +3318,21 @@ fn captured_selection_is_usable(selection: &str) -> bool {
 /// OS glue: feed one key event into the shared COMMAND-MODE state machine
 /// and react to whatever [`hotkeys::Transition`] it produces (issue #259).
 /// Mirrors [`handle_key_event`] exactly, one machine over.
-fn should_handle_command_key_event() -> bool {
-    COMMAND_MODE_ENABLED
+/// The injected closure keeps the flag-off early return testable without
+/// constructing `AppState`/`tauri::Wry` (issue #165).
+fn handle_command_key_event_if_enabled(handle: impl FnOnce()) {
+    if !COMMAND_MODE_ENABLED {
+        return;
+    }
+    handle();
 }
 
 fn handle_command_key_event(app: &tauri::AppHandle, event: hotkeys::KeyEvent) {
-    if !should_handle_command_key_event() {
-        return;
-    }
-
-    let state = app.state::<AppState>();
-    let transition = state.command_hotkeys.lock().unwrap().handle(event);
-    react_to_command_transition(app, transition);
+    handle_command_key_event_if_enabled(|| {
+        let state = app.state::<AppState>();
+        let transition = state.command_hotkeys.lock().unwrap().handle(event);
+        react_to_command_transition(app, transition);
+    });
 }
 
 /// Issue #259 (mirrors issue #44's `reconcile_hotkeys_on_focus_loss`): called
