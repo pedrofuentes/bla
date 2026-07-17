@@ -60,6 +60,11 @@ beforeEach(() => {
       // tests doesn't reject through an unmocked command.
       case "list_tone_rules":
         return Promise.resolve([]);
+      // Issue #261: the Snippets tab (mounted once its tab is clicked)
+      // lists snippets on mount — mocked here so switching to it in these
+      // tab-bar tests doesn't reject through an unmocked command.
+      case "list_snippets":
+        return Promise.resolve([]);
       default:
         return Promise.reject(new Error(`unmocked command ${command}`));
     }
@@ -82,7 +87,7 @@ describe("SettingsWindow tab bar", () => {
     expect(mounted.container.querySelector('[data-testid="general-panel"]')).not.toBeNull();
   });
 
-  it("switches to a placeholder panel when a not-yet-built tab is clicked", async () => {
+  it("switches to the real Snippets panel when the Snippets tab is clicked (issue #261)", async () => {
     mounted = mount(<SettingsWindow />);
     await flush();
 
@@ -90,9 +95,8 @@ describe("SettingsWindow tab bar", () => {
     await flush();
 
     expect(mounted.container.querySelector('[data-testid="general-panel"]')).toBeNull();
-    const placeholder = mounted.container.querySelector('[data-testid="placeholder-panel"]');
-    expect(placeholder).not.toBeNull();
-    expect(placeholder?.textContent).toMatch(/snippets/i);
+    expect(mounted.container.querySelector('[data-testid="placeholder-panel"]')).toBeNull();
+    expect(mounted.container.querySelector('[data-testid="snippets-panel"]')).not.toBeNull();
   });
 
   it("switches to the real Dictionary panel when the Dictionary tab is clicked (issue #201)", async () => {
