@@ -45,6 +45,35 @@ pub fn validate_hotkey(hotkey: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// AC-49 (issue #259, part of #242, M4): reject a command-mode hotkey that's
+/// indistinguishable from the dictation hotkey, rather than silently letting
+/// one shortcut registration shadow the other. Parses BOTH accelerators via
+/// the same [`validate_hotkey`] parser (`Shortcut::from_str`) and compares
+/// the *parsed* values — not the raw strings — so two spellings of the same
+/// physical chord (different key-token order, e.g. `"Shift+Control+C"` vs.
+/// `"Control+Shift+C"`, or a case difference) are still caught as identical,
+/// exactly as the OS registrar would see them once bound. `commands::set_settings`
+/// calls this before persisting either hotkey (mirroring how it already
+/// calls `validate_hotkey` before persisting one) — a malformed accelerator
+/// is reported via that same parse error, so this function doesn't need a
+/// separate "which one is malformed" case: [`validate_hotkey`] already runs
+/// first at each call site.
+pub fn distinct_hotkeys(dictation: &str, command: &str) -> Result<(), String> {
+    use std::str::FromStr;
+    let dictation_parsed =
+        tauri_plugin_global_shortcut::Shortcut::from_str(dictation).map_err(|e| e.to_string())?;
+    let command_parsed =
+        tauri_plugin_global_shortcut::Shortcut::from_str(command).map_err(|e| e.to_string())?;
+    if dictation_parsed == command_parsed {
+        Err(format!(
+            "the command-mode hotkey must differ from the dictation hotkey (both resolve to \
+             {command:?})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Startup fallback (issue #91 Sentinel 🔴): returns `persisted` if it is a
 /// valid hotkey per [`validate_hotkey`], otherwise `default`. Callers pass
 /// `settings::Settings::default().hotkey` (always a valid accelerator) as
@@ -495,6 +524,56 @@ mod tests {
                 "expected {bad:?} to be rejected as an invalid hotkey"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #259 (AC-49): a command-mode hotkey identical to the dictation
+    // hotkey must be rejected at settings-save time, not silently let one
+    // shortcut registration shadow the other.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn distinct_hotkeys_accepts_two_different_accelerators_issue_259() {
+        assert!(distinct_hotkeys("Control+Shift+Space", "Control+Shift+C").is_ok());
+    }
+
+    #[test]
+    fn distinct_hotkeys_rejects_two_identical_accelerators_issue_259() {
+        let err = distinct_hotkeys("Control+Shift+Space", "Control+Shift+Space")
+            .expect_err("identical bindings must be rejected");
+        assert!(!err.is_empty(), "the error must carry a clear message");
+    }
+
+    #[test]
+    fn distinct_hotkeys_rejects_the_same_chord_spelled_with_different_key_order_issue_259() {
+        // The OS registrar (and validate_hotkey's own parser) treats these
+        // as the exact same accelerator — this must be caught even though
+        // the raw strings differ.
+        let err = distinct_hotkeys("Control+Shift+C", "Shift+Control+C");
+        assert!(
+            err.is_err(),
+            "differently-ordered modifiers for the same chord must still be rejected"
+        );
+    }
+
+    #[test]
+    fn distinct_hotkeys_propagates_a_malformed_dictation_hotkeys_parse_error_issue_259() {
+        assert!(distinct_hotkeys("NotARealKey", "Control+Shift+C").is_err());
+    }
+
+    #[test]
+    fn distinct_hotkeys_propagates_a_malformed_command_hotkeys_parse_error_issue_259() {
+        assert!(distinct_hotkeys("Control+Shift+Space", "NotARealKey").is_err());
+    }
+
+    #[test]
+    fn the_actual_settings_defaults_for_both_hotkeys_are_distinct_issue_259() {
+        // Ties this assertion to the real `Settings::default()` values (not
+        // copy-pasted literals) so bla's own shipped defaults can never
+        // silently regress into colliding with each other and rejecting the
+        // very first settings save on a fresh install.
+        let settings = crate::settings::Settings::default();
+        assert!(distinct_hotkeys(&settings.hotkey, &settings.command_hotkey).is_ok());
     }
 
     #[test]

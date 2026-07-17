@@ -115,6 +115,34 @@ struct CachedStt {
 /// different threads.
 pub(crate) struct AppState {
     hotkeys: Mutex<hotkeys::StateMachine>,
+    /// Issue #259 (M4 command-mode backbone, part of #242): the command-mode
+    /// hotkey's own hold/toggle `StateMachine` instance — a separate press/
+    /// release *session* from `hotkeys` above, so a command-mode chord can
+    /// never be misread as (or interfere with) a dictation chord's phase, or
+    /// vice versa. Both machines currently mirror the same persisted
+    /// `Settings::recording_mode` (Hold vs. Toggle) — see `apply_settings` —
+    /// there's no separate per-mode setting for command mode in this PR.
+    /// They still share the single physical mic-capture resource below
+    /// (`buffer`/`diagnostics`/`capture`/`level_meter`): only one of the two
+    /// chords can actually be recording at a time. Mutual exclusion is
+    /// enforced from BOTH sides — `react_to_transition`'s AND
+    /// `react_to_command_transition`'s `StartRecording` arms each check
+    /// [`mic_capture_is_busy`] first, before touching anything else (issue
+    /// #259 Sentinel 🔴-1, SNTL-20260716-bla-PR274-2b757bf: an earlier
+    /// revision only guarded the command-mode side, so a dictation press
+    /// during an in-flight command-mode capture would silently clobber the
+    /// shared `capture`/`buffer`).
+    command_hotkeys: Mutex<hotkeys::StateMachine>,
+    /// Issue #259: the selection captured (`output::capture_selection`) at
+    /// the command-mode hotkey's press, stashed here until the matching
+    /// release/second-press hands it to `run_command_in_background`. `None`
+    /// whenever no command-mode capture is in flight — including right
+    /// after a press whose capture failed, found nothing selected, or was
+    /// skipped because a dictation was already recording (see
+    /// `react_to_command_transition`'s `StartRecording` arm) — which its
+    /// `StopRecording` arm reads as "already surfaced a notice at press
+    /// time; quietly clean up, nothing to run."
+    command_selection: Mutex<Option<output::CapturedSelection>>,
     buffer: audio::SharedRingBuffer,
     diagnostics: Arc<audio::CaptureDiagnostics>,
     capture: Mutex<Option<audio::CaptureSession>>,
@@ -185,6 +213,21 @@ pub(crate) struct AppState {
     /// (dropping its waveform, showing wrong pill chrome, emitting a stray
     /// event) for anywhere from an instant up to the completion's full
     /// settle-visibility window. A stale generation means "no-op entirely."
+    ///
+    /// **Issue #259 design decision (M4 command-mode backbone):** command
+    /// mode's background run (`run_command_in_background`) shares this
+    /// exact counter and every helper built on it
+    /// (`generation_is_live`/`settle_idle_keeping_pill_for_notice`/
+    /// `settle_idle_keeping_pill_for_done`) rather than forking a second,
+    /// parallel generation counter. Both dictation and command mode write
+    /// the SAME `pipeline_display`/tray/pill state, so a single shared
+    /// monotonic counter is what guarantees a dictation and a command-mode
+    /// run that overlap in time can never clobber each other's pill state —
+    /// forking a second counter would only reintroduce the exact race
+    /// issues #174/#175/#176 fixed, just between the two hotkeys instead of
+    /// between two dictations. `react_to_command_transition`'s
+    /// `StartRecording` arm bumps this the same way `react_to_transition`'s
+    /// does.
     dictation_generation: AtomicU64,
     /// PR #185 Sentinel 🔴-1: the generation of the latest outstanding
     /// hotkey-capture suspend (`commands::suspend_hotkey`), or `0` when the
@@ -271,26 +314,35 @@ fn to_tray_output_mode(mode: settings::OutputModeSetting) -> tray::OutputMode {
 /// constructing an `AppState` (or any native-runtime-typed field) from test
 /// code.
 ///
-/// Returns the [`hotkeys::Transition`] the mode flip produced —
-/// `Some(Cancelled)` when it interrupted an in-flight session — for the
-/// caller to hand to [`react_to_transition`], which stops capture and
-/// discards the buffered audio.
+/// Returns the [`hotkeys::Transition`] each machine's mode flip produced —
+/// `(dictation, command)` — `Some(Cancelled)` in either slot when the flip
+/// interrupted an in-flight session — for the caller to hand to
+/// [`react_to_transition`]/[`react_to_command_transition`] respectively,
+/// which stop capture and discard the buffered audio.
+///
+/// Issue #259: `command_hotkeys` is flipped alongside `hotkeys` because both
+/// machines currently mirror the SAME persisted `recording_mode` (there is
+/// no separate per-mode setting for command mode in this PR) — without this,
+/// a saved Hold↔Toggle change would take effect on the live dictation
+/// machine immediately (the #126 fix this function already provides) but
+/// only reach the command-mode machine after a restart, reintroducing
+/// exactly the staleness #126 fixed, just for the newer hotkey.
 fn apply_settings(
     hotkeys: &Mutex<hotkeys::StateMachine>,
+    command_hotkeys: &Mutex<hotkeys::StateMachine>,
     output_switch: &Mutex<tray::OutputModeSwitch>,
     settings_slot: &Mutex<settings::Settings>,
     settings: settings::Settings,
-) -> Option<hotkeys::Transition> {
-    let transition = hotkeys
-        .lock()
-        .unwrap()
-        .set_mode(to_hotkey_mode(settings.recording_mode));
+) -> (Option<hotkeys::Transition>, Option<hotkeys::Transition>) {
+    let mode = to_hotkey_mode(settings.recording_mode);
+    let transition = hotkeys.lock().unwrap().set_mode(mode);
+    let command_transition = command_hotkeys.lock().unwrap().set_mode(mode);
     output_switch
         .lock()
         .unwrap()
         .set_mode(to_tray_output_mode(settings.output_mode));
     *settings_slot.lock().unwrap() = settings;
-    transition
+    (transition, command_transition)
 }
 
 /// `AppState`-shaped wrapper over [`apply_settings`] — the entry point
@@ -302,9 +354,10 @@ fn apply_settings(
 pub(crate) fn apply_settings_to_state(
     state: &AppState,
     settings: settings::Settings,
-) -> Option<hotkeys::Transition> {
+) -> (Option<hotkeys::Transition>, Option<hotkeys::Transition>) {
     apply_settings(
         &state.hotkeys,
+        &state.command_hotkeys,
         &state.output_switch,
         &state.settings,
         settings,
@@ -545,17 +598,25 @@ mod apply_settings_tests {
 
     use super::*;
 
-    /// The three `Mutex`es `apply_settings` reads/writes, seeded from
+    /// The four `Mutex`es `apply_settings` reads/writes, seeded from
     /// `settings` (mirrors how `AppState`'s equivalent fields are seeded at
     /// startup) — no `AppState`, tray item, or capture session involved.
+    /// Issue #259: now includes `command_hotkeys`, the second machine
+    /// `apply_settings` also flips.
     fn test_slots(
         settings: &settings::Settings,
     ) -> (
+        Mutex<hotkeys::StateMachine>,
         Mutex<hotkeys::StateMachine>,
         Mutex<tray::OutputModeSwitch>,
         Mutex<settings::Settings>,
     ) {
         (
+            Mutex::new(hotkeys::StateMachine::new(
+                to_hotkey_mode(settings.recording_mode),
+                [0u32],
+                hotkeys::DEFAULT_DEBOUNCE,
+            )),
             Mutex::new(hotkeys::StateMachine::new(
                 to_hotkey_mode(settings.recording_mode),
                 [0u32],
@@ -571,26 +632,40 @@ mod apply_settings_tests {
     #[test]
     fn apply_settings_flips_the_live_hotkey_machine_mode_issue_126() {
         // Default settings are Hold.
-        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default());
+        let (hotkeys, command_hotkeys, output_switch, settings_slot) =
+            test_slots(&settings::Settings::default());
         let new = settings::Settings {
             recording_mode: settings::RecordingMode::Toggle,
             ..settings::Settings::default()
         };
 
-        let transition = apply_settings(&hotkeys, &output_switch, &settings_slot, new.clone());
+        let (transition, command_transition) = apply_settings(
+            &hotkeys,
+            &command_hotkeys,
+            &output_switch,
+            &settings_slot,
+            new.clone(),
+        );
 
         assert_eq!(transition, None, "idle machine: nothing to cancel");
+        assert_eq!(command_transition, None, "idle machine: nothing to cancel");
         assert_eq!(
             hotkeys.lock().unwrap().mode(),
             hotkeys::Mode::Toggle,
             "the LIVE machine must run the just-saved mode, not wait for a restart"
+        );
+        assert_eq!(
+            command_hotkeys.lock().unwrap().mode(),
+            hotkeys::Mode::Toggle,
+            "the command-mode machine must run the just-saved mode too (issue #259)"
         );
         assert_eq!(*settings_slot.lock().unwrap(), new);
     }
 
     #[test]
     fn apply_settings_cancels_an_in_flight_session_on_a_mode_change_issue_126() {
-        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default());
+        let (hotkeys, command_hotkeys, output_switch, settings_slot) =
+            test_slots(&settings::Settings::default());
         // Drive the live machine into a hold-in-progress first.
         let started = hotkeys
             .lock()
@@ -602,7 +677,13 @@ mod apply_settings_tests {
             recording_mode: settings::RecordingMode::Toggle,
             ..settings::Settings::default()
         };
-        let transition = apply_settings(&hotkeys, &output_switch, &settings_slot, new);
+        let (transition, _command_transition) = apply_settings(
+            &hotkeys,
+            &command_hotkeys,
+            &output_switch,
+            &settings_slot,
+            new,
+        );
 
         // The caller (set_settings) hands this to react_to_transition, which
         // stops capture and discards the buffered audio.
@@ -611,8 +692,49 @@ mod apply_settings_tests {
     }
 
     #[test]
+    fn apply_settings_cancels_an_in_flight_command_mode_session_on_a_mode_change_issue_259() {
+        let (hotkeys, command_hotkeys, output_switch, settings_slot) =
+            test_slots(&settings::Settings::default());
+        // Drive the LIVE COMMAND-MODE machine into a hold-in-progress —
+        // the dictation machine stays idle throughout, proving the two
+        // sessions are independent.
+        let started = command_hotkeys
+            .lock()
+            .unwrap()
+            .handle(hotkeys::KeyEvent::KeyDown(0, std::time::Duration::ZERO));
+        assert_eq!(started, Some(hotkeys::Transition::StartRecording));
+
+        let new = settings::Settings {
+            recording_mode: settings::RecordingMode::Toggle,
+            ..settings::Settings::default()
+        };
+        let (transition, command_transition) = apply_settings(
+            &hotkeys,
+            &command_hotkeys,
+            &output_switch,
+            &settings_slot,
+            new,
+        );
+
+        assert_eq!(
+            transition, None,
+            "the idle dictation machine has nothing to cancel"
+        );
+        assert_eq!(
+            command_transition,
+            Some(hotkeys::Transition::Cancelled),
+            "an in-flight command-mode session is cancelled by a mode change, mirroring dictation"
+        );
+        assert_eq!(
+            command_hotkeys.lock().unwrap().mode(),
+            hotkeys::Mode::Toggle
+        );
+    }
+
+    #[test]
     fn apply_settings_with_an_unchanged_mode_leaves_a_session_in_flight() {
-        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default());
+        let (hotkeys, command_hotkeys, output_switch, settings_slot) =
+            test_slots(&settings::Settings::default());
         let started = hotkeys
             .lock()
             .unwrap()
@@ -625,7 +747,13 @@ mod apply_settings_tests {
             model_preset: settings::ModelPreset::Small,
             ..settings::Settings::default()
         };
-        let transition = apply_settings(&hotkeys, &output_switch, &settings_slot, new);
+        let (transition, _command_transition) = apply_settings(
+            &hotkeys,
+            &command_hotkeys,
+            &output_switch,
+            &settings_slot,
+            new,
+        );
 
         assert_eq!(transition, None);
         assert_eq!(hotkeys.lock().unwrap().mode(), hotkeys::Mode::Hold);
@@ -633,13 +761,20 @@ mod apply_settings_tests {
 
     #[test]
     fn apply_settings_updates_the_live_output_switch() {
-        let (hotkeys, output_switch, settings_slot) = test_slots(&settings::Settings::default()); // Cursor
+        let (hotkeys, command_hotkeys, output_switch, settings_slot) =
+            test_slots(&settings::Settings::default()); // Cursor
         let new = settings::Settings {
             output_mode: settings::OutputModeSetting::File,
             ..settings::Settings::default()
         };
 
-        apply_settings(&hotkeys, &output_switch, &settings_slot, new);
+        apply_settings(
+            &hotkeys,
+            &command_hotkeys,
+            &output_switch,
+            &settings_slot,
+            new,
+        );
 
         assert_eq!(
             output_switch.lock().unwrap().route_target(),
@@ -898,6 +1033,507 @@ mod mapping_tests {
         assert!(registers.is_empty());
         assert_eq!(persists, 1);
         assert!(rollbacks.is_empty());
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-2b757bf finding 🔴 3:
+    // `set_two_hotkeys_with_rollback` extends `set_settings_with_rollback`
+    // to TWO independent hotkey slots sharing one persisted `Settings` blob
+    // and ONE OS accelerator registry. The prior bug: `commands::set_settings`
+    // fully processed the dictation slot (unregister its prior, register its
+    // new value) BEFORE touching the command slot — so a swap-style save
+    // (new-dictation == current-command's still-live value) hit "already
+    // registered" on the OS's shared keyspace, and the ensuing rollback tore
+    // out the command slot's live binding, leaving it dead until restart
+    // with settings.json disagreeing with the OS. The fix: unregister BOTH
+    // changed priors before registering EITHER new value.
+    // -------------------------------------------------------------
+
+    /// Simulates the OS's single shared accelerator registry: `register`
+    /// fails if the accelerator is already live, `unregister` is
+    /// idempotent. Makes the swap test below a genuine regression check —
+    /// it only passes under the fixed (unregister-both-first) ordering.
+    struct SharedRegistry {
+        live: std::cell::RefCell<std::collections::HashSet<String>>,
+        /// Accelerators that always fail to register, regardless of `live`
+        /// — simulates an external failure reason unrelated to this app's
+        /// own tracked collisions (another application's exclusive claim,
+        /// an OS-reserved combo). Used by the command-register-failure
+        /// residual test (SNTL-20260716-bla-PR274-0900818) to force
+        /// `register_command`'s new value to fail for a reason that has
+        /// nothing to do with the swap collision itself.
+        blocked: std::collections::HashSet<String>,
+    }
+    impl SharedRegistry {
+        fn new(initial: &[&str]) -> Self {
+            Self {
+                live: std::cell::RefCell::new(initial.iter().map(|s| s.to_string()).collect()),
+                blocked: std::collections::HashSet::new(),
+            }
+        }
+        fn with_blocked(initial: &[&str], blocked: &[&str]) -> Self {
+            Self {
+                live: std::cell::RefCell::new(initial.iter().map(|s| s.to_string()).collect()),
+                blocked: blocked.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+        fn unregister(&self, h: &str) {
+            self.live.borrow_mut().remove(h);
+        }
+        fn register(&self, h: &str) -> Result<(), String> {
+            if self.blocked.contains(h) {
+                return Err(format!("{h} is claimed by another application"));
+            }
+            if self.live.borrow().contains(h) {
+                return Err(format!("{h} already registered"));
+            }
+            self.live.borrow_mut().insert(h.to_string());
+            Ok(())
+        }
+        fn is_live(&self, h: &str) -> bool {
+            self.live.borrow().contains(h)
+        }
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_unregisters_both_priors_before_registering_either_new_value_sntl_pr274(
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let unregister_log = Rc::clone(&log);
+        let dictation_log = Rc::clone(&log);
+        let command_log = Rc::clone(&log);
+        let persist_log = Rc::clone(&log);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregister_log.borrow_mut().push(format!("unregister:{h}")),
+            |h| {
+                dictation_log
+                    .borrow_mut()
+                    .push(format!("register_dictation:{h}"));
+                Ok(())
+            },
+            |h| {
+                command_log
+                    .borrow_mut()
+                    .push(format!("register_command:{h}"));
+                Ok(())
+            },
+            || {
+                persist_log.borrow_mut().push("persist".to_string());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        let calls = log.borrow().clone();
+        let unregister_a = calls.iter().position(|c| c == "unregister:PriorA").unwrap();
+        let unregister_c = calls.iter().position(|c| c == "unregister:PriorC").unwrap();
+        let register_b = calls
+            .iter()
+            .position(|c| c == "register_dictation:NewB")
+            .unwrap();
+        let register_d = calls
+            .iter()
+            .position(|c| c == "register_command:NewD")
+            .unwrap();
+        assert!(
+            unregister_a < register_b,
+            "both priors must be unregistered before either new value is registered"
+        );
+        assert!(
+            unregister_c < register_b,
+            "the OTHER slot's prior must be freed before THIS slot's new value is registered \
+             (the swap-collision fix)"
+        );
+        assert!(unregister_a < register_d);
+        assert!(unregister_c < register_d);
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_a_swap_style_save_ends_with_both_new_values_live_sntl_pr274() {
+        // Dictation A -> B, Command B -> C: the new dictation value
+        // collides with the command slot's still-CURRENT value. Under the
+        // OLD (broken) ordering, registering dictation's new B before
+        // unregistering command's still-live B fails with "already
+        // registered". Unregistering both priors first is what makes this
+        // succeed cleanly.
+        let registry = SharedRegistry::new(&["A", "B"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "A",
+            "B",
+            true,
+            "B",
+            "C",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Ok(()),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(!registry.is_live("A"));
+        assert!(
+            registry.is_live("B"),
+            "B ends up live again, now under the dictation slot"
+        );
+        assert!(registry.is_live("C"));
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-0900818 residual on 🔴 3: the
+    // command-register-failure rollback branch restored command's PRIOR
+    // value BEFORE freeing dictation's colliding NEW binding. Repro:
+    // dictation A→B (succeeds, B now live), command B→C, but
+    // `register_command("C")` fails for an unrelated external reason. The
+    // buggy ordering then attempted `register_command("B")` — which
+    // collides with dictation's now-live "B" — the collision error was
+    // swallowed (`let _ =`), so command's prior was never actually
+    // restored; then dictation's OWN rollback unregistered "B" anyway,
+    // leaving "B" live NOWHERE. Net effect: the command hotkey ends up
+    // dead until restart, with settings.json (which never got persisted,
+    // so still reads the OLD command="B") disagreeing with the OS (which
+    // has neither B nor C registered under the command slot).
+    //
+    // This test is deliberately built so it FAILS under the pre-fix
+    // ordering (asserted here: `is_live("B")` would be `false` on the
+    // buggy code — verified by temporarily reverting the reorder fix
+    // locally, confirming a red run, then restoring it) and PASSES once
+    // `new_hotkey` is freed before `register_command(prior_command_hotkey)`
+    // is attempted.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_command_register_failure_after_a_colliding_dictation_swap_restores_both_sntl_pr274_0900818(
+    ) {
+        // "C" is blocked (an external app/OS-reserved combo), independent
+        // of this app's own tracked collisions — so `register_command("C")`
+        // fails for a reason that has NOTHING to do with the dictation/
+        // command swap itself.
+        let registry = SharedRegistry::with_blocked(&["A", "B"], &["C"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "A",
+            "B",
+            true,
+            "B",
+            "C",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Ok(()),
+        );
+
+        assert!(result.is_err(), "C is blocked, so the save must fail");
+        assert!(
+            registry.is_live("B"),
+            "command's prior binding \"B\" must end up live again — it must NEVER be left \
+             registered nowhere just because it happened to collide with dictation's newly \
+             (and by now rolled back) applied value"
+        );
+        assert!(
+            !registry.is_live("C"),
+            "the blocked value must never end up live"
+        );
+        // Dictation's own rollback must also have taken effect: its new
+        // value isn't left live either (only ever ONE hotkey should be
+        // bound to "B" at a time, and it must be the command slot's,
+        // matching the ROLLED-BACK state — dictation itself is back to "A").
+        assert!(
+            registry.is_live("A"),
+            "dictation must be rolled back to its own prior binding \"A\""
+        );
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_dictation_register_failure_restores_both_priors_and_never_persists_sntl_pr274(
+    ) {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+        let mut persists = 0;
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                if h == "NewB" {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(
+            persists, 0,
+            "must never persist after a registration failure"
+        );
+        assert!(
+            dictation_registers.contains(&"PriorA".to_string()),
+            "dictation's own prior must be restored"
+        );
+        assert!(
+            command_registers.contains(&"PriorC".to_string()),
+            "command's prior must be restored too, even though its own new-value register was \
+             never attempted"
+        );
+        assert!(
+            !command_registers.contains(&"NewD".to_string()),
+            "command's new value must never be attempted once dictation's registration already \
+             failed"
+        );
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_command_register_failure_rolls_back_the_already_registered_dictation_value_sntl_pr274(
+    ) {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+        let mut persists = 0;
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                Ok(())
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                if h == "NewD" {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(persists, 0);
+        assert!(
+            unregisters.contains(&"NewB".to_string()),
+            "dictation's already-registered new value must be torn back out"
+        );
+        assert!(
+            dictation_registers
+                .iter()
+                .filter(|h| *h == "PriorA")
+                .count()
+                >= 1,
+            "dictation's prior must be re-registered"
+        );
+        assert!(
+            command_registers.contains(&"PriorC".to_string()),
+            "command's own prior must be restored (its internal rollback)"
+        );
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_persist_failure_after_both_registered_restores_both_priors_sntl_pr274(
+    ) {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "PriorA",
+            "NewB",
+            true,
+            "PriorC",
+            "NewD",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                Ok(())
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                Ok(())
+            },
+            || Err("disk full".to_string()),
+        );
+
+        assert_eq!(result, Err("disk full".to_string()));
+        assert!(unregisters.contains(&"NewB".to_string()));
+        assert!(unregisters.contains(&"NewD".to_string()));
+        assert!(dictation_registers.contains(&"PriorA".to_string()));
+        assert!(command_registers.contains(&"PriorC".to_string()));
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-867577d residual: the ABOVE persist-
+    // failure test uses non-colliding fixtures (PriorA/NewB/PriorC/NewD) —
+    // exactly the coverage gap that let this branch's own mirror-edge ship
+    // undetected. This is the genuinely discriminating version: dictation
+    // prior="X", new="Y"; command prior="Z", new="X" (command's NEW value
+    // equals dictation's PRIOR — the collision precondition). Both
+    // registrations succeed, then persist() fails.
+    //
+    // Repro against the PRE-fix ordering (processing dictation's whole
+    // unregister-then-register block fully before command's even starts):
+    // unregister("Y") frees Y; register_dictation("X") COLLIDES with
+    // command's still-live "X" (command's own rollback block hasn't run
+    // yet) and fails silently (`let _ =`) — dictation's prior is never
+    // actually restored; THEN command's block unregisters "X" (freeing it
+    // to register "Z") and registers "Z". Net: "X" ends up live NOWHERE —
+    // the dictation hotkey is dead, and settings.json (never persisted,
+    // still reads the OLD "X") disagrees with the OS. Confirmed red
+    // against the pre-fix code before the unregister-both-then-register-
+    // both reorder landed.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_persist_failure_after_a_colliding_swap_restores_both_sntl_pr274_867577d(
+    ) {
+        let registry = SharedRegistry::new(&["X", "Z"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "X",
+            "Y",
+            true,
+            "Z",
+            "X",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Err("disk full".to_string()),
+        );
+
+        assert_eq!(result, Err("disk full".to_string()));
+        assert!(
+            registry.is_live("X"),
+            "dictation's prior \"X\" must end up live again — it must NEVER be left registered \
+             nowhere just because it happened to collide with command's newly (and by now \
+             rolled back) applied value"
+        );
+        assert!(
+            registry.is_live("Z"),
+            "command's prior must also be restored"
+        );
+        assert!(
+            !registry.is_live("Y"),
+            "dictation's new value must be freed"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Completeness coverage for the THIRD rollback point (dictation-
+    // register-failure) under the same swap-adjacent-collision shape, per
+    // the SNTL-20260716-bla-PR274-867577d audit request. Unlike the two
+    // tests above, this branch never actually had a reordering bug: when
+    // `register_dictation(new_hotkey)` itself fails, NEITHER new value is
+    // ever live (dictation's own attempt just failed — nothing bound;
+    // command's new value hasn't even been attempted yet, since that block
+    // runs strictly after this one returns) — so restoring both priors
+    // here can never collide with a still-live new value, regardless of
+    // ordering. This test passes both BEFORE and AFTER the
+    // rollback_both_hotkeys unification below; it exists to lock the
+    // invariant in as regression coverage for the refactor, not because a
+    // distinct bug was found here (see the audit note in this PR's
+    // changelog/commit message).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_dictation_register_failure_with_a_swap_adjacent_collision_is_still_safe_sntl_pr274_867577d(
+    ) {
+        let registry = SharedRegistry::with_blocked(&["X", "Z"], &["Y"]);
+
+        let result = set_two_hotkeys_with_rollback(
+            true,
+            "X",
+            "Y",
+            true,
+            "Z",
+            "W",
+            |h| registry.unregister(h),
+            |h| registry.register(h),
+            |h| registry.register(h),
+            || Ok(()),
+        );
+
+        assert!(result.is_err(), "Y is blocked, so the save must fail");
+        assert!(registry.is_live("X"), "dictation's prior must be restored");
+        assert!(registry.is_live("Z"), "command's prior must be restored");
+        assert!(!registry.is_live("Y"));
+        assert!(
+            !registry.is_live("W"),
+            "command's new value must never even be attempted once dictation's registration \
+             already failed"
+        );
+    }
+
+    #[test]
+    fn set_two_hotkeys_with_rollback_neither_changed_only_persists_once_sntl_pr274() {
+        let mut dictation_registers: Vec<String> = vec![];
+        let mut command_registers: Vec<String> = vec![];
+        let mut unregisters: Vec<String> = vec![];
+        let mut persists = 0;
+
+        let result = set_two_hotkeys_with_rollback(
+            false,
+            "A",
+            "A",
+            false,
+            "B",
+            "B",
+            |h| unregisters.push(h.to_string()),
+            |h| {
+                dictation_registers.push(h.to_string());
+                Ok(())
+            },
+            |h| {
+                command_registers.push(h.to_string());
+                Ok(())
+            },
+            || {
+                persists += 1;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(unregisters.is_empty());
+        assert!(dictation_registers.is_empty());
+        assert!(command_registers.is_empty());
+        assert_eq!(persists, 1);
     }
 }
 
@@ -1436,6 +2072,441 @@ mod tone_wiring_tests {
     }
 }
 
+/// Issue #259 (M4 command-mode backbone, AC-23/AC-47): tests for
+/// `run_command_transform`, the pure-injected orchestration behind
+/// `run_command_in_background`. Mirrors `dictionary_wiring_tests`'/
+/// `tone_wiring_tests`' pattern (issue #165) — local `Stt`/`CommandTransform`/
+/// `Clipboard`/`PasteSynthesizer` fakes, never a constructed `AppState`.
+#[cfg(test)]
+mod command_dispatch_tests {
+    use super::*;
+    use crate::output::{Clipboard, PasteSynthesizer};
+    use std::cell::RefCell;
+    use std::io;
+
+    /// In-memory clipboard so tests can assert its FINAL state after a run —
+    /// mirrors `history_wiring_tests`'/`command.rs`'s own local fakes.
+    struct FakeClipboard {
+        contents: RefCell<String>,
+    }
+    impl FakeClipboard {
+        fn new(initial: &str) -> Self {
+            Self {
+                contents: RefCell::new(initial.to_string()),
+            }
+        }
+    }
+    impl Clipboard for FakeClipboard {
+        fn get(&self) -> io::Result<String> {
+            Ok(self.contents.borrow().clone())
+        }
+        fn set(&self, contents: &str) -> io::Result<()> {
+            *self.contents.borrow_mut() = contents.to_string();
+            Ok(())
+        }
+    }
+
+    /// Counts calls so failure-path tests can assert the paste keystroke is
+    /// never synthesized once an earlier step (transcription/transform) has
+    /// already failed (AC-47: no fallback, no partial paste).
+    struct CountingPaste {
+        calls: std::cell::Cell<u32>,
+        fail: bool,
+    }
+    impl CountingPaste {
+        fn succeeding() -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                fail: true,
+            }
+        }
+    }
+    impl PasteSynthesizer for CountingPaste {
+        fn synthesize_paste(&self) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail {
+                Err(io::Error::other("synthetic paste failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Stands in for a "fixture instruction audio → known transcript" real
+    /// STT call (AC-23's "fixture instruction audio") — mirrors
+    /// `dictionary_wiring_tests::SpyStt` one step further: fixed output, no
+    /// need to inspect `opts` here.
+    struct FixedStt(String);
+    impl stt::Stt for FixedStt {
+        fn transcribe(
+            &self,
+            _samples: &[f32],
+            _opts: &stt::TranscribeOpts,
+        ) -> Result<String, stt::SttError> {
+            Ok(self.0.clone())
+        }
+    }
+    struct FailingStt;
+    impl stt::Stt for FailingStt {
+        fn transcribe(
+            &self,
+            _samples: &[f32],
+            _opts: &stt::TranscribeOpts,
+        ) -> Result<String, stt::SttError> {
+            Err(stt::SttError::Transcription(
+                "synthetic failure".to_string(),
+            ))
+        }
+    }
+
+    /// Captures the exact `(content, instruction)` pair it was called with —
+    /// proves `run_command_transform` keeps the two channels separate all
+    /// the way through (this PR's CRITICAL file-scope constraint), on top of
+    /// `command.rs`'s own unit tests of the request-shaping itself.
+    struct FixedCommand {
+        output: Result<String, command::CommandError>,
+        captured: RefCell<Option<(String, String)>>,
+    }
+    impl FixedCommand {
+        fn succeeding(output: &str) -> Self {
+            Self {
+                output: Ok(output.to_string()),
+                captured: RefCell::new(None),
+            }
+        }
+        fn unreachable() -> Self {
+            Self {
+                output: Err(command::CommandError::Unreachable),
+                captured: RefCell::new(None),
+            }
+        }
+    }
+    impl command::CommandTransform for FixedCommand {
+        fn transform(
+            &self,
+            content: &str,
+            instruction: &str,
+        ) -> Result<String, command::CommandError> {
+            *self.captured.borrow_mut() = Some((content.to_string(), instruction.to_string()));
+            self.output.clone()
+        }
+    }
+
+    // -------------------------------------------------------------
+    // AC-23: the end-to-end happy path — stubbed selection + fixture
+    // instruction audio → transcribe → transform → replace, asserting both
+    // the output text and the post-paste clipboard state.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn run_command_transform_transcribes_transforms_and_replaces_the_selection_ac23() {
+        let stt = FixedStt("make this more formal".to_string());
+        let command = FixedCommand::succeeding("Rewritten formally.");
+        let clipboard = FakeClipboard::new("mid-flow captured selection");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "some selected text".to_string(),
+            "the user's original clipboard contents".to_string(),
+        );
+
+        assert_eq!(result, Ok("Rewritten formally.".to_string()));
+        assert_eq!(paste.calls.get(), 1);
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "the user's original clipboard contents",
+            "the original clipboard must be restored after a successful paste (AC-23)"
+        );
+
+        let (content, instruction) = command
+            .captured
+            .borrow()
+            .clone()
+            .expect("the transform must have been called");
+        assert_eq!(content, "some selected text");
+        assert_eq!(instruction, "make this more formal");
+    }
+
+    // -------------------------------------------------------------
+    // Safe-degradation paths: on every failure, the clipboard ends up back
+    // at `pre_copy_clipboard` and the paste keystroke is never synthesized.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_empty_audio() {
+        let stt = FixedStt("unused".to_string());
+        let command = FixedCommand::succeeding("unused");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[], // no audio captured at all
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::NoInstruction));
+        assert_eq!(paste.calls.get(), 0, "no partial paste on failure (AC-47)");
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+        assert!(
+            command.captured.borrow().is_none(),
+            "the transform must never be called with no instruction"
+        );
+    }
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_a_blank_transcribed_instruction() {
+        let stt = FixedStt("   \n  ".to_string());
+        let command = FixedCommand::succeeding("unused");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::NoInstruction));
+        assert_eq!(paste.calls.get(), 0);
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+        assert!(command.captured.borrow().is_none());
+    }
+
+    #[test]
+    fn run_command_transform_degrades_safely_when_transcription_fails() {
+        let stt = FailingStt;
+        let command = FixedCommand::succeeding("unused");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CommandRunError::Transcription(
+                stt::SttError::Transcription(_)
+            ))
+        ));
+        assert_eq!(paste.calls.get(), 0);
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+    }
+
+    #[test]
+    fn run_command_transform_degrades_safely_when_the_transport_is_unreachable_ac47() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::unreachable();
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(
+            result,
+            Err(CommandRunError::Transform(
+                command::CommandError::Unreachable
+            ))
+        );
+        assert_eq!(
+            paste.calls.get(),
+            0,
+            "AC-47: an unreachable transform backend must never reach the paste step"
+        );
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+    }
+
+    #[test]
+    fn run_command_transform_restores_the_clipboard_when_the_paste_keystroke_fails() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding("Rewritten.");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::failing();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::Paste));
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "original clipboard",
+            "output::replace_selection restores the original clipboard even when the paste \
+             keystroke itself fails"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-2b757bf finding 🔴 2: a blank/
+    // whitespace-only model response must never be pasted as a silent
+    // success — that would replace the user's selection with nothing under
+    // `Ok`. `OllamaCommand::transform` (command.rs) can return
+    // `Ok(String::new())` for a degenerate model response; this guard must
+    // catch it symmetrically with the existing blank-INSTRUCTION guard
+    // above.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_a_blank_transform_result_sntl_pr274() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding("   \n  "); // whitespace-only response
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::EmptyResult));
+        assert_eq!(
+            paste.calls.get(),
+            0,
+            "a blank transform result must never reach the paste step"
+        );
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "original clipboard",
+            "the selection must be left untouched (clipboard restored), never replaced with \
+             nothing"
+        );
+    }
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_an_empty_string_transform_result_sntl_pr274() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding(""); // genuinely empty response
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::EmptyResult));
+        assert_eq!(paste.calls.get(), 0);
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+    }
+
+    // -------------------------------------------------------------
+    // `captured_selection_is_usable`: the pure "was anything actually
+    // selected" check `react_to_command_transition`'s `StartRecording` arm
+    // runs before ever starting audio capture.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn captured_selection_is_usable_accepts_non_blank_text() {
+        assert!(captured_selection_is_usable("some selected text"));
+    }
+
+    #[test]
+    fn captured_selection_is_usable_rejects_blank_or_empty_text() {
+        assert!(!captured_selection_is_usable(""));
+        assert!(!captured_selection_is_usable("   "));
+        assert!(!captured_selection_is_usable("\n\t "));
+    }
+
+    // -------------------------------------------------------------
+    // Sentinel SNTL-20260716-bla-PR274-2b757bf finding 🔴 1: mutual
+    // exclusion over the single shared mic-capture resource
+    // (`buffer`/`diagnostics`/`capture`/`level_meter`) must be checked from
+    // BOTH hotkeys' `StartRecording` arms, not just command mode's — a
+    // dictation press while a command-mode capture is in flight must be
+    // guarded exactly like the reverse already is, or it clobbers
+    // `state.capture`/drains `state.buffer` out from under the live
+    // command-mode session. `mic_capture_is_busy` is the shared pure
+    // predicate both `react_to_transition` and `react_to_command_transition`
+    // call at the very top of their `StartRecording` arm — before any other
+    // state is touched — so it's testable without an `AppState` (#165).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn mic_capture_is_busy_when_a_capture_session_is_already_active_sntl_pr274() {
+        assert!(mic_capture_is_busy(true, false));
+    }
+
+    #[test]
+    fn mic_capture_is_busy_when_a_command_mode_selection_is_captured_but_capture_has_not_started_yet_sntl_pr274(
+    ) {
+        // The narrow window in `react_to_command_transition`'s
+        // `StartRecording` arm: `command_selection` is populated BEFORE
+        // `audio::CaptureSession::start` is even attempted, so `capture`
+        // can still be `None` while a command-mode press is already
+        // committed to running. The other hotkey must treat this as busy
+        // too, not just a live `capture`.
+        assert!(mic_capture_is_busy(false, true));
+    }
+
+    #[test]
+    fn mic_capture_is_busy_when_both_are_true_sntl_pr274() {
+        assert!(mic_capture_is_busy(true, true));
+    }
+
+    #[test]
+    fn mic_capture_is_free_when_neither_flag_is_set_sntl_pr274() {
+        assert!(!mic_capture_is_busy(false, false));
+    }
+}
+
 /// Loads persisted settings from the `tauri-plugin-store`-backed
 /// `settings.json`, translating a missing store/key to
 /// [`settings::SettingsLoadError::NotFound`] and a present-but-unparsable
@@ -1469,15 +2540,31 @@ fn save_settings_to_store(
 }
 
 /// Registers `hotkey` (a string like `"Control+Option+Space"`) as the
-/// global shortcut driving the hotkeys state machine, unregistering
-/// whatever was previously registered first so this is safe to call again
-/// when the user changes the hotkey binding (`commands::set_settings`).
+/// global shortcut driving the DICTATION hotkeys state machine.
+///
+/// **Issue #259 (M4 command-mode backbone):** `prior`, if given, is
+/// unregistered FIRST via a TARGETED [`unregister`](tauri_plugin_global_shortcut::GlobalShortcut::unregister)
+/// of that exact accelerator — never [`unregister_all`](tauri_plugin_global_shortcut::GlobalShortcut::unregister_all).
+/// Before the command-mode hotkey existed, this function *did* call
+/// `unregister_all()`, which was safe only because there was exactly one
+/// global shortcut ever registered; doing that now would silently drop the
+/// OTHER hotkey (dictation's or command mode's) out from under whichever
+/// one wasn't just changed. `prior` is `None` at startup (nothing registered
+/// yet) and `Some(previously-registered value)` on every re-registration
+/// (`commands::set_settings`'s register-before-persist path, and its
+/// rollback path, which passes the value that just got bound so it can be
+/// un-done). Unregistering `prior` is best-effort (`let _ =`): it may
+/// already be gone (nothing was ever registered, or the OS already dropped
+/// it), and that must never block registering `hotkey`.
 fn register_hotkey(
     app: &tauri::AppHandle,
+    prior: Option<&str>,
     hotkey: &str,
 ) -> Result<(), tauri_plugin_global_shortcut::Error> {
     let global_shortcut = app.global_shortcut();
-    let _ = global_shortcut.unregister_all();
+    if let Some(prior) = prior {
+        let _ = global_shortcut.unregister(prior);
+    }
     let handler_handle = app.clone();
     global_shortcut.on_shortcut(hotkey, move |_app, _shortcut, event| {
         let key_event = match event.state() {
@@ -1488,14 +2575,49 @@ fn register_hotkey(
     })
 }
 
+/// Registers `hotkey` as the global shortcut driving the COMMAND-MODE
+/// hotkeys state machine (issue #259) — mirrors [`register_hotkey`] exactly,
+/// one key over: same targeted-`unregister`-of-`prior` discipline (never
+/// `unregister_all()`, for the identical reason — it would drop the
+/// dictation hotkey too), dispatching to [`handle_command_key_event`]
+/// instead of [`handle_key_event`].
+fn register_command_hotkey(
+    app: &tauri::AppHandle,
+    prior: Option<&str>,
+    hotkey: &str,
+) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    let global_shortcut = app.global_shortcut();
+    if let Some(prior) = prior {
+        let _ = global_shortcut.unregister(prior);
+    }
+    let handler_handle = app.clone();
+    global_shortcut.on_shortcut(hotkey, move |_app, _shortcut, event| {
+        let key_event = match event.state() {
+            ShortcutState::Pressed => hotkeys::KeyEvent::KeyDown(0, monotonic_now()),
+            ShortcutState::Released => hotkeys::KeyEvent::KeyUp(0, monotonic_now()),
+        };
+        handle_command_key_event(&handler_handle, key_event);
+    })
+}
+
 /// Unregisters the global dictation hotkey without registering a new one
 /// (issue #181, `commands::suspend_hotkey`) — called while the settings
 /// window's hotkey-capture field is active so keypresses are captured for
 /// rebinding instead of also triggering a dictation via the still-live
 /// shortcut. [`register_hotkey`]/`commands::resume_hotkey` re-register when
 /// capture ends.
-fn unregister_hotkey(app: &tauri::AppHandle) -> Result<(), tauri_plugin_global_shortcut::Error> {
-    app.global_shortcut().unregister_all()
+///
+/// Issue #259: targets exactly `hotkey` (the caller passes the CURRENT
+/// dictation hotkey) via [`unregister`](tauri_plugin_global_shortcut::GlobalShortcut::unregister)
+/// — never `unregister_all()`, which would also drop the independently-
+/// registered command-mode hotkey (there is no settings-window capture UI
+/// for command mode yet — issue #262 — so only the dictation hotkey ever
+/// goes through suspend/resume in this PR).
+fn unregister_hotkey(
+    app: &tauri::AppHandle,
+    hotkey: &str,
+) -> Result<(), tauri_plugin_global_shortcut::Error> {
+    app.global_shortcut().unregister(hotkey)
 }
 
 /// Whether a window `label` is allowed to suspend/resume the global
@@ -1531,6 +2653,18 @@ fn should_resume_hotkey(current_gen: u64, requested_gen: u64) -> bool {
 /// a chord the OS won't bind fails without being written; and the OS binding
 /// and settings.json can never disagree — a failure at EITHER step rolls the
 /// OS back to `prior_hotkey` before returning `Err`.
+///
+/// Issue #259 Sentinel 🔴-3 (SNTL-20260716-bla-PR274-2b757bf): `commands::set_settings`
+/// now goes through [`set_two_hotkeys_with_rollback`] instead (single-slot
+/// register-then-rollback nested inside a two-closure call runs into an
+/// unavoidable double-mutable-borrow of the same `FnMut`, so that function
+/// inlines the equivalent logic rather than delegating here — see its own
+/// doc comment). This function predates the command-mode hotkey (PR #185)
+/// and is kept — still fully tested below — as a valid, reusable
+/// single-hotkey primitive rather than removed as a side effect of a
+/// targeted three-bug fix; `#[allow(dead_code)]` reflects that its only
+/// current callers are its own unit tests.
+#[allow(dead_code)]
 pub(crate) fn set_settings_with_rollback(
     hotkey_changed: bool,
     prior_hotkey: &str,
@@ -1558,6 +2692,197 @@ pub(crate) fn set_settings_with_rollback(
     Ok(())
 }
 
+/// Extends [`set_settings_with_rollback`] to TWO independent hotkey slots —
+/// dictation and command mode — that share one persisted `Settings` blob
+/// AND one OS accelerator registry (issue #259 Sentinel 🔴-3,
+/// SNTL-20260716-bla-PR274-2b757bf).
+///
+/// **The bug this fixes:** the OS's global-shortcut registry is a single
+/// shared keyspace across both slots. Handling the two slots fully
+/// independently, one after the other (unregister slot A's prior, register
+/// slot A's new value, THEN do the same for slot B) breaks for a
+/// swap-style save where a new value collides with the OTHER slot's
+/// still-live current value (e.g. dictation A→B while command is still
+/// bound to B) — registering dictation's new B fails with "already
+/// registered" because command's B hasn't been freed yet, and the ensuing
+/// rollback of the dictation attempt has no reason to touch command's live
+/// binding, so nothing goes wrong there — but if the ordering were instead
+/// "register-both-then-unregister-stale" (or any interleaving that doesn't
+/// free both priors up front), a partial failure can leave one slot
+/// unregistered with no matching rollback, dead until restart, while
+/// settings.json still claims it's bound.
+///
+/// **The fix, and why it's now ONE shared helper instead of three
+/// hand-rolled branches (SNTL-20260716-bla-PR274-{2b757bf,0900818,867577d}
+/// — three separate delta re-reviews, each catching a DIFFERENT
+/// mirror-edge of the identical mistake in a different branch):** every
+/// rollback in this function — whichever of the three failure points
+/// (dictation-register / command-register / persist) triggers it — must
+/// free every new binding that's ACTUALLY LIVE right now before
+/// re-registering any prior, never the reverse. Get that ordering
+/// backwards in even one branch and a prior can attempt to bind while a
+/// still-live new value (possibly belonging to the OTHER slot, in a
+/// swap-style save) is squatting on the same accelerator; the OS rejects
+/// it, the failure is necessarily best-effort/swallowed (there's no
+/// further fallback to run), and that prior ends up live NOWHERE —
+/// exactly the dead-hotkey/settings.json-disagreement outcome this whole
+/// function exists to prevent. [`rollback_both_hotkeys`] is the single
+/// place this ordering now lives, parameterized by which new bindings are
+/// actually live at the point of failure (computed from what actually
+/// happened, never assumed):
+/// - dictation-register-failure: neither new value is ever live (this
+///   slot's own attempt just failed with nothing bound; the command slot's
+///   register hasn't even been attempted yet) — restoring both priors here
+///   can't collide regardless of ordering, but it still goes through the
+///   shared helper for the guarantee to live in one place, not three.
+/// - command-register-failure: dictation's new value is live IF
+///   `hotkey_changed` (its own registration already succeeded above);
+///   command's own new value never became live (this is the failure
+///   itself).
+/// - persist-failure: BOTH new values are live (both registrations already
+///   succeeded, or this failure point would never be reached).
+///
+/// Mirrors [`set_settings_with_rollback`]'s register-then-persist-then-
+/// rollback-on-failure shape for each individual slot (not literally
+/// delegating to it — nesting two closures that both need to call the same
+/// `FnMut` register closure, once directly and once from a rollback
+/// closure, runs into an unavoidable double-mutable-borrow since both
+/// closures must be constructed as live arguments to the same call even
+/// though only one is ever actually invoked at runtime; inlining keeps the
+/// borrow checker happy without reaching for interior mutability). Effects
+/// are injected as closures exactly like `set_settings_with_rollback`, so
+/// this is unit-testable without an `AppHandle`/`Wry` runtime (#165).
+#[allow(clippy::too_many_arguments)] // mirrors run_command_transform's/output::route's identical
+                                     // justification: pure dispatch logic over independently-
+                                     // injected seams for two symmetric slots
+pub(crate) fn set_two_hotkeys_with_rollback(
+    hotkey_changed: bool,
+    prior_hotkey: &str,
+    new_hotkey: &str,
+    command_hotkey_changed: bool,
+    prior_command_hotkey: &str,
+    new_command_hotkey: &str,
+    mut unregister: impl FnMut(&str),
+    mut register_dictation: impl FnMut(&str) -> Result<(), String>,
+    mut register_command: impl FnMut(&str) -> Result<(), String>,
+    mut persist: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    if hotkey_changed {
+        unregister(prior_hotkey);
+    }
+    if command_hotkey_changed {
+        unregister(prior_command_hotkey);
+    }
+
+    let mut dictation_new_is_live = false;
+    let mut command_new_is_live = false;
+
+    if hotkey_changed {
+        if let Err(err) = register_dictation(new_hotkey) {
+            rollback_both_hotkeys(
+                hotkey_changed,
+                prior_hotkey,
+                dictation_new_is_live,
+                new_hotkey,
+                command_hotkey_changed,
+                prior_command_hotkey,
+                command_new_is_live,
+                new_command_hotkey,
+                &mut unregister,
+                &mut register_dictation,
+                &mut register_command,
+            );
+            return Err(err);
+        }
+        dictation_new_is_live = true;
+    }
+
+    if command_hotkey_changed {
+        if let Err(err) = register_command(new_command_hotkey) {
+            rollback_both_hotkeys(
+                hotkey_changed,
+                prior_hotkey,
+                dictation_new_is_live,
+                new_hotkey,
+                command_hotkey_changed,
+                prior_command_hotkey,
+                command_new_is_live,
+                new_command_hotkey,
+                &mut unregister,
+                &mut register_dictation,
+                &mut register_command,
+            );
+            return Err(err);
+        }
+        command_new_is_live = true;
+    }
+
+    if let Err(err) = persist() {
+        rollback_both_hotkeys(
+            hotkey_changed,
+            prior_hotkey,
+            dictation_new_is_live,
+            new_hotkey,
+            command_hotkey_changed,
+            prior_command_hotkey,
+            command_new_is_live,
+            new_command_hotkey,
+            &mut unregister,
+            &mut register_dictation,
+            &mut register_command,
+        );
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+/// The single shared rollback discipline for every failure point in
+/// [`set_two_hotkeys_with_rollback`] (issue #259 Sentinel 🔴-3 and its two
+/// mirror edges — SNTL-20260716-bla-PR274-{2b757bf,0900818,867577d} —
+/// three hand-rolled per-branch rollbacks each independently got this
+/// ordering wrong in a different branch; this is now the one place it
+/// lives). See that function's doc comment for the full rationale and the
+/// three call sites' `*_new_is_live` values.
+///
+/// Frees every new binding that's ACTUALLY live right now (`unregister` is
+/// a no-op for one that isn't — but which is which is computed by the
+/// caller from what actually happened, never assumed), THEN registers
+/// whichever slot(s) changed back to its prior value. This ordering — free
+/// every live new binding before registering ANY prior — is what
+/// guarantees a prior can never collide with a still-live new value on the
+/// OS's single shared accelerator registry, no matter which of the three
+/// failure points called it or which combination of `*_new_is_live` that
+/// point observed.
+#[allow(clippy::too_many_arguments)] // mirrors set_two_hotkeys_with_rollback's own justification —
+                                     // this is that function's one extracted rollback step
+fn rollback_both_hotkeys(
+    hotkey_changed: bool,
+    prior_hotkey: &str,
+    dictation_new_is_live: bool,
+    new_hotkey: &str,
+    command_hotkey_changed: bool,
+    prior_command_hotkey: &str,
+    command_new_is_live: bool,
+    new_command_hotkey: &str,
+    unregister: &mut impl FnMut(&str),
+    register_dictation: &mut impl FnMut(&str) -> Result<(), String>,
+    register_command: &mut impl FnMut(&str) -> Result<(), String>,
+) {
+    if dictation_new_is_live {
+        unregister(new_hotkey);
+    }
+    if command_new_is_live {
+        unregister(new_command_hotkey);
+    }
+    if hotkey_changed {
+        let _ = register_dictation(prior_hotkey);
+    }
+    if command_hotkey_changed {
+        let _ = register_command(prior_command_hotkey);
+    }
+}
+
 /// Backend safety net (PR #185 Sentinel 🔴-1(b)): force-restore the global
 /// dictation hotkey if a capture suspend is still outstanding. The settings
 /// window is *hidden* (not destroyed) on close, so React never unmounts and
@@ -1571,7 +2896,11 @@ fn force_resume_hotkey(app: &tauri::AppHandle) {
     let hotkey = state.settings.lock().unwrap().hotkey.clone();
     let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
     if *gen_slot != 0 {
-        if let Err(err) = register_hotkey(app, &hotkey) {
+        // `None` prior: `suspend_hotkey` already target-unregistered this
+        // exact hotkey (issue #259 — see `unregister_hotkey`'s doc), so
+        // there's nothing left registered under this slot to unregister
+        // again here.
+        if let Err(err) = register_hotkey(app, None, &hotkey) {
             eprintln!("bla: failed to restore global hotkey on settings-window close: {err}");
         }
         *gen_slot = 0;
@@ -1610,6 +2939,31 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
     let state = app.state::<AppState>();
     match transition {
         Some(hotkeys::Transition::StartRecording) => {
+            // Issue #259 Sentinel 🔴-1 (SNTL-20260716-bla-PR274-2b757bf):
+            // mutual exclusion with command mode over the single shared
+            // mic-capture resource — checked FIRST, before touching
+            // anything else (mirrors `react_to_command_transition`'s own
+            // guard). Without this, a dictation press landing while a
+            // command-mode capture is in flight (trivial in Toggle mode:
+            // tap command on, tap dictation on) would clobber
+            // `state.capture`/drain `state.buffer` out from under the live
+            // command-mode session, and the eventual command `StopRecording`
+            // would then feed cross-contaminated audio into
+            // `run_command_in_background` — silently corrupting/losing the
+            // user's selected text.
+            if mic_capture_is_busy(
+                state.capture.lock().unwrap().is_some(),
+                state.command_selection.lock().unwrap().is_some(),
+            ) {
+                emit_pipeline_error(
+                    app,
+                    &errors::ErrorKind::Other {
+                        message: "Dictation is unavailable while command mode is recording."
+                            .to_string(),
+                    },
+                );
+                return;
+            }
             // Issues #174/#175/#176: mint a new per-dictation generation id
             // FIRST, before anything else in this arm — so any earlier
             // dictation's still-in-flight background completion (see
@@ -1705,6 +3059,228 @@ fn react_to_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Trans
             stop_level_poller(&state);
             state.buffer.lock().unwrap().drain();
             state.diagnostics.clear_error();
+            set_pipeline_state(app, tray::PipelineState::Idle);
+        }
+        None => {}
+    }
+}
+
+/// Whether the single shared mic-capture resource
+/// (`AppState::buffer`/`diagnostics`/`capture`/`level_meter`) is already
+/// committed to a session — either hotkey's — and therefore unavailable to
+/// the OTHER hotkey's `StartRecording` (issue #259 Sentinel 🔴-1,
+/// SNTL-20260716-bla-PR274-2b757bf).
+///
+/// Both `react_to_transition` and `react_to_command_transition` call this
+/// as the very first thing in their `StartRecording` arm, before touching
+/// any other state, with:
+/// - `capture_active` — `state.capture.lock().unwrap().is_some()`: a
+///   `CaptureSession` is live (covers the ordinary case: one hotkey is
+///   already recording when the other is pressed).
+/// - `command_selection_captured` — `state.command_selection.lock().unwrap().is_some()`:
+///   command mode has already captured a selection but may not have
+///   started `CaptureSession::start` yet (`react_to_command_transition`
+///   populates `command_selection` BEFORE attempting to start capture) —
+///   without this second flag, a dictation press landing in that narrow
+///   window would see `capture_active == false` and proceed to clobber
+///   `state.capture`/drain `state.buffer` out from under the command-mode
+///   press that's already committed to running.
+///
+/// Pure and `AppState`-free so it's unit-testable (#165's Windows-CI hard
+/// rule) — the two lock reads happen at each call site, not in here.
+fn mic_capture_is_busy(capture_active: bool, command_selection_captured: bool) -> bool {
+    capture_active || command_selection_captured
+}
+
+/// Whether a captured selection (`output::capture_selection`'s `.selection`
+/// field, already unwrapped to plain text by the caller) is non-blank enough
+/// to run command mode's transform over (issue #259). A blank capture means
+/// the user pressed the command-mode hotkey with nothing actually selected
+/// (most apps leave the clipboard untouched by a copy keystroke with no
+/// selection) — command mode must degrade safely in that case (a kind-only
+/// notice, no transform attempted, no capture started) rather than sending
+/// an empty CONTENT-channel string through the LLM transform.
+fn captured_selection_is_usable(selection: &str) -> bool {
+    !selection.trim().is_empty()
+}
+
+/// OS glue: feed one key event into the shared COMMAND-MODE state machine
+/// and react to whatever [`hotkeys::Transition`] it produces (issue #259).
+/// Mirrors [`handle_key_event`] exactly, one machine over.
+fn handle_command_key_event(app: &tauri::AppHandle, event: hotkeys::KeyEvent) {
+    let state = app.state::<AppState>();
+    let transition = state.command_hotkeys.lock().unwrap().handle(event);
+    react_to_command_transition(app, transition);
+}
+
+/// Issue #259 (mirrors issue #44's `reconcile_hotkeys_on_focus_loss`): called
+/// on window focus-loss to reconcile a possibly-dropped `KeyUp` on the
+/// COMMAND-MODE machine, so it can never wedge in `Holding` either.
+fn reconcile_command_hotkeys_on_focus_loss(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let transition = state.command_hotkeys.lock().unwrap().reset();
+    react_to_command_transition(app, transition);
+}
+
+/// React to a COMMAND-MODE `hotkeys::Transition` (issue #259, part of #242):
+/// on `StartRecording`, capture the active selection (#257) and — only if
+/// something was actually selected, and no dictation is already using the
+/// single shared mic-capture resource — start recording the spoken
+/// instruction; on `StopRecording`, hand the captured selection + recorded
+/// audio to [`run_command_in_background`]; on `Cancelled` (debounce/reset),
+/// discard the recording and restore the clipboard if a selection was
+/// already captured. Reuses the exact same `AppState::dictation_generation`/
+/// pill/tray machinery `react_to_transition` does (see that field's doc
+/// comment for why they're shared) — no new tray/pill state, no forked
+/// generation counter.
+fn react_to_command_transition(app: &tauri::AppHandle, transition: Option<hotkeys::Transition>) {
+    use output::Clipboard as _;
+
+    let state = app.state::<AppState>();
+    match transition {
+        Some(hotkeys::Transition::StartRecording) => {
+            // Physical mic capture is a single shared resource
+            // (`buffer`/`diagnostics`/`capture`/`level_meter`) — if a
+            // dictation (or another command-mode press, though the state
+            // machine itself already prevents that) already owns it, degrade
+            // safely: no capture, no clipboard touched, a kind-only notice.
+            // The reciprocal check lives in `react_to_transition`'s own
+            // `StartRecording` arm via the same `mic_capture_is_busy`
+            // predicate (issue #259 Sentinel 🔴-1,
+            // SNTL-20260716-bla-PR274-2b757bf) — this arm only needs the
+            // `capture_active` half of it, since there's no command-mode-side
+            // "in-flight but not yet in `capture`" state analogous to
+            // `command_selection` for dictation to worry about.
+            if mic_capture_is_busy(state.capture.lock().unwrap().is_some(), false) {
+                emit_pipeline_error(
+                    app,
+                    &errors::ErrorKind::Other {
+                        message: "Command mode is unavailable while a dictation is recording."
+                            .to_string(),
+                    },
+                );
+                return;
+            }
+
+            state.dictation_generation.fetch_add(1, Ordering::SeqCst);
+
+            match output::capture_selection(&output::SystemClipboard, &output::EnigoCopy) {
+                Err(err) => {
+                    eprintln!("bla: command-mode selection capture failed: {err}");
+                    emit_pipeline_error(
+                        app,
+                        &errors::ErrorKind::Other {
+                            message: "Couldn't read the current selection.".to_string(),
+                        },
+                    );
+                    // capture_selection never writes to the clipboard on its
+                    // own failure paths (it only reads, plus the OS's own
+                    // copy-keystroke side effect) — nothing to restore.
+                }
+                Ok(captured) => {
+                    let content = captured.selection.into_inner();
+                    if !captured_selection_is_usable(&content) {
+                        emit_pipeline_error(
+                            app,
+                            &errors::ErrorKind::Other {
+                                message: "Nothing was selected.".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                    *state.command_selection.lock().unwrap() = Some(output::CapturedSelection {
+                        selection: output::ClipboardPayload::new(content),
+                        pre_copy_clipboard: captured.pre_copy_clipboard,
+                    });
+
+                    state.buffer.lock().unwrap().drain();
+                    state.diagnostics.clear_error();
+                    match audio::CaptureSession::start(
+                        state.buffer.clone(),
+                        state.diagnostics.clone(),
+                        state.level_meter.clone(),
+                    ) {
+                        Ok(session) => {
+                            *state.capture.lock().unwrap() = Some(session);
+                            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                            *state.level_poll_stop.lock().unwrap() = Some(stop_tx);
+                            spawn_level_poller(app.clone(), state.level_meter.clone(), stop_rx);
+                            set_pipeline_state(app, tray::PipelineState::Recording);
+                        }
+                        Err(err) => {
+                            eprintln!("bla: failed to start command-mode audio capture: {err}");
+                            emit_pipeline_error(app, &errors::error_kind_for_capture_error(&err));
+                            set_pipeline_state(app, tray::PipelineState::Error);
+                            // `command_selection` is deliberately left
+                            // populated: no clipboard restore happens here.
+                            // `capture` never got set, so when the eventual
+                            // `StopRecording` (chord release) arrives below,
+                            // it reads an empty drained buffer and hands
+                            // `run_command_in_background` zero samples —
+                            // `run_command_transform`'s `samples.is_empty()`
+                            // guard is what actually restores the clipboard
+                            // at that point. Restoring it here too would
+                            // just race whatever the user's clipboard holds
+                            // by the time that second restore ran.
+                        }
+                    }
+                }
+            }
+        }
+        Some(hotkeys::Transition::StopRecording) => {
+            let session = state.capture.lock().unwrap().take();
+            if let Some(session) = session {
+                session.stop();
+            }
+            stop_level_poller(&state);
+
+            let captured = state.command_selection.lock().unwrap().take();
+            let Some(captured) = captured else {
+                // StartRecording never got as far as capturing a usable
+                // selection (guarded start, capture failure, or nothing
+                // selected) — a notice was already surfaced there; quietly
+                // clean up.
+                state.diagnostics.clear_error();
+                state.buffer.lock().unwrap().drain();
+                set_pipeline_state(app, tray::PipelineState::Idle);
+                return;
+            };
+
+            if let Some(err) = state.diagnostics.last_error() {
+                eprintln!("bla: command-mode audio capture was degraded, discarding: {err}");
+                state.diagnostics.clear_error();
+                state.buffer.lock().unwrap().drain();
+                let _ = output::SystemClipboard.set(&captured.pre_copy_clipboard.into_inner());
+                emit_pipeline_error(
+                    app,
+                    &errors::ErrorKind::Other {
+                        message: "Couldn't record the spoken instruction.".to_string(),
+                    },
+                );
+                set_pipeline_state(app, tray::PipelineState::Error);
+                return;
+            }
+
+            let samples = state.buffer.lock().unwrap().drain();
+            let generation = state.dictation_generation.load(Ordering::SeqCst);
+            set_pipeline_state(app, tray::PipelineState::Transcribing);
+            run_command_in_background(app.clone(), samples, captured, generation);
+        }
+        Some(hotkeys::Transition::Cancelled) => {
+            let session = state.capture.lock().unwrap().take();
+            if let Some(session) = session {
+                session.stop();
+            }
+            stop_level_poller(&state);
+            state.buffer.lock().unwrap().drain();
+            state.diagnostics.clear_error();
+            if let Some(captured) = state.command_selection.lock().unwrap().take() {
+                // A selection was already captured before this press was
+                // cancelled (debounce, or a focus-loss reconcile) — restore
+                // the user's original clipboard rather than leaving the
+                // captured selection sitting on it.
+                let _ = output::SystemClipboard.set(&captured.pre_copy_clipboard.into_inner());
+            }
             set_pipeline_state(app, tray::PipelineState::Idle);
         }
         None => {}
@@ -2524,6 +4100,239 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
     });
 }
 
+/// What went wrong in [`run_command_transform`] (issue #259, part of #242).
+/// Every variant is reached only AFTER that function has already restored
+/// the clipboard (or, for [`CommandRunError::Paste`], after
+/// `output::replace_selection` restored it internally on a paste-synthesis
+/// failure) — see that function's doc comment for the invariant this
+/// guarantees. `run_command_in_background` maps each variant to a
+/// kind-only, static notice string (never the wrapped error's own text —
+/// same HARD RULE `errors.rs` enforces for the dictation path).
+#[derive(Debug, PartialEq, Eq)]
+enum CommandRunError {
+    /// No audio was captured, or the transcribed instruction was blank —
+    /// there was nothing to run the transform with.
+    NoInstruction,
+    /// `Stt::transcribe` failed.
+    Transcription(stt::SttError),
+    /// `CommandTransform::transform` failed (AC-47: never a deterministic
+    /// fallback for command mode, unlike dictation's `RegexCleanup`).
+    Transform(command::CommandError),
+    /// `CommandTransform::transform` returned `Ok` with a blank/
+    /// whitespace-only result (issue #259 Sentinel 🔴-2,
+    /// SNTL-20260716-bla-PR274-2b757bf: `OllamaCommand::transform` can
+    /// return `Ok(String::new())` for a degenerate model response — without
+    /// this variant, that flowed straight into `output::replace_selection`
+    /// as a "successful" paste of nothing, silently destroying the user's
+    /// selection). Treated exactly like [`CommandRunError::NoInstruction`]:
+    /// the clipboard is restored, the paste keystroke is never synthesized.
+    EmptyResult,
+    /// `output::replace_selection` failed to synthesize the paste keystroke
+    /// or observe the post-paste clipboard; it already restored the
+    /// original clipboard internally before returning `Err` (see its own
+    /// doc comment), so this variant carries no further cleanup obligation.
+    Paste,
+}
+
+/// Command mode's core orchestration (issue #259, AC-23): transcribe the
+/// recorded spoken instruction, transform `content` (the selection captured
+/// by `output::capture_selection`, untrusted CONTENT-channel input) through
+/// it via #256's separated-channel `CommandTransform`, and paste the result
+/// back over the selection via #257's `output::replace_selection` —
+/// restoring `pre_copy_clipboard` (the user's original clipboard, saved by
+/// `output::capture_selection` before command mode ever touched it) in
+/// EVERY failure branch, so a failure never leaves the clipboard holding the
+/// mid-flow captured-selection value instead of what the user actually had.
+///
+/// Generic over `stt::Stt`/`command::CommandTransform`/`output::Clipboard`/
+/// `output::PasteSynthesizer` exactly like `pipeline::Pipeline`'s own
+/// generic shape, so — despite its production caller
+/// (`run_command_in_background`) being OS glue — this function itself is
+/// unit-testable with fakes/stubs, no `AppState`/`tauri::Wry` involved
+/// (issue #165's Windows-CI hard rule). This is where AC-23's "asserted in
+/// `cargo test` with a stubbed selection and fixture instruction audio,
+/// asserting output text and post-paste clipboard state" actually lives —
+/// see `command_dispatch_tests` below.
+///
+/// **Instruction/content channel separation (this PR's file-scope
+/// constraint):** `content` and the transcribed `instruction` are threaded
+/// through as two distinct arguments all the way to `transform.transform(&content, &instruction)`
+/// — never concatenated anywhere in this function.
+#[allow(clippy::too_many_arguments)] // mirrors output::route's identical justification: pure
+                                     // dispatch logic over several independently-injected seams
+fn run_command_transform(
+    stt: &impl stt::Stt,
+    transform: &impl command::CommandTransform,
+    clipboard: &impl output::Clipboard,
+    paste: &impl output::PasteSynthesizer,
+    sleep: impl FnOnce(std::time::Duration),
+    samples: &[f32],
+    content: String,
+    pre_copy_clipboard: String,
+) -> Result<String, CommandRunError> {
+    if samples.is_empty() {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::NoInstruction);
+    }
+
+    let instruction = match stt.transcribe(samples, &stt::TranscribeOpts::default()) {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = clipboard.set(&pre_copy_clipboard);
+            return Err(CommandRunError::Transcription(err));
+        }
+    };
+
+    if instruction.trim().is_empty() {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::NoInstruction);
+    }
+
+    let transformed = match transform.transform(&content, &instruction) {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = clipboard.set(&pre_copy_clipboard);
+            return Err(CommandRunError::Transform(err));
+        }
+    };
+
+    // Issue #259 Sentinel 🔴-2 (SNTL-20260716-bla-PR274-2b757bf): a blank/
+    // whitespace-only `Ok` result must never be pasted as a "successful"
+    // replacement of the user's selection with nothing — symmetric with the
+    // blank-INSTRUCTION guard above.
+    if transformed.trim().is_empty() {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::EmptyResult);
+    }
+
+    match output::replace_selection(
+        clipboard,
+        paste,
+        sleep,
+        output::ClipboardPayload::new(pre_copy_clipboard),
+        output::ClipboardPayload::new(transformed.clone()),
+        output::DEFAULT_RESTORE_DELAY,
+    ) {
+        Ok(()) => Ok(transformed),
+        Err(_) => Err(CommandRunError::Paste),
+    }
+}
+
+/// Runs command mode's background flow (issue #259, part of #242) over a
+/// recorded instruction + a selection already captured by
+/// `react_to_command_transition`'s `StartRecording` arm, in a background
+/// thread so the shortcut-handler callback that triggered `StopRecording`
+/// never blocks on transcription. Thin OS glue over [`run_command_transform`]
+/// (the actual, unit-tested orchestration): builds the real `Stt`/
+/// `CommandTransform`/`Clipboard`/`PasteSynthesizer` and gates every
+/// UI-visible effect (notice emit, pipeline state write, pill settle) behind
+/// [`generation_is_live`] — mirroring `run_pipeline_in_background`'s own
+/// "the real effect is unconditional, only the UI feedback is gated"
+/// pattern: `run_command_transform` has ALREADY restored the clipboard by
+/// the time this function checks liveness, so a stale generation still
+/// leaves the user's clipboard correct, it just skips telling them why.
+fn run_command_in_background(
+    app: tauri::AppHandle,
+    samples: Vec<f32>,
+    captured: output::CapturedSelection,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let content = captured.selection.into_inner();
+        let pre_copy_clipboard = captured.pre_copy_clipboard.into_inner();
+
+        let settings = { app.state::<AppState>().settings.lock().unwrap().clone() };
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("bla"));
+
+        #[cfg(feature = "whisper")]
+        let stt_result = {
+            let state = app.state::<AppState>();
+            build_stt(&settings, &app_data_dir, &state.stt_cache)
+        };
+        #[cfg(not(feature = "whisper"))]
+        let stt_result = build_stt(&settings, &app_data_dir);
+
+        let stt_engine = match stt_result {
+            Ok(engine) => engine,
+            Err(msg) => {
+                eprintln!("bla: {msg}");
+                use output::Clipboard as _;
+                let _ = output::SystemClipboard.set(&pre_copy_clipboard);
+                if generation_is_live(&app, generation) {
+                    emit_pipeline_error(&app, &errors::error_kind_for_build_stt_failure(&msg));
+                    set_pipeline_state(&app, tray::PipelineState::Error);
+                }
+                return;
+            }
+        };
+
+        let command_transform = command::OllamaCommand::with_default_base_url(
+            "llama3",
+            cleanup::UreqTransport::default(),
+        );
+
+        let result = run_command_transform(
+            &stt_engine,
+            &command_transform,
+            &output::SystemClipboard,
+            &output::EnigoPaste,
+            std::thread::sleep,
+            &samples,
+            content,
+            pre_copy_clipboard,
+        );
+
+        match result {
+            Ok(_transformed) => {
+                if !generation_is_live(&app, generation) {
+                    return;
+                }
+                // Issue #259: no history-row persistence for command-mode
+                // text (explicitly out of scope for this PR, per #242's
+                // AC-29 not requesting it) — otherwise mirrors dictation's
+                // completed-run settle for the same "done" pill confirmation
+                // (issue #151).
+                let previous = app
+                    .state::<AppState>()
+                    .pipeline_display
+                    .lock()
+                    .unwrap()
+                    .state;
+                settle_idle_keeping_pill_for_done(&app, previous, generation);
+            }
+            Err(err) => {
+                if !generation_is_live(&app, generation) {
+                    return;
+                }
+                let message = match &err {
+                    CommandRunError::NoInstruction => "No instruction was heard.",
+                    CommandRunError::Transcription(_) => {
+                        "Couldn't transcribe the spoken instruction."
+                    }
+                    CommandRunError::Transform(_) => {
+                        "Local AI is unreachable; command mode couldn't run."
+                    }
+                    CommandRunError::EmptyResult => {
+                        "Local AI returned an empty result; the selection was left unchanged."
+                    }
+                    CommandRunError::Paste => "Couldn't paste the transformed text.",
+                };
+                eprintln!("bla: command mode failed: {err:?}");
+                emit_pipeline_error(
+                    &app,
+                    &errors::ErrorKind::Other {
+                        message: message.to_string(),
+                    },
+                );
+                set_pipeline_state(&app, tray::PipelineState::Error);
+            }
+        }
+    });
+}
+
 /// Wall-clock `output::Clock` for file-mode path/timestamp templating —
 /// the one place this crate's OS-glue reads the real system clock (`output`
 /// itself never does, per its module doc: `Clock` is always injected).
@@ -2735,6 +4544,16 @@ pub fn run() {
                     [0u32],
                     hotkeys::DEFAULT_DEBOUNCE,
                 )),
+                // Issue #259: mirrors `hotkeys` above (same recording_mode —
+                // see `apply_settings`'s doc comment on why the two share
+                // it), driving the command-mode hotkey's own independent
+                // press/release session.
+                command_hotkeys: Mutex::new(hotkeys::StateMachine::new(
+                    to_hotkey_mode(settings.recording_mode),
+                    [0u32],
+                    hotkeys::DEFAULT_DEBOUNCE,
+                )),
+                command_selection: Mutex::new(None),
                 buffer: Arc::new(Mutex::new(audio::RingBuffer::new(
                     audio::TARGET_SAMPLE_RATE as usize * MAX_CAPTURE_SECONDS,
                 ))),
@@ -2773,10 +4592,32 @@ pub fn run() {
             let default_hotkey = settings::Settings::default().hotkey;
             let effective_hotkey =
                 hotkeys::resolve_effective_hotkey(&settings.hotkey, &default_hotkey).to_string();
-            if let Err(err) = register_hotkey(&handle, &effective_hotkey) {
+            if let Err(err) = register_hotkey(&handle, None, &effective_hotkey) {
                 eprintln!(
                     "bla: failed to register global hotkey {effective_hotkey:?} at startup; \
                      the app will launch without a bound dictation hotkey: {err}"
+                );
+            }
+
+            // Issue #259: same non-fatal, resolve-to-default-on-corruption
+            // startup discipline as the dictation hotkey just above, for the
+            // command-mode hotkey. `None` prior — this call always runs
+            // AFTER the dictation hotkey's own `register_hotkey` above, and
+            // (issue #259's `register_hotkey`/`register_command_hotkey` doc
+            // comments) neither one calls `unregister_all()`, so this
+            // registration can never clobber the dictation hotkey that was
+            // just bound.
+            let default_command_hotkey = settings::Settings::default().command_hotkey;
+            let effective_command_hotkey = hotkeys::resolve_effective_hotkey(
+                &settings.command_hotkey,
+                &default_command_hotkey,
+            )
+            .to_string();
+            if let Err(err) = register_command_hotkey(&handle, None, &effective_command_hotkey) {
+                eprintln!(
+                    "bla: failed to register global command-mode hotkey \
+                     {effective_command_hotkey:?} at startup; the app will launch without a \
+                     bound command-mode hotkey: {err}"
                 );
             }
 
@@ -2786,12 +4627,16 @@ pub fn run() {
             // instead of quitting the whole app — this is a tray-resident
             // utility now, so "close" and "quit" are deliberately different
             // actions; the tray menu's Quit item is the only way to exit.
+            // Issue #259: the command-mode machine gets the identical
+            // focus-loss reconcile as the dictation machine, so it can never
+            // wedge in Holding either.
             if let Some(window) = app.get_webview_window("main") {
                 let focus_handle = handle.clone();
                 let close_handle = handle.clone();
                 window.on_window_event(move |event| match event {
                     tauri::WindowEvent::Focused(false) => {
                         reconcile_hotkeys_on_focus_loss(&focus_handle);
+                        reconcile_command_hotkeys_on_focus_loss(&focus_handle);
                     }
                     tauri::WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();

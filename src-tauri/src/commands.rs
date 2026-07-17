@@ -12,10 +12,10 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
     apply_settings_to_state, copy_history_entry_text, is_settings_window, model_registry_entries,
-    now_ms, output_mode_toggle_label, prune_history_for_retention, react_to_transition,
-    register_hotkey, save_settings_to_store, set_settings_with_rollback, should_resume_hotkey,
-    spec_for_preset, to_models_preset, to_tray_output_mode, unregister_hotkey, AppState,
-    ModelRegistryEntry,
+    now_ms, output_mode_toggle_label, prune_history_for_retention, react_to_command_transition,
+    react_to_transition, register_command_hotkey, register_hotkey, save_settings_to_store,
+    set_two_hotkeys_with_rollback, should_resume_hotkey, spec_for_preset, to_models_preset,
+    to_tray_output_mode, unregister_hotkey, AppState, ModelRegistryEntry,
 };
 
 /// Read the currently effective settings (in-memory, kept in sync with the
@@ -75,6 +75,12 @@ pub fn set_settings(
         let current = state.settings.lock().unwrap();
         current.hotkey != settings.hotkey
     };
+    // Issue #259 (AC-49): the command-mode hotkey change-detection mirrors
+    // the dictation one exactly, one field over.
+    let command_hotkey_changed = {
+        let current = state.settings.lock().unwrap();
+        current.command_hotkey != settings.command_hotkey
+    };
     // Issue #126: the pure decision of whether/which direction this save's
     // launch_at_login change should flip OS autostart registration —
     // unit-tested in `settings::autostart_action_for_change`. `None` on the
@@ -103,37 +109,62 @@ pub fn set_settings(
     // therefore does NOT touch the generation at all — dissolving the
     // two-writer TOCTOU that earlier cycles fought.
     //
-    // Rollback keeps the OS binding and settings.json in agreement on failure.
-    // The control flow (register-before-persist; roll the OS back to the prior
-    // hotkey if EITHER the register or the persist fails) is the pure,
-    // unit-tested `set_settings_with_rollback` seam (PR #185 cycle-6 🟡); this
-    // command only injects the three OS effects. #91: validate BEFORE binding
-    // so a malformed chord is rejected without touching the OS.
+    // Issue #259 (AC-49): extended to a SECOND independent hotkey slot
+    // (command mode), sharing one persisted `Settings` blob AND one OS
+    // accelerator registry with the dictation slot.
+    //
+    // Issue #259 Sentinel 🔴-3 (SNTL-20260716-bla-PR274-2b757bf): the two
+    // slots are registered via `set_two_hotkeys_with_rollback`, NOT two
+    // independent per-slot register-then-persist calls — the OS's global
+    // shortcut registry keys purely by accelerator, so handling the slots
+    // fully independently breaks for a swap-style save (new-dictation ==
+    // current-command's still-live value, or vice versa): registering the
+    // first slot's new value can hit "already registered" because the
+    // other slot's still-current binding hasn't been freed yet, and a
+    // naive per-slot rollback has no reason to touch that other slot,
+    // leaving it dead until restart with settings.json disagreeing with
+    // the OS. `set_two_hotkeys_with_rollback` unregisters BOTH changed
+    // priors before registering EITHER new value, so this can't happen —
+    // see its doc comment for the full rationale.
     let prior_hotkey = if hotkey_changed {
         state.settings.lock().unwrap().hotkey.clone()
+    } else {
+        String::new()
+    };
+    let prior_command_hotkey = if command_hotkey_changed {
+        state.settings.lock().unwrap().command_hotkey.clone()
     } else {
         String::new()
     };
     if hotkey_changed {
         crate::hotkeys::validate_hotkey(&settings.hotkey)?;
     }
-    set_settings_with_rollback(
+    if command_hotkey_changed {
+        crate::hotkeys::validate_hotkey(&settings.command_hotkey)?;
+    }
+    // AC-49: reject a save that would leave both hotkeys bound to the same
+    // accelerator, BEFORE either is (re)registered or anything is
+    // persisted — a malformed individual hotkey is already caught by the
+    // two `validate_hotkey` calls just above, so by this point both parse.
+    crate::hotkeys::distinct_hotkeys(&settings.hotkey, &settings.command_hotkey)?;
+
+    set_two_hotkeys_with_rollback(
         hotkey_changed,
         &prior_hotkey,
         &settings.hotkey,
-        |h| register_hotkey(&app, h).map_err(|e| e.to_string()),
-        || save_settings_to_store(&app, &settings),
-        |prior| {
-            // PR #185 cycle-6 🟢: a failed RESTORE must not be invisible — the
-            // OS could be left unbound. Surface it (per this file's eprintln
-            // convention) instead of silently swallowing it.
-            if let Err(err) = register_hotkey(&app, prior) {
-                eprintln!(
-                    "bla: failed to restore prior hotkey {prior:?} after a set_settings rollback; \
-                     the global dictation shortcut may be unbound until restart: {err}"
-                );
-            }
+        command_hotkey_changed,
+        &prior_command_hotkey,
+        &settings.command_hotkey,
+        |h| {
+            // Best-effort, same convention as `register_hotkey`'s own
+            // internal targeted-unregister-of-prior: `h` may already be
+            // unregistered (e.g. nothing was ever bound to it), and that
+            // must never block registering the OTHER slot's new value.
+            let _ = unregister_hotkey(&app, h);
         },
+        |h| register_hotkey(&app, None, h).map_err(|e| e.to_string()),
+        |h| register_command_hotkey(&app, None, h).map_err(|e| e.to_string()),
+        || save_settings_to_store(&app, &settings),
     )?;
 
     // Issue #126: thin OS glue over `tauri-plugin-autostart`'s
@@ -171,9 +202,15 @@ pub fn set_settings(
     // Unit-tested in lib.rs::apply_settings_tests; a mode change that
     // interrupts an in-flight session yields Cancelled, which
     // react_to_transition turns into stop-capture + discard-audio (the same
-    // handling as the debounce/focus-loss cancel paths).
-    let transition = apply_settings_to_state(&state, settings);
+    // handling as the debounce/focus-loss cancel paths). Issue #259:
+    // `apply_settings_to_state` now flips BOTH hotkey state machines'
+    // Hold/Toggle mode (they mirror the same `recording_mode`) — the
+    // command-mode transition is handled by its own
+    // `react_to_command_transition`, mirroring the dictation call
+    // immediately above it.
+    let (transition, command_transition) = apply_settings_to_state(&state, settings);
     react_to_transition(&app, transition);
+    react_to_command_transition(&app, command_transition);
 
     // Issue #198 (AC-31): best-effort, same as the autostart glue above —
     // settings are already persisted at this point, so a prune failure must
@@ -319,7 +356,11 @@ pub fn suspend_hotkey(
     if !is_settings_window(window.label()) {
         return Err("suspend_hotkey is only callable from the settings window".to_string());
     }
-    unregister_hotkey(window.app_handle()).map_err(|e| e.to_string())?;
+    // Issue #259: target-unregister exactly the dictation hotkey (never
+    // `unregister_all()`, which would also drop the independently-
+    // registered command-mode hotkey — see `unregister_hotkey`'s doc).
+    let hotkey = state.settings.lock().unwrap().hotkey.clone();
+    unregister_hotkey(window.app_handle(), &hotkey).map_err(|e| e.to_string())?;
     *state.hotkey_suspend_gen.lock().unwrap() = generation;
     Ok(())
 }
@@ -600,7 +641,10 @@ pub fn resume_hotkey(
     let hotkey = state.settings.lock().unwrap().hotkey.clone();
     let mut gen_slot = state.hotkey_suspend_gen.lock().unwrap();
     if should_resume_hotkey(*gen_slot, generation) {
-        register_hotkey(window.app_handle(), &hotkey).map_err(|e| e.to_string())?;
+        // `None` prior: `suspend_hotkey` already target-unregistered this
+        // exact hotkey (issue #259), so there's nothing left registered
+        // under this slot to unregister again here.
+        register_hotkey(window.app_handle(), None, &hotkey).map_err(|e| e.to_string())?;
         *gen_slot = 0;
     }
     Ok(())

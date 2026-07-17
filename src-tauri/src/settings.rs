@@ -90,6 +90,24 @@ pub struct Settings {
     /// — thin OS glue in `lib.rs`/`commands::set_settings`; this field is
     /// only the durable preference.
     pub retention_days: u32,
+    /// The command-mode global hotkey (issue #259, part of #242, M4):
+    /// pressing/holding it drives its OWN `hotkeys::StateMachine` instance
+    /// (`lib.rs::AppState::command_hotkeys`), independent of the dictation
+    /// hotkey's — capture selection → transcribe the spoken instruction →
+    /// transform → replace selection, rather than a dictation. Persisted
+    /// separately from `hotkey` (never derived from it) so the two can be
+    /// rebound independently; [`hotkeys::distinct_hotkeys`](crate::hotkeys::distinct_hotkeys)
+    /// is the AC-49 guard `commands::set_settings` runs before persisting
+    /// either, rejecting a save that would leave both hotkeys bound to the
+    /// same accelerator (which would otherwise make one silently shadow the
+    /// other's OS registration). Defaults to `"Control+Shift+C"` —
+    /// deliberately distinct from `Settings::default().hotkey`
+    /// (`"Control+Shift+Space"`), using the same cross-platform-safe
+    /// modifier spelling (issue #110: no macOS-only `"Option"` alias).
+    /// There is no settings-window capture UI for this field yet (that's
+    /// issue #262) — a settings.json predating this field falls back to
+    /// this default via `#[serde(default)]`, same as every other field.
+    pub command_hotkey: String,
 }
 
 impl Default for Settings {
@@ -115,6 +133,10 @@ impl Default for Settings {
             launch_at_login: false,
             sound_cues: true,
             retention_days: 0,
+            // Issue #259: distinct from `hotkey` above by construction —
+            // `hotkeys_default_and_command_default_are_distinct_issue_259`
+            // pins this so the two can never silently drift back together.
+            command_hotkey: "Control+Shift+C".to_string(),
         }
     }
 }
@@ -292,6 +314,7 @@ mod tests {
             launch_at_login: true,
             sound_cues: false,
             retention_days: 30,
+            command_hotkey: "Cmd+Shift+K".to_string(),
         }
     }
 
@@ -323,6 +346,7 @@ mod tests {
         assert_ne!(default.launch_at_login, non_default.launch_at_login);
         assert_ne!(default.sound_cues, non_default.sound_cues);
         assert_ne!(default.retention_days, non_default.retention_days);
+        assert_ne!(default.command_hotkey, non_default.command_hotkey);
     }
 
     #[test]
@@ -347,6 +371,7 @@ mod tests {
         assert_eq!(partial.launch_at_login, Settings::default().launch_at_login);
         assert_eq!(partial.sound_cues, Settings::default().sound_cues);
         assert_eq!(partial.retention_days, Settings::default().retention_days);
+        assert_eq!(partial.command_hotkey, Settings::default().command_hotkey);
     }
 
     // -------------------------------------------------------------
@@ -470,6 +495,45 @@ mod tests {
             "journal/{{date:YYYY-MM-DD}}.md"
         );
         assert_eq!(restored.retention_days, 0);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #259 (M4 command-mode backbone, AC-49): `command_hotkey` is a
+    // brand-new field — a settings.json from any build before this PR has
+    // no such key and must default rather than fail to deserialize (the
+    // same `#[serde(default)]` back-compat guarantee every earlier field
+    // gets), and the shipped default must never collide with the shipped
+    // dictation-hotkey default (AC-49's distinctness guard would otherwise
+    // reject bla's own defaults at the very first settings save).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn command_hotkey_defaults_to_a_value_distinct_from_the_dictation_hotkey_default_issue_259() {
+        let default = Settings::default();
+        assert_ne!(default.command_hotkey, default.hotkey);
+        assert_eq!(default.command_hotkey, "Control+Shift+C");
+    }
+
+    #[test]
+    fn pre_259_settings_json_without_command_hotkey_still_deserializes_with_a_default() {
+        // Mirrors a real settings.json written by a pre-#259 build: every
+        // field earlier PRs introduced, but no `command_hotkey`.
+        let old_json = r#"{
+            "hotkey": "Control+Shift+D",
+            "recording_mode": "Toggle",
+            "model_preset": "Small",
+            "output_mode": "File",
+            "file_path_template": "journal/{{date:YYYY-MM-DD}}.md",
+            "file_base_dir": "/Users/cofounder/Obsidian/Vault",
+            "launch_at_login": true,
+            "sound_cues": false,
+            "retention_days": 30
+        }"#;
+
+        let restored = from_json(old_json).unwrap();
+
+        assert_eq!(restored.hotkey, "Control+Shift+D");
+        assert_eq!(restored.command_hotkey, Settings::default().command_hotkey);
     }
 
     // -------------------------------------------------------------
