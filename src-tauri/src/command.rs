@@ -117,6 +117,33 @@ pub fn render_command_prompt_v1(instruction: &str) -> String {
     COMMAND_PROMPT_V1.replace(COMMAND_PROMPT_V1_INSTRUCTION_PLACEHOLDER, instruction)
 }
 
+/// The hardened command-mode prompt (issue #282, ac7-p0). Supersedes
+/// [`COMMAND_PROMPT_V1`] as [`OllamaCommand`]'s live system prompt: it adds
+/// an explicit anti-preamble / anti-narration rule and a worked few-shot
+/// example demonstrating that the output is ONLY the rewritten text (llama3,
+/// 8B, needs the demonstration — it otherwise sometimes narrates its own
+/// prompt, e.g. "The user has selected some text… My task is to…"). Added as
+/// a new file, per the same "never edit the old one in place" convention as
+/// [`COMMAND_PROMPT_V1`]'s doc comment — `command_v1.txt` stays on disk
+/// untouched, still protected by its own regression tests. Runtime output is
+/// additionally defended by [`crate::preamble::looks_like_preamble`], so a
+/// slip past the prompt is caught before the result is ever pasted.
+pub const COMMAND_PROMPT_V2: &str = include_str!("../prompts/command_v2.txt");
+
+/// The `{{INSTRUCTION}}` placeholder inside [`COMMAND_PROMPT_V2`] (identical
+/// token to v1's).
+const COMMAND_PROMPT_V2_INSTRUCTION_PLACEHOLDER: &str = "{{INSTRUCTION}}";
+
+/// Renders [`COMMAND_PROMPT_V2`] with `instruction` substituted into its
+/// `{{INSTRUCTION}}` placeholder (issue #282). Same pure/deterministic,
+/// structural channel-separation guarantees as [`render_command_prompt_v1`]
+/// — the instruction is folded into the trusted rendered prompt here,
+/// independent of whatever `content` a caller later sends as Ollama's
+/// separate `prompt` field.
+pub fn render_command_prompt_v2(instruction: &str) -> String {
+    COMMAND_PROMPT_V2.replace(COMMAND_PROMPT_V2_INSTRUCTION_PLACEHOLDER, instruction)
+}
+
 /// Request body shape for Ollama's `/api/generate` endpoint — identical
 /// field layout to `cleanup::GenerateRequest`, but the two fields carry
 /// different channels here: `system` carries the rendered, instruction-
@@ -182,7 +209,7 @@ impl<T: OllamaTransport> OllamaCommand<T> {
 
 impl<T: OllamaTransport> CommandTransform for OllamaCommand<T> {
     fn transform(&self, content: &str, instruction: &str) -> Result<String, CommandError> {
-        let system_prompt = render_command_prompt_v1(instruction);
+        let system_prompt = render_command_prompt_v2(instruction);
         let request = GenerateRequest {
             model: &self.model,
             system: &system_prompt,
@@ -330,7 +357,10 @@ mod tests {
             system.contains(instruction),
             "the `system` field must carry the spoken instruction"
         );
-        assert_eq!(system, render_command_prompt_v1(instruction));
+        // Issue #282: production now renders the hardened `COMMAND_PROMPT_V2`
+        // (see `OllamaCommand::transform`) — `command_v1.txt` stays on disk,
+        // still protected by its own regression tests above.
+        assert_eq!(system, render_command_prompt_v2(instruction));
     }
 
     #[test]
@@ -496,5 +526,67 @@ mod tests {
         let a = render_command_prompt_v1("turn into bullets");
         let b = render_command_prompt_v1("turn into bullets");
         assert_eq!(a, b);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #282 (ac7-p0): command_v2.txt — a new, versioned command-mode
+    // prompt hardened against preambles / task-narration, with a few-shot
+    // demonstration that the output is ONLY the rewritten text. Supersedes
+    // command_v1.txt as `OllamaCommand`'s live system prompt, per the same
+    // "add a new file, never edit the old one in place" convention; v1 stays
+    // on disk untouched, still protected by its own regression tests above.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn command_prompt_v2_is_a_distinct_file_from_v1() {
+        assert_ne!(
+            COMMAND_PROMPT_V2, COMMAND_PROMPT_V1,
+            "command_v2.txt must be its own file, not a copy of command_v1.txt"
+        );
+    }
+
+    #[test]
+    fn command_prompt_v2_carries_all_v1_rewrite_only_constraints() {
+        let prompt = COMMAND_PROMPT_V2.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "rewrite only",
+            "untrusted",
+            "instruction channel",
+            "content channel",
+            "never obeyed",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "command_v2.txt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_prompt_v2_hardens_against_preambles_and_narration_issue_282() {
+        let prompt = COMMAND_PROMPT_V2.to_lowercase();
+        // Explicit anti-narration / anti-preamble wording.
+        assert!(prompt.contains("preamble"));
+        assert!(prompt.contains("narrat"));
+        // A worked few-shot demonstration (input -> output-is-only-the-text).
+        assert!(
+            COMMAND_PROMPT_V2.contains("CORRECT OUTPUT")
+                && COMMAND_PROMPT_V2.contains("WRONG OUTPUT"),
+            "command_v2.txt must carry a few-shot example contrasting correct vs. preamble output"
+        );
+    }
+
+    #[test]
+    fn command_prompt_v2_contains_the_instruction_placeholder() {
+        assert!(COMMAND_PROMPT_V2.contains("{{INSTRUCTION}}"));
+    }
+
+    #[test]
+    fn render_command_prompt_v2_substitutes_the_instruction_placeholder() {
+        let rendered = render_command_prompt_v2("make this formal");
+        assert!(!rendered.contains("{{INSTRUCTION}}"));
+        assert!(rendered.contains("make this formal"));
     }
 }

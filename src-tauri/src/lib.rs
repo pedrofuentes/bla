@@ -82,6 +82,12 @@ mod hotkeys;
 pub mod models;
 pub mod output;
 pub mod pipeline;
+// `pub` (issues #282/#283, M4): the pure LLM-output preamble/prompt-echo
+// detector, shared by the command-mode orchestration (`run_command_transform`
+// in this file) and the dictation pipeline's cleanup fallback
+// (`pipeline::Pipeline::clean_with_fallback`). Standalone, fully-unit-tested
+// pure logic, mirroring `cleanup`/`snippets`' seams.
+pub mod preamble;
 pub mod settings;
 // Private, mirroring `mod context;` above: pure trigger-matching logic
 // (issue #260) with no external caller yet — #263 wires it into the
@@ -2453,6 +2459,162 @@ mod command_dispatch_tests {
     }
 
     // -------------------------------------------------------------
+    // Issues #282/#283 (ac7-p0): the LLM (hardcoded llama3) sometimes emits a
+    // narrated prompt / conversational preamble instead of the rewritten
+    // selection. `run_command_transform` must treat that like a failed
+    // transform — clipboard restored, paste NEVER synthesized — so a narrated
+    // prompt is never pasted over the user's selection.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn run_command_transform_rejects_a_conversational_preamble_result_issue_283() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding(
+            "This is a formal rewrite of your original transcript: Rewritten.",
+        );
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::Preamble));
+        assert_eq!(
+            paste.calls.get(),
+            0,
+            "a preamble-polluted result must never reach the paste step"
+        );
+        assert_eq!(
+            clipboard.get().unwrap(),
+            "original clipboard",
+            "the selection must be left untouched (clipboard restored), never replaced with a \
+             narrated prompt"
+        );
+    }
+
+    #[test]
+    fn run_command_transform_rejects_a_narrated_prompt_result_issue_282() {
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding(
+            "The user has selected some text (the CONTENT CHANNEL). My task is to produce a \
+             rewritten version.",
+        );
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::Preamble));
+        assert_eq!(paste.calls.get(), 0);
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+    }
+
+    #[test]
+    fn run_command_transform_relays_a_clean_rewrite_that_merely_starts_with_this_issue_283() {
+        // Conservative-detector guard: a faithful rewrite that happens to
+        // begin with "This" must still paste normally — the preamble guard
+        // must not swallow legitimate output.
+        let stt = FixedStt("make this formal".to_string());
+        let command = FixedCommand::succeeding("This is normal.");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Ok("This is normal.".to_string()));
+        assert_eq!(paste.calls.get(), 1);
+    }
+
+    // -------------------------------------------------------------
+    // Issue #282: a degenerate (blank OR sub-minimal-length) transcribed
+    // instruction must short-circuit to `NoInstruction` BEFORE the model is
+    // ever called — so a stray one-character transcription (e.g. downstream
+    // of the hotkey-leak #281) can never elicit a narrated-prompt response
+    // the user then sees. Symmetric with, and an extension of, the existing
+    // blank-instruction guard.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn run_command_transform_degrades_safely_on_a_single_character_instruction_issue_282() {
+        let stt = FixedStt(".".to_string());
+        let command = FixedCommand::succeeding("unused");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Err(CommandRunError::NoInstruction));
+        assert_eq!(paste.calls.get(), 0);
+        assert_eq!(clipboard.get().unwrap(), "original clipboard");
+        assert!(
+            command.captured.borrow().is_none(),
+            "the model must never be called for a sub-minimal-length instruction"
+        );
+    }
+
+    #[test]
+    fn run_command_transform_still_runs_a_short_but_real_instruction_issue_282() {
+        // The min-length guard must stay conservative: a genuine short
+        // instruction like "fix" (3 chars) must NOT be rejected.
+        let stt = FixedStt("fix".to_string());
+        let command = FixedCommand::succeeding("Fixed.");
+        let clipboard = FakeClipboard::new("mid-flow");
+        let paste = CountingPaste::succeeding();
+
+        let result = run_command_transform(
+            &stt,
+            &command,
+            &clipboard,
+            &paste,
+            |_| {},
+            &[0.0_f32; 16_000],
+            "selected text".to_string(),
+            "original clipboard".to_string(),
+        );
+
+        assert_eq!(result, Ok("Fixed.".to_string()));
+        assert!(
+            command.captured.borrow().is_some(),
+            "a genuine short instruction must reach the model"
+        );
+    }
+
+    // -------------------------------------------------------------
     // `captured_selection_is_usable`: the pure "was anything actually
     // selected" check `react_to_command_transition`'s `StartRecording` arm
     // runs before ever starting audio capture.
@@ -4153,6 +4315,15 @@ enum CommandRunError {
     /// selection). Treated exactly like [`CommandRunError::NoInstruction`]:
     /// the clipboard is restored, the paste keystroke is never synthesized.
     EmptyResult,
+    /// `CommandTransform::transform` returned `Ok`, but the text looks like a
+    /// conversational preamble / prompt echo rather than the rewritten
+    /// selection — the model (hardcoded llama3, 8B) narrated its own system
+    /// prompt or prepended a label instead of rewriting (issue #282, ac7-p0;
+    /// detected by [`preamble::looks_like_preamble`]). Treated exactly like
+    /// [`CommandRunError::EmptyResult`]: the clipboard is restored and the
+    /// paste keystroke is never synthesized, so a narrated prompt is never
+    /// pasted over the user's selection.
+    Preamble,
     /// `output::replace_selection` failed to synthesize the paste keystroke
     /// or observe the post-paste clipboard; it already restored the
     /// original clipboard internally before returning `Err` (see its own
@@ -4184,6 +4355,16 @@ enum CommandRunError {
 /// constraint):** `content` and the transcribed `instruction` are threaded
 /// through as two distinct arguments all the way to `transform.transform(&content, &instruction)`
 /// — never concatenated anywhere in this function.
+/// Minimum number of (trimmed) characters a transcribed instruction must
+/// have before command mode will call the model (issue #282). Deliberately
+/// tiny — the point is only to reject a blank or single-stray-character
+/// transcription (which cannot be a meaningful directive and, sent to an 8B
+/// model with a real selection, tends to elicit prompt-narration), NOT to
+/// second-guess genuine short instructions like "fix" (3 chars). The
+/// output-side [`preamble::looks_like_preamble`] guard covers the harder case
+/// of a non-degenerate-but-bad instruction.
+const MIN_INSTRUCTION_CHARS: usize = 2;
+
 #[allow(clippy::too_many_arguments)] // mirrors output::route's identical justification: pure
                                      // dispatch logic over several independently-injected seams
 fn run_command_transform(
@@ -4209,7 +4390,14 @@ fn run_command_transform(
         }
     };
 
-    if instruction.trim().is_empty() {
+    // Issue #282 (ac7-p0): a blank OR sub-minimal-length transcribed
+    // instruction is degenerate (e.g. a single stray character downstream of
+    // the hotkey-leak #281) — short-circuit BEFORE calling the model, so a
+    // garbage instruction can never elicit a narrated-prompt response the
+    // user then sees. Kept conservative (a genuine short instruction like
+    // "fix" is 3 chars and passes) — the output-side preamble guard below is
+    // the second line of defense for a non-degenerate-but-bad instruction.
+    if instruction.trim().chars().count() < MIN_INSTRUCTION_CHARS {
         let _ = clipboard.set(&pre_copy_clipboard);
         return Err(CommandRunError::NoInstruction);
     }
@@ -4229,6 +4417,17 @@ fn run_command_transform(
     if transformed.trim().is_empty() {
         let _ = clipboard.set(&pre_copy_clipboard);
         return Err(CommandRunError::EmptyResult);
+    }
+
+    // Issue #282 (ac7-p0): the model sometimes returns a conversational
+    // preamble / a narration of its own system prompt instead of the
+    // rewritten selection. Treat that like a failed transform — restore the
+    // clipboard, never paste — so a narrated prompt is never pasted over the
+    // user's selection. Conservative detector (see `preamble` module): a
+    // legitimate rewrite that merely starts with "This" is not caught.
+    if preamble::looks_like_preamble(&transformed) {
+        let _ = clipboard.set(&pre_copy_clipboard);
+        return Err(CommandRunError::Preamble);
     }
 
     match output::replace_selection(
@@ -4343,6 +4542,9 @@ fn run_command_in_background(
                     }
                     CommandRunError::EmptyResult => {
                         "Local AI returned an empty result; the selection was left unchanged."
+                    }
+                    CommandRunError::Preamble => {
+                        "Local AI didn't return a usable rewrite; the selection was left unchanged."
                     }
                     CommandRunError::Paste => "Couldn't paste the transformed text.",
                 };

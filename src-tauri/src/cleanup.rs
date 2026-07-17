@@ -420,6 +420,54 @@ pub fn render_cleanup_prompt_v3(dictionary: &[String], tone: Tone) -> String {
         )
 }
 
+/// The preamble-hardened cleanup/tone prompt (issue #283, ac7-p0).
+/// Supersedes [`CLEANUP_PROMPT_V3`] as [`OllamaCleanup`]'s live system
+/// prompt: it adds an explicit anti-preamble rule and a worked few-shot
+/// example demonstrating that the output is ONLY the rewritten transcript
+/// (llama3, 8B, otherwise sometimes prepends a conversational label such as
+/// "This is a formal rewrite of your original transcript: …"). Carries the
+/// same `{{TONE}}` and `{{DICTIONARY}}` placeholders as v3. Added as a new
+/// file per the "never edit the old one in place" convention — `cleanup_v3.txt`
+/// (and v1/v2) stay on disk untouched, still protected by their own
+/// regression tests. Runtime output is additionally defended by the
+/// pipeline's [`crate::preamble::looks_like_preamble`] check, which falls
+/// back to [`RegexCleanup`] if a preamble slips past the prompt (AC-4-style
+/// safe degradation).
+pub const CLEANUP_PROMPT_V4: &str = include_str!("../prompts/cleanup_v4.txt");
+
+/// Renders [`CLEANUP_PROMPT_V4`] with `dictionary` and `tone` substituted —
+/// identical substitution semantics to [`render_cleanup_prompt_v3`] (the two
+/// share the same `{{DICTIONARY}}`/`{{TONE}}` placeholder tokens and the same
+/// per-tone/empty-dictionary sentences), just over the hardened v4 file so
+/// the two rendering paths can't drift on those rules.
+pub fn render_cleanup_prompt_v4(dictionary: &[String], tone: Tone) -> String {
+    let terms = crate::stt::build_initial_prompt(dictionary);
+    let dictionary_sentence = if terms.is_empty() {
+        "The user's dictionary is currently empty.".to_string()
+    } else {
+        format!("The user's current dictionary terms: {terms}.")
+    };
+    let tone_sentence = match tone {
+        Tone::Neutral | Tone::Verbatim => String::new(),
+        Tone::Casual => {
+            "The requested tone for this rewrite is casual: write in a relaxed, conversational \
+             style — contractions and informal phrasing are fine."
+                .to_string()
+        }
+        Tone::Formal => {
+            "The requested tone for this rewrite is formal: write in a polished, professional \
+             style — avoid contractions and casual phrasing."
+                .to_string()
+        }
+    };
+    CLEANUP_PROMPT_V4
+        .replace(CLEANUP_PROMPT_V3_TONE_PLACEHOLDER, &tone_sentence)
+        .replace(
+            CLEANUP_PROMPT_V2_DICTIONARY_PLACEHOLDER,
+            &dictionary_sentence,
+        )
+}
+
 /// Errors an [`OllamaTransport`] may return. `OllamaCleanup::clean` maps
 /// every variant to [`CleanupError::Unreachable`] (AC-4) — transport
 /// internals never propagate past this module.
@@ -705,7 +753,7 @@ impl<T: OllamaTransport> OllamaCleanup<T> {
     }
 
     fn clean_via_ollama(&self, raw: &str, tone: Tone) -> Result<String, CleanupError> {
-        let system_prompt = render_cleanup_prompt_v3(&self.dictionary, tone);
+        let system_prompt = render_cleanup_prompt_v4(&self.dictionary, tone);
         let request = GenerateRequest {
             model: &self.model,
             system: &system_prompt,
@@ -1212,7 +1260,7 @@ mod ollama_tests {
 
         assert_eq!(
             parsed["system"],
-            render_cleanup_prompt_v3(&[], Tone::Neutral),
+            render_cleanup_prompt_v4(&[], Tone::Neutral),
             "the `system` field must carry the rewrite-only prompt, not the transcript"
         );
         assert_eq!(
@@ -1443,7 +1491,8 @@ mod ollama_tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn with_dictionary_makes_the_request_carry_the_rendered_v3_prompt_for_those_terms() {
+    fn with_dictionary_makes_the_request_carry_the_rendered_live_prompt_for_those_terms() {
+        // Issue #283: the live prompt is now the hardened `CLEANUP_PROMPT_V4`.
         let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
         let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
         let cleanup = cleanup_with(stub).with_dictionary(dictionary.clone());
@@ -1455,12 +1504,12 @@ mod ollama_tests {
 
         assert_eq!(
             parsed["system"],
-            render_cleanup_prompt_v3(&dictionary, Tone::Neutral),
+            render_cleanup_prompt_v4(&dictionary, Tone::Neutral),
             "the system prompt must carry the attached dictionary's terms"
         );
         assert_ne!(
             parsed["system"],
-            render_cleanup_prompt_v3(&[], Tone::Neutral),
+            render_cleanup_prompt_v4(&[], Tone::Neutral),
             "a non-empty dictionary must change the rendered prompt"
         );
     }
@@ -1479,7 +1528,7 @@ mod ollama_tests {
             serde_json::from_str(&body).expect("request body must be valid JSON");
         assert_eq!(
             parsed["system"],
-            render_cleanup_prompt_v3(&[], Tone::Neutral)
+            render_cleanup_prompt_v4(&[], Tone::Neutral)
         );
     }
 
@@ -1628,8 +1677,108 @@ mod ollama_tests {
                 .as_str()
                 .expect("system field must be a string");
 
-            assert_eq!(system, render_cleanup_prompt_v3(&[], tone));
+            // Issue #283: production now sends the hardened v4 prompt.
+            assert_eq!(system, render_cleanup_prompt_v4(&[], tone));
             assert!(system.to_lowercase().contains(must_contain));
         }
+    }
+
+    // -------------------------------------------------------------
+    // Issue #283 (ac7-p0): CLEANUP_PROMPT_V4 — a new, versioned cleanup/tone
+    // prompt hardened against conversational preambles / labels (e.g. "This
+    // is a formal rewrite of your original transcript: …"), with a few-shot
+    // demonstration that the output is ONLY the rewritten transcript.
+    // Supersedes CLEANUP_PROMPT_V3 as `OllamaCleanup`'s live system prompt,
+    // per the "add a new file, never edit the old one in place" convention;
+    // v3 (and v1/v2) stay on disk untouched, still protected by their own
+    // regression tests above.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn cleanup_prompt_v4_is_a_distinct_file_from_v3() {
+        assert_ne!(
+            CLEANUP_PROMPT_V4, CLEANUP_PROMPT_V3,
+            "cleanup_v4.txt must be its own file, not a copy of cleanup_v3.txt"
+        );
+    }
+
+    #[test]
+    fn ac_v4_prompt_file_contains_the_rewrite_only_constraints() {
+        let prompt = CLEANUP_PROMPT_V4.to_lowercase();
+        for must_contain in [
+            "never answer",
+            "never add",
+            "filler",
+            "self-correction",
+            "punctuation",
+            "bullet",
+            "tone",
+        ] {
+            assert!(
+                prompt.contains(must_contain),
+                "cleanup_v4 prompt is missing required constraint: {must_contain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_prompt_v4_contains_the_dictionary_and_tone_placeholders() {
+        assert!(CLEANUP_PROMPT_V4.contains("{{DICTIONARY}}"));
+        assert!(CLEANUP_PROMPT_V4.contains("{{TONE}}"));
+    }
+
+    #[test]
+    fn cleanup_prompt_v4_rule_7_forbids_inserting_unspoken_dictionary_terms_issue_229() {
+        let normalized = CLEANUP_PROMPT_V4
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains(RULE_7_ANTI_HALLUCINATION_CLAUSE),
+            "cleanup_v4 rule 7 must forbid inserting a dictionary term the speaker never said \
+             (anti-hallucination guard) — normalized prompt was: {normalized:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_prompt_v4_hardens_against_preambles_issue_283() {
+        let prompt = CLEANUP_PROMPT_V4.to_lowercase();
+        assert!(prompt.contains("preamble"));
+        // A worked few-shot demonstration (transcript -> output-is-only-the-
+        // rewritten-text), contrasting a correct rewrite with a labeled one.
+        assert!(
+            CLEANUP_PROMPT_V4.contains("CORRECT OUTPUT")
+                && CLEANUP_PROMPT_V4.contains("WRONG OUTPUT"),
+            "cleanup_v4.txt must carry a few-shot example contrasting correct vs. preamble output"
+        );
+    }
+
+    #[test]
+    fn render_cleanup_prompt_v4_substitutes_the_dictionary_and_tone_placeholders() {
+        let dictionary = vec!["Kubernetes".to_string(), "kubectl".to_string()];
+        let rendered = render_cleanup_prompt_v4(&dictionary, Tone::Formal);
+        assert!(!rendered.contains("{{DICTIONARY}}"));
+        assert!(!rendered.contains("{{TONE}}"));
+        assert!(!rendered.contains("{{"));
+        assert!(!rendered.contains("}}"));
+        assert!(rendered.contains(&crate::stt::build_initial_prompt(&dictionary)));
+        assert!(rendered.to_lowercase().contains("formal"));
+    }
+
+    #[test]
+    fn ollama_cleanup_sends_the_v4_prompt_live_issue_283() {
+        // The production `OllamaCleanup::clean` path must now send v4 (the
+        // hardened prompt), not v3.
+        let stub = StubTransport::succeeding(FIXTURE_MODEL_OUTPUT);
+        let cleanup = cleanup_with(stub);
+        cleanup.clean(FIXTURE_RAW, Tone::Neutral).unwrap();
+
+        let (_, body) = cleanup.transport.captured_request();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+        assert_eq!(
+            parsed["system"],
+            render_cleanup_prompt_v4(&[], Tone::Neutral)
+        );
     }
 }

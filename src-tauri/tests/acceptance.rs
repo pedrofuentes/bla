@@ -605,3 +605,55 @@ fn ac24_a_transcript_with_no_matching_trigger_falls_through_to_ordinary_cleanup(
     assert_eq!(outcome.cleaned_transcript, "What time is the meeting.");
     assert!(!outcome.snippet_matched);
 }
+
+#[test]
+fn ac_cleanup_preamble_output_falls_back_to_regex_issue_283() {
+    // Issue #283 (ac7-p0): even when Ollama is REACHABLE, the model
+    // (hardcoded llama3) sometimes returns a conversational preamble/label
+    // instead of only the rewritten transcript — e.g. "This is a formal
+    // rewrite of your original transcript: This Is Normal." The pipeline
+    // must detect that polluted output and fall back to the deterministic
+    // regex baseline (recording `cleanup_fell_back`), never emitting the
+    // preamble to the output path.
+    let raw_transcript = "this is normal";
+    let stt = FakeStt::new(raw_transcript);
+
+    let polluted = "This is a formal rewrite of your original transcript: This Is Normal.";
+    let transport = StubTransport {
+        response: Ok(ollama_response_body(polluted)),
+    };
+    let cleanup = OllamaCleanup::new("http://localhost:11434", "llama3", transport);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = Pipeline::new(stt, cleanup, NoopClipboard, NoopPaste, |_d: Duration| {});
+
+    let opts = PipelineOpts {
+        transcribe: TranscribeOpts::default(),
+        tone: Tone::Formal,
+        output_mode: file_output_mode(&dir),
+        clock: fixed_clock(),
+        restore_delay: Duration::from_millis(0),
+        snippets: vec![],
+    };
+
+    let outcome = pipeline
+        .run(&[0.0_f32; 1_600], &opts)
+        .expect("issue #283: a preamble-polluted response must not surface an error");
+
+    assert_eq!(
+        outcome.cleaned_transcript, "This is normal.",
+        "issue #283: the regex baseline output must be used, not the model's preamble"
+    );
+    assert!(
+        !outcome
+            .cleaned_transcript
+            .to_lowercase()
+            .contains("formal rewrite"),
+        "issue #283: the conversational preamble must never reach the output path, got {:?}",
+        outcome.cleaned_transcript
+    );
+    assert!(
+        outcome.cleanup_fell_back,
+        "issue #283: the safe regex-baseline fallback must have fired"
+    );
+}
