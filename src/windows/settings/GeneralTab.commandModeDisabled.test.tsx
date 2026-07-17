@@ -54,6 +54,9 @@ it("hides command-mode settings while leaving dictation settings available", asy
 
   expect(mounted.container.querySelector('[data-testid="command-hotkey-input"]')).toBeNull();
   expect(mounted.container.querySelector('[data-testid="command-hotkey-apply-button"]')).toBeNull();
+  expect(mounted.container.querySelector('[data-testid="command-hotkey-pending"]')).toBeNull();
+  expect(mounted.container.querySelector('[data-testid="command-hotkey-error"]')).toBeNull();
+  expect(mounted.container.textContent).not.toContain("Command-mode hotkey");
   expect(mounted.container.querySelector('[data-testid="hotkey-input"]')).not.toBeNull();
   expect(mounted.container.querySelector('[data-testid="mode-hold"]')).not.toBeNull();
 });

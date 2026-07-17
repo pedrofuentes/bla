@@ -2683,7 +2683,7 @@ mod command_dispatch_tests {
 mod command_mode_flag_tests {
     use std::cell::Cell;
 
-    use super::{register_command_hotkey_at_startup, should_handle_command_key_event};
+    use super::{handle_command_key_event_if_enabled, register_command_hotkey_at_startup};
 
     #[test]
     fn startup_skips_command_hotkey_registration_when_command_mode_is_disabled() {
@@ -2698,7 +2698,13 @@ mod command_mode_flag_tests {
 
     #[test]
     fn command_key_event_returns_before_dispatch_when_command_mode_is_disabled() {
-        assert!(!should_handle_command_key_event());
+        let dispatch_calls = Cell::new(0);
+
+        handle_command_key_event_if_enabled(|| {
+            dispatch_calls.set(dispatch_calls.get() + 1);
+        });
+
+        assert_eq!(dispatch_calls.get(), 0);
     }
 }
 
