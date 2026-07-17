@@ -491,6 +491,88 @@ pub fn delete_tone_rule(state: State<'_, AppState>, id: i64) -> Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
+/// List every stored snippet (issue #258/#261, AC-51/AC-54, part of #242's
+/// M4 scope), most-recently-added first — mirrors `Store::list_snippets`'s
+/// own ordering contract. Thin wrapper over `store::Store::list_snippets`;
+/// `Snippet` derives `Serialize` (see its doc comment) specifically so this
+/// command can hand rows to the frontend over Tauri IPC — the Snippets tab
+/// (`SnippetsTab.tsx`, #261).
+#[tauri::command]
+pub fn list_snippets(state: State<'_, AppState>) -> Result<Vec<crate::store::Snippet>, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .list_snippets()
+        .map_err(|e| e.to_string())
+}
+
+/// Add a snippet (issue #258/#261, AC-51/AC-54). Thin wrapper over
+/// `store::Store::add_snippet` — case-insensitively unique on `trigger`, so
+/// adding a trigger that already exists under a different case is a no-op,
+/// not an error (matches `Store::add_snippet`'s own contract, mirroring
+/// `add_dictionary_term`'s — see `SnippetsTab.tsx`'s client-side duplicate
+/// check for why the tab never relies on this call rejecting). Returns the
+/// snippet's row id either way.
+///
+/// No multi-word argument names here (`trigger`, `body` are both single
+/// words), so the #239 `rename_all = "snake_case"` wire-key rule doesn't
+/// bite — see `upsert_tone_rule`'s doc comment for the case where it does;
+/// `wire_key_contract_tests` (below) re-parses this file at test time and
+/// would fail loudly if that ever changed without the attribute.
+#[tauri::command]
+pub fn add_snippet(
+    state: State<'_, AppState>,
+    trigger: String,
+    body: String,
+) -> Result<i64, String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .add_snippet(&trigger, &body, now_ms())
+        .map_err(|e| e.to_string())
+}
+
+/// Update an existing snippet's trigger/body in place by id (issue #258/
+/// #261, AC-51/AC-54). Thin wrapper over `store::Store::update_snippet` —
+/// updating an id that doesn't exist is a no-op, not an error; UNLIKE
+/// `add_snippet` (and unlike `upsert_tone_rule`), a new `trigger` that
+/// collides case-insensitively with a DIFFERENT existing row's trigger
+/// genuinely rejects with an `Err` here (the schema's `UNIQUE COLLATE
+/// NOCASE` constraint is enforced on UPDATE too — see
+/// `Store::update_snippet`'s own doc comment), which `SnippetsTab.tsx`
+/// surfaces as a row-scoped, kind-only inline error rather than a silent
+/// no-op.
+#[tauri::command]
+pub fn update_snippet(
+    state: State<'_, AppState>,
+    id: i64,
+    trigger: String,
+    body: String,
+) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .update_snippet(id, &trigger, &body)
+        .map_err(|e| e.to_string())
+}
+
+/// Remove a single snippet by id (issue #258/#261, AC-51/AC-54). Thin
+/// wrapper over `store::Store::remove_snippet` — removing an id that
+/// doesn't exist is a no-op, not an error (matches `Store::remove_term`'s/
+/// `Store::delete_tone_rule`'s own contract).
+#[tauri::command]
+pub fn remove_snippet(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .remove_snippet(id)
+        .map_err(|e| e.to_string())
+}
+
 /// Re-registers the current (persisted) hotkey as the global dictation
 /// shortcut (issue #181) — called whenever hotkey capture ends without a
 /// newly-committed *changed* chord already re-registering it via

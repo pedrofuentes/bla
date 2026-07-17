@@ -2,6 +2,7 @@ import { useState } from "react";
 import { DictionaryTab } from "./DictionaryTab";
 import { GeneralTab } from "./GeneralTab";
 import { HistoryTab } from "./HistoryTab";
+import { SnippetsTab } from "./SnippetsTab";
 import { ToneTab } from "./ToneTab";
 import { TABS, type TabId } from "./tabs";
 
@@ -15,10 +16,12 @@ import { TABS, type TabId } from "./tabs";
  *
  * General tab lands in issue #126 (M2 PR 2.5); History lands in issue #199
  * (M3 PR 3.3); Dictionary lands in issue #201 (M3 PR 3.5); Tone lands in
- * issue #203 (M3 PR 3.7). Snippets is a later M3+ increment — clicking it
- * shows a placeholder rather than being disabled, so the tab bar's final
- * shape (and switching between tabs) is exercised now without pulling
- * forward content that doesn't exist yet.
+ * issue #203 (M3 PR 3.7); Snippets lands in issue #261 (M4). The trailing
+ * placeholder branch below is defensive-only now that every current tab id
+ * has real content — kept so a future tab added to `TABS` without content
+ * yet degrades to a labeled placeholder instead of rendering nothing, the
+ * same incremental-rollout pattern each of the tabs above used in its own
+ * PR.
  */
 export function SettingsWindow() {
   const [active, setActive] = useState<TabId>("general");
@@ -59,6 +62,8 @@ export function SettingsWindow() {
           <DictionaryTab />
         ) : active === "tone" ? (
           <ToneTab />
+        ) : active === "snippets" ? (
+          <SnippetsTab />
         ) : (
           <p
             data-testid="placeholder-panel"

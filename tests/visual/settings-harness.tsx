@@ -47,6 +47,19 @@
  * place rather than adding a second one — so a Playwright script exercising
  * the tab sees the same contract `ToneTab.tsx`'s own client-side duplicate
  * check is written against.
+ *
+ * A `?snippets=` query param (issue #261) selects the starting
+ * `list_snippets` row set for the Snippets tab — see `SNIPPETS_FIXTURES`.
+ * Every trigger/body is an obviously synthetic placeholder, same privacy
+ * note as dictionary terms/tone patterns above.
+ * `list_snippets`/`add_snippet`/`update_snippet`/`remove_snippet` are
+ * mocked statefully (mutating a module-local array); `add_snippet` mirrors
+ * the real backend's case-insensitive `UNIQUE COLLATE NOCASE` no-op
+ * behavior (see `store::Store::add_snippet`), and `update_snippet` mirrors
+ * its genuinely-rejects-on-collision behavior (see
+ * `store::Store::update_snippet`'s doc comment) — so a Playwright script
+ * exercising the tab sees the same contracts `SnippetsTab.tsx`'s own
+ * client-side checks are written against.
  */
 import React from "react";
 import ReactDOM from "react-dom/client";
@@ -57,6 +70,7 @@ import type {
   HistoryRow,
   ModelRegistryEntry,
   Settings,
+  Snippet,
   ToneProfile,
   ToneRule,
 } from "../../src/lib/ipc";
@@ -167,6 +181,35 @@ const TONE_FIXTURES: Record<string, ToneRule[]> = {
   empty: [],
 };
 
+// Issue #261: obviously synthetic placeholder snippets (never a real
+// dictated trigger/body) for the Snippets tab's design-loop screenshots.
+// Most-recently-added first, matching `list_snippets`'s real ordering.
+const SNIPPETS: Snippet[] = [
+  {
+    id: 3,
+    trigger: "sig",
+    body: "Best,\nPlaceholder Pat",
+    created_at_ms: Date.parse("2026-07-15T09:41:00Z"),
+  },
+  {
+    id: 2,
+    trigger: "addr",
+    body: "123 Placeholder St, Faketown",
+    created_at_ms: Date.parse("2026-07-14T18:05:00Z"),
+  },
+  {
+    id: 1,
+    trigger: "standup",
+    body: "Yesterday: placeholder work. Today: more placeholder work.",
+    created_at_ms: Date.parse("2026-07-14T08:12:00Z"),
+  },
+];
+
+const SNIPPETS_FIXTURES: Record<string, Snippet[]> = {
+  default: SNIPPETS,
+  empty: [],
+};
+
 const params = new URLSearchParams(window.location.search);
 const fixtureName = params.get("fixture") ?? "default";
 const settings = FIXTURES[fixtureName] ?? DEFAULT_SETTINGS;
@@ -194,6 +237,14 @@ const toneFixtureName = params.get("tone") ?? "default";
 // resulting state.
 let toneRules: ToneRule[] = [...(TONE_FIXTURES[toneFixtureName] ?? TONE_RULES)];
 let nextToneId = Math.max(0, ...toneRules.map((r) => r.id)) + 1;
+
+const snippetsFixtureName = params.get("snippets") ?? "default";
+// Mutable copy — `add_snippet`/`update_snippet`/`remove_snippet` mutate
+// this array, mirroring the real commands' effect on the underlying store,
+// so a Playwright script can drive an add/edit/remove and screenshot the
+// resulting state.
+let snippets: Snippet[] = [...(SNIPPETS_FIXTURES[snippetsFixtureName] ?? SNIPPETS)];
+let nextSnippetId = Math.max(0, ...snippets.map((s) => s.id)) + 1;
 
 mockWindows("settings");
 // `shouldMockEvents: true` so GeneralTab's `onEvent` subscriptions
@@ -281,6 +332,42 @@ mockIPC(
       case "delete_tone_rule": {
         const { id } = payload as { id: number };
         toneRules = toneRules.filter((r) => r.id !== id);
+        return undefined;
+      }
+      case "list_snippets":
+        return snippets;
+      // Mirrors `store::Store::add_snippet`'s real `INSERT OR IGNORE` +
+      // `UNIQUE COLLATE NOCASE` contract: a case-insensitive duplicate
+      // trigger is a no-op that resolves with the existing row's id rather
+      // than rejecting, so this fixture stays honest about what
+      // `SnippetsTab`'s own client-side duplicate check is defending
+      // against (see this file's doc comment).
+      case "add_snippet": {
+        const { trigger, body } = payload as { trigger: string; body: string };
+        const existing = snippets.find((s) => s.trigger.toLowerCase() === trigger.toLowerCase());
+        if (existing) return existing.id;
+        const id = nextSnippetId++;
+        snippets = [{ id, trigger, body, created_at_ms: Date.now() }, ...snippets];
+        return id;
+      }
+      // Mirrors `store::Store::update_snippet`'s real by-id update — AND
+      // its genuine rejection when the new trigger collides
+      // case-insensitively with a DIFFERENT row's trigger (the schema's
+      // `UNIQUE COLLATE NOCASE` constraint applies on UPDATE too), so this
+      // fixture stays honest about what `SnippetsTab`'s row-scoped error
+      // path is defending against.
+      case "update_snippet": {
+        const { id, trigger, body } = payload as { id: number; trigger: string; body: string };
+        const collision = snippets.find(
+          (s) => s.id !== id && s.trigger.toLowerCase() === trigger.toLowerCase(),
+        );
+        if (collision) throw new Error("UNIQUE constraint failed: snippets.trigger");
+        snippets = snippets.map((s) => (s.id === id ? { ...s, trigger, body } : s));
+        return undefined;
+      }
+      case "remove_snippet": {
+        const { id } = payload as { id: number };
+        snippets = snippets.filter((s) => s.id !== id);
         return undefined;
       }
       default:

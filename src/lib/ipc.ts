@@ -148,6 +148,25 @@ export interface ToneRule {
 }
 
 /**
+ * Mirrors `store::Snippet` (src-tauri/src/store.rs) — one stored text
+ * snippet returned by `list_snippets`: a trigger phrase spoken during
+ * dictation and the body text it expands to (the actual matching against a
+ * transcript is `snippets::match_snippet`'s job, issue #260, not this
+ * type). `list_snippets` returns rows most-recently-added first, mirroring
+ * `DictionaryTerm`'s ordering (NOT `ToneRule`'s insertion/match order).
+ * Carries the user's own content — sanctioned to render in the Snippets tab
+ * (#261), but never `console.log`/persist it anywhere else (MISSION §5/§7),
+ * the same no-log invariant `HistoryRow`/`DictionaryTerm`/`ToneRule`
+ * document.
+ */
+export interface Snippet {
+  id: number;
+  trigger: string;
+  body: string;
+  created_at_ms: number;
+}
+
+/**
  * Command name → { args, result } typing. Extend this map as `commands.rs`
  * grows; each key must match a `#[tauri::command]` name exactly.
  */
@@ -235,6 +254,35 @@ export interface Commands {
   upsert_tone_rule: { args: { app_pattern: string; tone: ToneProfile }; result: number };
   /** Mirrors `commands::delete_tone_rule` (issue #202/#203). */
   delete_tone_rule: { args: { id: number }; result: void };
+  /**
+   * Mirrors `commands::list_snippets` (issue #258/#261) — every stored
+   * snippet, most-recently-added first, the Snippets tab's (#261) sole
+   * source of rows to render.
+   */
+  list_snippets: { result: Snippet[] };
+  /**
+   * Mirrors `commands::add_snippet` (issue #258/#261). The backend's
+   * `snippets(trigger UNIQUE COLLATE NOCASE)` constraint makes a
+   * case-insensitively duplicate trigger an `INSERT OR IGNORE` no-op that
+   * still resolves with the existing row's id — it is never a rejected
+   * call, so the Snippets tab checks for a case-insensitive duplicate
+   * against its already-loaded list itself before calling this for an
+   * *add* (see `SnippetsTab.tsx`'s doc comment, the same pattern
+   * `DictionaryTab.tsx` uses for `add_dictionary_term`).
+   */
+  add_snippet: { args: { trigger: string; body: string }; result: number };
+  /**
+   * Mirrors `commands::update_snippet` (issue #258/#261) — edits an
+   * existing snippet's trigger/body by id. UNLIKE `add_snippet` (and
+   * unlike `upsert_tone_rule`), a new `trigger` colliding
+   * case-insensitively with a DIFFERENT row's trigger genuinely rejects
+   * this call (the schema's `UNIQUE COLLATE NOCASE` constraint is enforced
+   * on UPDATE too), which the Snippets tab surfaces as a row-scoped
+   * kind-only inline error.
+   */
+  update_snippet: { args: { id: number; trigger: string; body: string }; result: void };
+  /** Mirrors `commands::remove_snippet` (issue #258/#261). */
+  remove_snippet: { args: { id: number }; result: void };
 }
 
 /**
