@@ -26,6 +26,8 @@ use crate::cleanup::{Cleanup, CleanupError, RegexCleanup, Tone};
 use crate::output::{
     self, Clipboard, Clock, OutputMode, OutputOutcome, PasteSynthesizer, RouteError,
 };
+use crate::snippets;
+use crate::store::Snippet;
 use crate::stt::{Stt, SttError, TranscribeOpts};
 
 /// Per-run configuration for [`Pipeline::run`].
@@ -45,6 +47,15 @@ pub struct PipelineOpts {
     /// Forwarded to the cursor-paste target's clipboard-restore delay
     /// (ADR-0003); unused by the file target.
     pub restore_delay: Duration,
+    /// Issue #263 (AC-53), part of #242's M4 scope: the caller's currently
+    /// configured snippets (typically `Store::list_snippets`'s result,
+    /// read fresh per dictation — never cached — mirroring how `tone`
+    /// above is resolved from `list_tone_rules` on every run rather than
+    /// once at startup). `Pipeline::run` checks these against the RAW
+    /// transcript, before `tone` is ever consulted for a `Cleanup` call —
+    /// see `run`'s own doc comment for why raw-transcript matching was
+    /// chosen over PRD.md's older cleaned-transcript wording.
+    pub snippets: Vec<Snippet>,
 }
 
 /// What a successful [`Pipeline::run`] produced.
@@ -59,6 +70,14 @@ pub struct Outcome {
     /// `RegexCleanup` (AC-4) — never surfaced as an error, but exposed here
     /// for callers/tests that want to observe the fallback happened.
     pub cleanup_fell_back: bool,
+    /// Issue #263 (AC-53): true when a configured snippet's trigger
+    /// matched the raw transcript and `cleaned_transcript` is therefore
+    /// that snippet's stored `body` rather than `Cleanup`'s output — in
+    /// which case `Cleanup::clean` (and any AC-4 fallback) was never
+    /// invoked at all for this run. Always `false` when `cleanup_fell_back`
+    /// is `true`: the two are mutually exclusive outcomes of the same
+    /// branch in `run`.
+    pub snippet_matched: bool,
     /// What `crate::output::route` did with the cleaned text.
     pub output: OutputOutcome,
 }
@@ -136,17 +155,35 @@ where
     }
 
     /// Runs the full pipeline over `samples` (16 kHz mono `f32`, the format
-    /// `audio` produces): transcribe, clean (falling back to `RegexCleanup`
-    /// on `CleanupError::Unreachable` — AC-4), then route the cleaned text
+    /// `audio` produces): transcribe, then either short-circuit on a
+    /// snippet match (AC-53) or clean (falling back to `RegexCleanup` on
+    /// `CleanupError::Unreachable` — AC-4), then route the resulting text
     /// per `opts.output_mode` (AC-3/AC-9).
+    ///
+    /// Issue #263 / AC-53 (part of #242's M4 scope): `opts.snippets` is
+    /// checked against the RAW transcript via `snippets::match_snippet`
+    /// BEFORE `self.cleanup` is ever consulted. On a match, `self.cleanup`
+    /// (and its AC-4 `RegexCleanup` fallback) is skipped entirely for this
+    /// run — the matched snippet's stored body is routed to output
+    /// directly. This deliberately follows #242's cofounder-approved
+    /// scope (raw-transcript match, pre-cleanup short-circuit) rather than
+    /// PRD.md's older AC-24 wording (cleaned-transcript match, post-cleanup
+    /// expansion); see this crate's #263 PR description for that flagged
+    /// documentation conflict.
     pub fn run(&self, samples: &[f32], opts: &PipelineOpts) -> Result<Outcome, PipelineError> {
         let raw_transcript = self
             .stt
             .transcribe(samples, &opts.transcribe)
             .map_err(PipelineError::Stt)?;
 
-        let (cleaned_transcript, cleanup_fell_back) =
-            self.clean_with_fallback(&raw_transcript, opts.tone);
+        let (cleaned_transcript, cleanup_fell_back, snippet_matched) =
+            match snippets::match_snippet(&raw_transcript, &opts.snippets) {
+                Some(body) => (body, false, true),
+                None => {
+                    let (cleaned, fell_back) = self.clean_with_fallback(&raw_transcript, opts.tone);
+                    (cleaned, fell_back, false)
+                }
+            };
 
         let output = output::route(
             &opts.output_mode,
@@ -163,6 +200,7 @@ where
             raw_transcript,
             cleaned_transcript,
             cleanup_fell_back,
+            snippet_matched,
             output,
         })
     }

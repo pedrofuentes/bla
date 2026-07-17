@@ -6,8 +6,9 @@
 //! either silent or an in-code synthesized tone (never a real recording),
 //! and every transcript is a literal string written for this suite.
 //!
-//! Test names are bound to stable AC ids (`ac1_`, `ac2_`, `ac4_`, `ac5_`)
-//! so later milestones extend this same suite rather than re-numbering it.
+//! Test names are bound to stable AC ids (`ac1_`, `ac2_`, `ac4_`, `ac5_`,
+//! `ac24_`, `ac53_`) so later milestones extend this same suite rather than
+//! re-numbering it.
 //! AC-3 (file-mode templating) and AC-9 (clipboard restore) already have
 //! their own coverage in `output.rs`'s unit tests; this suite's file-mode
 //! usage below only stands in as a network-free, OS-glue-free output
@@ -17,11 +18,13 @@ use std::io;
 use std::time::Duration;
 
 use bla_lib::cleanup::{
-    NoRealNetworkTransport, OllamaCleanup, RegexCleanup, StubTransport, Tone, TransportError,
+    Cleanup, CleanupError, NoRealNetworkTransport, OllamaCleanup, RegexCleanup, StubTransport,
+    Tone, TransportError,
 };
 use bla_lib::errors::{self, ErrorKind, PipelineErrorEvent};
 use bla_lib::output::{Clipboard, Clock, FileConfig, OutputMode, OutputOutcome, PasteSynthesizer};
 use bla_lib::pipeline::{Pipeline, PipelineOpts};
+use bla_lib::store::Snippet;
 use bla_lib::stt::{FakeStt, Stt, SttError, TranscribeOpts};
 
 // `StubTransport` (a preprogrammed-outcome `OllamaTransport` that never
@@ -114,6 +117,7 @@ fn ac1_headless_pipeline_removes_fillers_and_applies_self_correction() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -185,6 +189,7 @@ fn ac2_latency_budget_regex_path_under_2s_for_15s_fixture() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let start = std::time::Instant::now();
@@ -234,6 +239,7 @@ fn ac4_ollama_unreachable_falls_back_to_regex_cleanup_with_no_error() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -299,6 +305,7 @@ fn ac5_full_pipeline_run_makes_no_network_io_outside_allowlist() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -356,6 +363,7 @@ fn pipeline_error_kind_mapping_never_leaks_transcript_text() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let err = pipeline
@@ -405,6 +413,7 @@ fn ac4b_ollama_unreachable_still_pastes_and_is_informational_not_blocking() {
         output_mode: file_output_mode(&dir),
         clock: fixed_clock(),
         restore_delay: Duration::from_millis(0),
+        snippets: vec![],
     };
 
     let outcome = pipeline
@@ -431,4 +440,168 @@ fn ac4b_ollama_unreachable_still_pastes_and_is_informational_not_blocking() {
     );
     let event = PipelineErrorEvent::from(&kind);
     assert_eq!(event.kind, "OllamaUnreachable");
+}
+
+// -------------------------------------------------------------
+// Issue #263 (AC-53, AC-24): snippet trigger matching wired into
+// `Pipeline::run`, short-circuiting straight to output BEFORE any
+// `Cleanup::clean` call. Per #242's cofounder-approved M4 scope (followed
+// here over PRD.md's now-superseded AC-24 wording — see this PR's
+// description for the flagged doc conflict), the match runs against the
+// RAW transcript, not cleaned text.
+// -------------------------------------------------------------
+
+/// Synthetic fixture constructor (ADR-0007) — every field made up, never
+/// real dictation text. Mirrors `snippets.rs`'s own test-module helper of
+/// the same name/shape.
+fn snippet(id: i64, trigger: &str, body: &str) -> Snippet {
+    Snippet {
+        id,
+        trigger: trigger.to_string(),
+        body: body.to_string(),
+        created_at_ms: 1_000 + id,
+    }
+}
+
+/// A `Cleanup` that fails the test the instant `clean` is invoked — the
+/// AC-53 enforcement stub. Proves the short-circuit itself (Cleanup is
+/// never even asked), not merely that the right text happened to come out
+/// the other end.
+struct PanicIfCalledCleanup;
+
+impl Cleanup for PanicIfCalledCleanup {
+    fn clean(&self, _raw: &str, _tone: Tone) -> Result<String, CleanupError> {
+        panic!(
+            "AC-53: Cleanup::clean must never be invoked when a snippet trigger matched the raw \
+             transcript"
+        );
+    }
+}
+
+#[test]
+fn ac53_snippet_match_short_circuits_before_cleanup_is_ever_invoked() {
+    let raw_transcript = "please add my sig now";
+    let stt = FakeStt::new(raw_transcript);
+
+    let snippets = vec![snippet(1, "sig", "Best regards,\nPat Nguyen")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // `PanicIfCalledCleanup`, not `RegexCleanup`/`OllamaCleanup`: if the
+    // pipeline ever reached `Cleanup::clean` on this run (fallback path
+    // included), this whole test would panic rather than merely assert the
+    // wrong text.
+    let pipeline = Pipeline::new(
+        stt,
+        PanicIfCalledCleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
+
+    let opts = PipelineOpts {
+        transcribe: TranscribeOpts::default(),
+        tone: Tone::Neutral,
+        output_mode: file_output_mode(&dir),
+        clock: fixed_clock(),
+        restore_delay: Duration::from_millis(0),
+        snippets,
+    };
+
+    let outcome = pipeline
+        .run(&[0.0_f32; 1_600], &opts)
+        .expect("AC-53: pipeline run should succeed via the snippet short-circuit");
+
+    assert_eq!(outcome.raw_transcript, raw_transcript);
+    assert_eq!(outcome.cleaned_transcript, "Best regards,\nPat Nguyen");
+    assert!(
+        outcome.snippet_matched,
+        "AC-53: Outcome must record that the short-circuit fired"
+    );
+    assert!(
+        !outcome.cleanup_fell_back,
+        "AC-53: this is the snippet short-circuit, not the AC-4 Cleanup fallback"
+    );
+
+    match outcome.output {
+        OutputOutcome::AppendedTo(_) => {}
+        other => panic!("expected the file target to have been written, got {other:?}"),
+    }
+}
+
+#[test]
+fn ac24_configured_snippet_trigger_expands_to_its_configured_text() {
+    // AC-24 (PRD.md): a configured snippet trigger phrase present in the
+    // transcript expands to its configured text. Unlike ac53 above (which
+    // proves the short-circuit itself with a panicking stub), this drives
+    // an ORDINARY `Cleanup` (`RegexCleanup`) to prove snippet expansion
+    // also behaves correctly wired into a realistic pipeline configuration.
+    let raw_transcript = "please send my addr to the team";
+    let stt = FakeStt::new(raw_transcript);
+
+    let snippets = vec![
+        snippet(1, "addr", "123 Main St, Springfield"),
+        snippet(2, "sig", "Best, Pat"),
+    ];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = Pipeline::new(
+        stt,
+        RegexCleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
+
+    let opts = PipelineOpts {
+        transcribe: TranscribeOpts::default(),
+        tone: Tone::Neutral,
+        output_mode: file_output_mode(&dir),
+        clock: fixed_clock(),
+        restore_delay: Duration::from_millis(0),
+        snippets,
+    };
+
+    let outcome = pipeline
+        .run(&[0.0_f32; 1_600], &opts)
+        .expect("AC-24: pipeline run should succeed");
+
+    assert_eq!(outcome.cleaned_transcript, "123 Main St, Springfield");
+    assert!(outcome.snippet_matched);
+}
+
+#[test]
+fn ac24_a_transcript_with_no_matching_trigger_falls_through_to_ordinary_cleanup() {
+    // Contrast case, proving the ac24 test above is actually discriminating:
+    // a transcript that matches no configured trigger must fall through to
+    // ordinary `Cleanup` behavior, not silently produce some snippet body
+    // anyway.
+    let raw_transcript = "um, what time is the meeting";
+    let stt = FakeStt::new(raw_transcript);
+
+    let snippets = vec![snippet(1, "sig", "Best, Pat")];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = Pipeline::new(
+        stt,
+        RegexCleanup,
+        NoopClipboard,
+        NoopPaste,
+        |_delay: Duration| {},
+    );
+
+    let opts = PipelineOpts {
+        transcribe: TranscribeOpts::default(),
+        tone: Tone::Neutral,
+        output_mode: file_output_mode(&dir),
+        clock: fixed_clock(),
+        restore_delay: Duration::from_millis(0),
+        snippets,
+    };
+
+    let outcome = pipeline
+        .run(&[0.0_f32; 1_600], &opts)
+        .expect("pipeline run should succeed");
+
+    assert_eq!(outcome.cleaned_transcript, "What time is the meeting.");
+    assert!(!outcome.snippet_matched);
 }

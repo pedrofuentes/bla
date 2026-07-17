@@ -1581,6 +1581,7 @@ mod history_wiring_tests {
             raw_transcript: raw.to_string(),
             cleaned_transcript: cleaned.to_string(),
             cleanup_fell_back: false,
+            snippet_matched: false,
             output: output::OutputOutcome::Pasted,
         }
     }
@@ -1836,6 +1837,7 @@ mod dictionary_wiring_tests {
             output_mode: file_output_mode(&dir),
             clock: fixed_clock(),
             restore_delay: Duration::from_millis(0),
+            snippets: vec![],
         };
         let pipeline = pipeline::Pipeline::new(
             std::rc::Rc::clone(&spy),
@@ -1881,6 +1883,7 @@ mod dictionary_wiring_tests {
                 output_mode: file_output_mode(&dir),
                 clock: fixed_clock(),
                 restore_delay: Duration::from_millis(0),
+                snippets: vec![],
             };
             let pipeline = pipeline::Pipeline::new(
                 std::rc::Rc::clone(&spy),
@@ -2006,6 +2009,7 @@ mod tone_wiring_tests {
             output_mode: file_output_mode(&dir),
             clock: fixed_clock(),
             restore_delay: Duration::from_millis(0),
+            snippets: vec![],
         };
         let raw = "  um, hello   world, uh, messy";
         let pipeline = pipeline::Pipeline::new(
@@ -2054,6 +2058,7 @@ mod tone_wiring_tests {
             output_mode: file_output_mode(&dir),
             clock: fixed_clock(),
             restore_delay: Duration::from_millis(0),
+            snippets: vec![],
         };
         let pipeline = pipeline::Pipeline::new(
             stt::FakeStt::default(),
@@ -3857,7 +3862,7 @@ fn spawn_stt_cache_warm(
 /// from `Settings` (AC-14).
 fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generation: u64) {
     std::thread::spawn(move || {
-        let (settings, route_target, dictionary, tone, active_app_name) = {
+        let (settings, route_target, dictionary, tone, active_app_name, snippets) = {
             let state = app.state::<AppState>();
             let settings = state.settings.lock().unwrap().clone();
             let route_target = state.output_switch.lock().unwrap().route_target();
@@ -3896,7 +3901,27 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
                 });
                 context::resolve_tone_for_app(active_app_name.as_ref(), &tone_rules)
             };
-            (settings, route_target, dictionary, tone, active_app_name)
+            // Issue #263 (AC-53), part of #242's M4 scope: read the
+            // configured snippets fresh for this dictation — same
+            // never-cached, best-effort pattern as `dictionary`/`tone`
+            // above (a read failure resolves to no snippets, never fails
+            // the dictation). `Pipeline::run` matches these against the
+            // RAW transcript before ever consulting `tone`/`Cleanup`.
+            let snippets = {
+                let store = state.store.lock().unwrap();
+                store.list_snippets().unwrap_or_else(|err| {
+                    eprintln!("bla: failed to read snippets, proceeding with none: {err}");
+                    Vec::new()
+                })
+            };
+            (
+                settings,
+                route_target,
+                dictionary,
+                tone,
+                active_app_name,
+                snippets,
+            )
         };
 
         let app_data_dir = app
@@ -3928,6 +3953,7 @@ fn run_pipeline_in_background(app: tauri::AppHandle, samples: Vec<f32>, generati
             output_mode,
             clock: real_clock(),
             restore_delay: output::DEFAULT_RESTORE_DELAY,
+            snippets,
         };
 
         let cleanup = cleanup::OllamaCleanup::with_default_base_url(
